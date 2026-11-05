@@ -148,9 +148,14 @@ make -C ../nucleus -j4 && make -C ../nucleus -k test bootstrap   # after a Nucle
 Written so far: `env.sh`, `setup-cloud.sh`, `run-tests.sh`, `check-probes.sh`,
 `build-reference.sh` (`[iron-doom] [chocolate-doom]`; auto mode denied running
 it again on 2026-11-05, so the user runs it or adds it to the setup script).
-`check-demos.sh` (exit 2 when a demo has no reference). `check-frames.sh`
-comes once there are reference frames. Update this list as scripts are added
-or renamed.
+`check-demos.sh` (exit 2 when a demo has no reference). `check-maps.sh`
+(each shareware map loads and runs). `mus2mid-ref.sh` builds Chocolate Doom's
+`mus2mid.c` with gcc into `build/mus2mid-ref`, for regenerating
+`reference/data/mus2mid/`. `check-frames.sh` comes once there are reference
+frames. Update this list as scripts are added or renamed.
+- **Savegame test output:** the `demo3-survives-a-load` test leaves
+  `build/savetest/doomsav0.nsg`, so `-config build/savetest/config.edn
+  -loadgame 0` runs a loaded game headless (add `-framedump TICS DIR`).
 - **Demo lengths** on doom1.wad v1.9: demo1 5026 gametics, demo2 3836, demo3
   2134; `-timedemo` runs all three in about 40 s here, drawing every tic.
 

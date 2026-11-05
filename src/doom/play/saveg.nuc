@@ -1,0 +1,554 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_saveg.c, g_game.c); this port is GPLv3,
+; see COPYING.
+;
+; Savegames. Not vanilla's format: this one keeps everything the playsim
+; reads, the RNG and the free lists included, so a game loaded mid-demo stays
+; in sync. Each struct's reader and writer come from its fields through
+; `defsave`; a pointer is written as an index into the saved mobjs or
+; thinkers, -1 for none.
+
+(ns doom.play.saveg)
+
+(import-ct nucleus.node)
+(import-ct nucleus.intern)
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.hashmap)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.fixed)
+(import-use doom.rand)
+(import-use doom.mapdata)
+(import-use doom.hufont)
+(import-use doom.play.defs)
+(import-use doom.play.world)
+(import doom.play.map pm)
+
+; "NDSV", and the format's version: bump it when a saved struct changes.
+(defconst SAVE-MAGIC 0x5653444e)
+(defconst SAVE-VERSION 1)
+(defconst SAVE-END 0x1d)
+
+; Pointers are numbered as they're met: thinker 0 is the cap.
+(defstruct Saver out:(Vector ui8) mobj-ids:(HashMap usize i32) mobjs:(Vector &Mobj)
+  thinker-ids:(HashMap usize i32) thinkers:(Vector &Thinker)
+  ; A special's pointer that names no thinker; the save is refused.
+  broken:bool)
+
+; `w` is none while only the header is read.
+(defstruct Loader data:Bytes pos:usize w:?&World mobjs:(Vector &Mobj) thinkers:(Vector &Thinker))
+
+; --- scalars -------------------------------------------------------------------
+
+(defn- put-word (s:&Saver v:i32):void
+  (let (u (unsafe/cast ui32 v))
+    (dotimes (i:usize 4)
+      (conj (ref s 'out) (unsafe/cast ui8 (bit-and (bit-shr u (unsafe/cast ui32 (* 8 i))) 255))))))
+
+(defn- get-word (l:&Loader):(Fallible i32)
+  (when (> (+ (l 'pos) 4) (count (ref l 'data))) (fail "the savegame ends early"))
+  (let (v (le-i32 (ref l 'data) (l 'pos)))
+    (set! (l 'pos) (+ (l 'pos) 4))
+    (return (ok v))))
+
+(defn save-put (s:&Saver x:&i32):void (put-word s @x))
+(defn save-put (s:&Saver x:&ui32):void (put-word s (unsafe/cast i32 @x)))
+(defn save-put (s:&Saver x:&i16):void (put-word s (as i32 @x)))
+(defn save-put (s:&Saver x:&bool):void (put-word s (if @x 1 0)))
+(defn save-put (s:&Saver x:&usize):void (put-word s (unsafe/cast i32 @x)))
+(defn save-put (s:&Saver x:&?usize):void
+  (put-word s (match @x ((some i) (unsafe/cast i32 i)) ((none) -1))))
+
+(defn save-get (l:&Loader x:&i32):(Fallible void) (set! @x (try (get-word l))) (return (ok)))
+(defn save-get (l:&Loader x:&ui32):(Fallible void)
+  (set! @x (unsafe/cast ui32 (try (get-word l))))
+  (return (ok)))
+(defn save-get (l:&Loader x:&i16):(Fallible void)
+  (set! @x (unsafe/cast i16 (try (get-word l))))
+  (return (ok)))
+(defn save-get (l:&Loader x:&bool):(Fallible void) (set! @x (!= (try (get-word l)) 0)) (return (ok)))
+(defn save-get (l:&Loader x:&usize):(Fallible void)
+  (let (v (try (get-word l)))
+    (when (< v 0) (fail "savegame: a negative index"))
+    (set! @x (unsafe/cast usize v)))
+  (return (ok)))
+(defn save-get (l:&Loader x:&?usize):(Fallible void)
+  (let (v (try (get-word l)))
+    (set! @x (if (< v 0) none (some (unsafe/cast usize v)))))
+  (return (ok)))
+
+; --- pointers --------------------------------------------------------------------
+
+(defn- mobj-id (s:&Saver m:&Mobj):i32
+  (let (k (unsafe/cast usize m))
+    (match (get (ref s 'mobj-ids) k)
+      ((some i) (return i))
+      ((none)
+       (let (i (unsafe/cast i32 (count (ref s 'mobjs))))
+         (assoc (ref s 'mobj-ids) k i)
+         (conj (ref s 'mobjs) m)
+         (return i))))))
+
+(defn- thinker-id (s:&Saver th:&Thinker):i32
+  (let (k (unsafe/cast usize th))
+    (match (get (ref s 'thinker-ids) k)
+      ((some i) (return i))
+      ((none)
+       (let (i (unsafe/cast i32 (count (ref s 'thinkers))))
+         (assoc (ref s 'thinker-ids) k i)
+         (conj (ref s 'thinkers) th)
+         (return i))))))
+
+; These serve the non-null pointers too: overloads can't tell `&Mobj` from
+; `?&Mobj` (ISSUE-029), so a load refuses none where it can't be.
+(defn save-put (s:&Saver x:&?&Mobj):void
+  (put-word s (match @x ((some m) (mobj-id s m)) ((none) -1))))
+(defn save-put (s:&Saver x:&?&Thinker):void
+  (put-word s (match @x ((some t) (thinker-id s t)) ((none) -1))))
+; The active ceilings and plats, through their thinkers.
+(defn save-put (s:&Saver x:&?&Ceiling):void
+  (match @x
+    ((some c) (if-some (th (c 'th)) (put-word s (thinker-id s th)) (set! (s 'broken) true)))
+    ((none) (put-word s -1))))
+(defn save-put (s:&Saver x:&?&Plat):void
+  (match @x
+    ((some p) (if-some (th (p 'th)) (put-word s (thinker-id s th)) (set! (s 'broken) true)))
+    ((none) (put-word s -1))))
+
+(defn- mobj-of (l:&Loader i:i32):(Fallible &Mobj)
+  (when (or (< i 0) (>= (unsafe/cast usize i) (count (ref l 'mobjs))))
+    (fail "savegame: no mobj " i))
+  (return (ok ((ref l 'mobjs) (unsafe/cast usize i)))))
+
+(defn- thinker-of (l:&Loader i:i32):(Fallible &Thinker)
+  (when (or (< i 0) (>= (unsafe/cast usize i) (count (ref l 'thinkers))))
+    (fail "savegame: no thinker " i))
+  (return (ok ((ref l 'thinkers) (unsafe/cast usize i)))))
+
+(defn save-get (l:&Loader x:&?&Mobj):(Fallible void)
+  (let (i (try (get-word l)))
+    (if (< i 0) (set! @x none) (set! @x (some (try (mobj-of l i))))))
+  (return (ok)))
+(defn save-get (l:&Loader x:&?&Thinker):(Fallible void)
+  (let (i (try (get-word l)))
+    (if (< i 0) (set! @x none) (set! @x (some (try (thinker-of l i))))))
+  (return (ok)))
+; Read after every thinker's body, so the thinker already holds its special.
+(defn save-get (l:&Loader x:&?&Ceiling):(Fallible void)
+  (let (i (try (get-word l)))
+    (if (< i 0)
+      (set! @x none)
+      (match ((try (thinker-of l i)) 'think)
+        ((ceiling c) (set! @x (some c)))
+        ((cap) (fail "savegame: active ceiling " i " is no ceiling's"))
+        ((mobj m) (fail "savegame: active ceiling " i " is no ceiling's"))
+        ((door d) (fail "savegame: active ceiling " i " is no ceiling's"))
+        ((floor f) (fail "savegame: active ceiling " i " is no ceiling's"))
+        ((plat p) (fail "savegame: active ceiling " i " is no ceiling's"))
+        ((flash f) (fail "savegame: active ceiling " i " is no ceiling's"))
+        ((strobe f) (fail "savegame: active ceiling " i " is no ceiling's"))
+        ((glow f) (fail "savegame: active ceiling " i " is no ceiling's"))
+        ((flicker f) (fail "savegame: active ceiling " i " is no ceiling's")))))
+  (return (ok)))
+(defn save-get (l:&Loader x:&?&Plat):(Fallible void)
+  (let (i (try (get-word l)))
+    (if (< i 0)
+      (set! @x none)
+      (match ((try (thinker-of l i)) 'think)
+        ((plat p) (set! @x (some p)))
+        ((cap) (fail "savegame: active plat " i " is no plat's"))
+        ((mobj m) (fail "savegame: active plat " i " is no plat's"))
+        ((door d) (fail "savegame: active plat " i " is no plat's"))
+        ((floor f) (fail "savegame: active plat " i " is no plat's"))
+        ((ceiling c) (fail "savegame: active plat " i " is no plat's"))
+        ((flash f) (fail "savegame: active plat " i " is no plat's"))
+        ((strobe f) (fail "savegame: active plat " i " is no plat's"))
+        ((glow f) (fail "savegame: active plat " i " is no plat's"))
+        ((flicker f) (fail "savegame: active plat " i " is no plat's")))))
+  (return (ok)))
+
+; --- structs ---------------------------------------------------------------------
+
+; A writer and a reader of struct `t`, field by field in declaration order,
+; leaving out the fields named after it. An array field is its elements.
+(defmacro defsave (t :rest skip)
+  (let (fields:&Node (struct-fields t)
+        put:&Node (node-list-new (t 'line))
+        get:&Node (node-list-new (t 'line)))
+    (dotimes (i (ast-len fields))
+      (let (f:ptr:Node (ast-at fields i)
+            fname:ptr:Node (ast-at f 0)
+            ftype:ptr:Node (ast-at f 1)
+            skipped:bool false)
+        (dotimes (k (ast-len skip))
+          (when (= (symbol-as-view ((ast-at skip k) 's)) (symbol-as-view (fname 's)))
+            (set! skipped true)))
+        (when (not skipped)
+          (if (and (= (ftype 'kind) NODE-LIST) (= ((ast-at ftype 0) 'kind) NODE-SYM)
+                   (= (symbol-as-view ((ast-at ftype 0) 's)) "array"))
+            (let (n:ptr:Node (ast-at ftype 2))
+              (node-push put `(dotimes (j:i64 ~n) (save-put s (ref (aref (x '~fname) j)))))
+              (node-push get `(dotimes (j:i64 ~n) (try (save-get l (ref (aref (x '~fname) j)))))))
+            (do (node-push put `(save-put s (ref x '~fname)))
+                (node-push get `(try (save-get l (ref x '~fname)))))))))
+    `(do (defn ~'save-put (s:&Saver x:(ref ~t)):void ~@put (return))
+         (defn ~'save-get (l:&Loader x:(ref ~t)):(Fallible void) ~@get (return (ok))))))
+
+(defsave MapThing)
+(defsave BBox)
+(defsave Random)
+(defsave Rules)
+(defsave TicCmd)
+(defsave PspDef)
+; The message points into the HUD's text or a cheat's, which a load restarts.
+(defsave Player message)
+(defsave Mobj)
+(defsave VlDoor)
+(defsave FloorMove)
+(defsave Ceiling)
+(defsave Plat)
+(defsave LightFlash)
+(defsave Strobe)
+(defsave Glow)
+(defsave FireFlicker)
+(defsave Button)
+(defsave SectorPlay)
+(defsave Divline)
+(defsave Opening)
+; The intercepts are rebuilt by every traversal before they're read.
+(defsave MapScratch intercepts)
+(defsave pm/Sector)
+(defsave pm/Side)
+(defsave pm/Line)
+
+; --- vectors ---------------------------------------------------------------------
+
+; The vector functions are the caller's (~'count): ISSUE-010.
+(defmacro put-vec (s v)
+  `(let (sl (~'view ~v))
+     (put-word ~s (unsafe/cast i32 (~'count &sl)))
+     (dotimes (i:usize (~'count &sl)) (save-put ~s (&sl i)))))
+
+; The vector is refilled with `blank` to the saved length, then read over.
+(defmacro get-vec (l v blank)
+  `(let (n (try (get-word ~l)))
+     (when (or (< n 0) (> n 1000000)) (fail "savegame: a vector of " n))
+     (~'clear! ~v)
+     (dotimes (i:i32 n) (~'conj ~v ~blank))
+     (let (sl (~'view ~v))
+       (dotimes (i:usize (~'count &sl)) (try (save-get ~l (&sl i)))))))
+
+; The same by index, for the vectors of `&Mobj`: a `view` of one beside the
+; automap's of a `(Vector ?&Mobj)` stamps the wrong instance (ISSUE-030).
+; A none read into one is refused, since overloads can't refuse it (ISSUE-029).
+(defn- put-mobj-vec (s:&Saver v:&(Vector &Mobj)):void
+  (put-word s (unsafe/cast i32 (count v)))
+  (dotimes (i:usize (count v))
+    (let (x:?&Mobj (some (v i))) (save-put s &x))))
+
+(defn- get-mobj-vec (l:&Loader v:&(Vector &Mobj)):(Fallible void)
+  (let (n (try (get-word l)))
+    (when (or (< n 0) (> n 1000000)) (fail "savegame: a vector of " n))
+    (clear! v)
+    (dotimes (i:i32 n) (conj v (try (mobj-of l (try (get-word l)))))))
+  (return (ok)))
+
+; The same for a vector the level sizes: a save of another map is refused.
+(defmacro get-vec-sized (l v)
+  `(let (n (try (get-word ~l)) sl (~'view ~v))
+     (when (!= n (unsafe/cast i32 (~'count &sl))) (fail "savegame: its map isn't this IWAD's"))
+     (dotimes (i:usize (~'count &sl)) (try (save-get ~l (&sl i))))))
+
+(defn save-put (s:&Saver x:&(Vector usize)):void (put-vec s x))
+(defn save-get (l:&Loader x:&(Vector usize)):(Fallible void) (get-vec l x (as usize 0)) (return (ok)))
+
+; --- thinkers --------------------------------------------------------------------
+
+(defconst TK-CAP 0)
+(defconst TK-MOBJ 1)
+(defconst TK-DOOR 2)
+(defconst TK-FLOOR 3)
+(defconst TK-CEILING 4)
+(defconst TK-PLAT 5)
+(defconst TK-FLASH 6)
+(defconst TK-STROBE 7)
+(defconst TK-GLOW 8)
+(defconst TK-FLICKER 9)
+
+(defn- put-thinker (s:&Saver th:&Thinker):void
+  (save-put s (ref th 'prev))
+  (save-put s (ref th 'next))
+  (save-put s (ref th 'removed))
+  (save-put s (ref th 'idle))
+  (match (th 'think)
+    ((cap) (put-word s TK-CAP))
+    ((mobj m) (put-word s TK-MOBJ) (put-word s (mobj-id s m)))
+    ((door d) (put-word s TK-DOOR) (save-put s d))
+    ((floor f) (put-word s TK-FLOOR) (save-put s f))
+    ((ceiling c) (put-word s TK-CEILING) (save-put s c))
+    ((plat p) (put-word s TK-PLAT) (save-put s p))
+    ((flash f) (put-word s TK-FLASH) (save-put s f))
+    ((strobe f) (put-word s TK-STROBE) (save-put s f))
+    ((glow f) (put-word s TK-GLOW) (save-put s f))
+    ((flicker f) (put-word s TK-FLICKER) (save-put s f))))
+
+; Each special is its thinker's alone, so it's made with the thinker's body.
+(defn- get-thinker (l:&Loader th:&Thinker):(Fallible void)
+  (try (save-get l (ref th 'prev)))
+  (try (save-get l (ref th 'next)))
+  (try (save-get l (ref th 'removed)))
+  (try (save-get l (ref th 'idle)))
+  (let (a (ref (unwrap (l 'w)) 'arena) k (try (get-word l)))
+    (case k
+      TK-CAP (set! (th 'think) (Think-cap))
+      TK-MOBJ (set! (th 'think) (Think-mobj (try (mobj-of l (try (get-word l))))))
+      TK-DOOR (let (x (new VlDoor a)) (try (save-get l x)) (set! (th 'think) (Think-door x)))
+      TK-FLOOR (let (x (new FloorMove a)) (try (save-get l x)) (set! (th 'think) (Think-floor x)))
+      TK-CEILING (let (x (new Ceiling a)) (try (save-get l x)) (set! (th 'think) (Think-ceiling x)))
+      TK-PLAT (let (x (new Plat a)) (try (save-get l x)) (set! (th 'think) (Think-plat x)))
+      TK-FLASH (let (x (new LightFlash a)) (try (save-get l x)) (set! (th 'think) (Think-flash x)))
+      TK-STROBE (let (x (new Strobe a)) (try (save-get l x)) (set! (th 'think) (Think-strobe x)))
+      TK-GLOW (let (x (new Glow a)) (try (save-get l x)) (set! (th 'think) (Think-glow x)))
+      TK-FLICKER (let (x (new FireFlicker a)) (try (save-get l x)) (set! (th 'think) (Think-flicker x)))
+      (fail "savegame: thinker kind " k)))
+  (return (ok)))
+
+; --- the world -------------------------------------------------------------------
+
+; Everything but the objects' bodies, which follow it in the file. The level's
+; sectors, sides and lines are whole: the specials change any of their fields.
+(defn- put-world (s:&Saver w:&World):void
+  (let (l (ref w 'level))
+    (put-vec s (ref l 'sectors))
+    (put-vec s (ref l 'sides))
+    (put-vec s (ref l 'lines)))
+  (save-put s (ref w 'random))
+  (put-mobj-vec s (ref w 'free-mobjs)) ; ISSUE-030
+  (put-vec s (ref w 'free-thinkers))
+  (put-vec s (ref w 'sector-things))
+  (put-vec s (ref w 'block-links))
+  (put-vec s (ref w 'sector-play))
+  (put-vec s (ref w 'line-valid))
+  (save-put s (ref w 'valid-count))
+  (put-vec s (ref w 'players))
+  (put-vec s (ref w 'player-in-game))
+  (put-vec s (ref w 'player-starts))
+  (put-vec s (ref w 'player-start-in-game))
+  (put-vec s (ref w 'deathmatch-starts))
+  (save-put s (ref w 'total-kills))
+  (save-put s (ref w 'total-items))
+  (save-put s (ref w 'total-secret))
+  (save-put s (ref w 'level-time))
+  (save-put s (ref w 'exit))
+  (put-vec s (ref w 'active-ceilings))
+  (put-vec s (ref w 'active-plats))
+  (put-vec s (ref w 'buttons))
+  (save-put s (ref w 'scratch))
+  (put-vec s (ref w 'item-respawn-que))
+  (put-vec s (ref w 'item-respawn-time))
+  (save-put s (ref w 'ique-head))
+  (save-put s (ref w 'ique-tail))
+  (put-vec s (ref w 'body-que))
+  (save-put s (ref w 'body-que-slot))
+  (put-vec s (ref w 'texture-translation))
+  (put-vec s (ref w 'flat-translation))
+  (put-vec s (ref w 'line-specials))
+  (save-put s (ref w 'level-timer))
+  (save-put s (ref w 'level-time-count))
+  (save-put s (ref w 'on-ground))
+  (save-put s (ref w 'game-tic))
+  (put-mobj-vec s (ref w 'brain-targets)) ; ISSUE-030
+  (save-put s (ref w 'brain-target-on))
+  (save-put s (ref w 'brain-easy))
+  (save-put s (ref w 'console-spawns))
+  (save-put s (ref w 'console-died)))
+
+(defn- get-world (l:&Loader w:&World):(Fallible void)
+  (let (lv (ref w 'level)
+        ; ISSUE-022: conj can't take a bare none.
+        no-mobj:?&Mobj none no-ceiling:?&Ceiling none no-plat:?&Plat none
+        thing (MapThing 0 0 0 0 0))
+    (get-vec-sized l (ref lv 'sectors))
+    (get-vec-sized l (ref lv 'sides))
+    (get-vec-sized l (ref lv 'lines))
+    (try (save-get l (ref w 'random)))
+    (try (get-mobj-vec l (ref w 'free-mobjs))) ; ISSUE-030
+    (get-vec l (ref w 'free-thinkers) (w 'thinker-cap))
+    (get-vec-sized l (ref w 'sector-things))
+    (get-vec-sized l (ref w 'block-links))
+    (get-vec-sized l (ref w 'sector-play))
+    (get-vec-sized l (ref w 'line-valid))
+    (try (save-get l (ref w 'valid-count)))
+    (get-vec l (ref w 'players) (player-zero))
+    (get-vec l (ref w 'player-in-game) false)
+    (get-vec l (ref w 'player-starts) thing)
+    (get-vec l (ref w 'player-start-in-game) false)
+    (get-vec l (ref w 'deathmatch-starts) thing)
+    (try (save-get l (ref w 'total-kills)))
+    (try (save-get l (ref w 'total-items)))
+    (try (save-get l (ref w 'total-secret)))
+    (try (save-get l (ref w 'level-time)))
+    (try (save-get l (ref w 'exit)))
+    (get-vec l (ref w 'active-ceilings) no-ceiling)
+    (get-vec l (ref w 'active-plats) no-plat)
+    (get-vec l (ref w 'buttons) (Button 0 0 0 0 none))
+    (try (save-get l (ref w 'scratch)))
+    (get-vec l (ref w 'item-respawn-que) thing)
+    (get-vec l (ref w 'item-respawn-time) 0)
+    (try (save-get l (ref w 'ique-head)))
+    (try (save-get l (ref w 'ique-tail)))
+    (get-vec l (ref w 'body-que) no-mobj)
+    (try (save-get l (ref w 'body-que-slot)))
+    (get-vec-sized l (ref w 'texture-translation))
+    (get-vec-sized l (ref w 'flat-translation))
+    (get-vec l (ref w 'line-specials) (as usize 0))
+    (try (save-get l (ref w 'level-timer)))
+    (try (save-get l (ref w 'level-time-count)))
+    (try (save-get l (ref w 'on-ground)))
+    (try (save-get l (ref w 'game-tic)))
+    (try (get-mobj-vec l (ref w 'brain-targets))) ; ISSUE-030
+    (try (save-get l (ref w 'brain-target-on)))
+    (try (save-get l (ref w 'brain-easy)))
+    (try (save-get l (ref w 'console-spawns)))
+    (try (save-get l (ref w 'console-died))))
+  (return (ok)))
+
+; --- the file ----------------------------------------------------------------------
+
+; What the menu shows of a save, and what the game needs to load its level.
+(defstruct SaveInfo description:String rules:Rules)
+
+(defn- put-text (s:&Saver t:StrView):void
+  (put-word s (unsafe/cast i32 (t 'len)))
+  (dotimes (i:usize (t 'len)) (conj (ref s 'out) (unsafe/cast ui8 (byte-of t i)))))
+
+(defn- append (out:&(Vector ui8) more:&(Vector ui8)):void
+  (let (m (view more))
+    (dotimes (i:usize (count &m)) (conj out @(&m i)))))
+
+; The header, the counts, the objects' bodies in the order met, each tagged
+; with its kind, then the world. The thinkers are numbered from the list, so
+; the cap is 0 and the order is P_RunThinkers'.
+(defn world-save (w:&World description:StrView):(Fallible (Vector ui8))
+  (let (s (Saver (make (Vector ui8)) (make (HashMap usize i32)) (make (Vector &Mobj))
+                 (make (HashMap usize i32)) (make (Vector &Thinker)) false)
+        cap (w 'thinker-cap))
+    (thinker-id &s cap)
+    (let (th (unwrap (cap 'next)))
+      (while (not (same? th cap))
+        (thinker-id &s th)
+        (set! th (unwrap (th 'next)))))
+    ; The world first, into its own buffer: the bodies follow from what it names.
+    (put-world &s w)
+    (let (world-bytes (s 'out) bodies (make (Vector ui8)) ti:usize 0 mi:usize 0)
+      (set! (s 'out) (make (Vector ui8)))
+      (let (going true)
+        (while going
+          (cond (< ti (count (ref s 'thinkers)))
+                (do (put-word &s 0)
+                    (put-thinker &s ((ref s 'thinkers) ti))
+                    (set! ti (+ ti 1)))
+                (< mi (count (ref s 'mobjs)))
+                (do (put-word &s 1)
+                    (save-put &s ((ref s 'mobjs) mi))
+                    (set! mi (+ mi 1)))
+                true (set! going false))))
+      (set! bodies (s 'out))
+      (set! (s 'out) (make (Vector ui8)))
+      (put-word &s SAVE-MAGIC)
+      (put-word &s SAVE-VERSION)
+      (put-text &s description)
+      (save-put &s (ref w 'rules))
+      (put-word &s (unsafe/cast i32 (count (ref s 'thinkers))))
+      (put-word &s (unsafe/cast i32 (count (ref s 'mobjs))))
+      (append (ref s 'out) &bodies)
+      (append (ref s 'out) &world-bytes)
+      (put-word &s SAVE-END)
+      (drop &bodies) (drop &world-bytes)
+      (drop (ref s 'mobj-ids)) (drop (ref s 'thinker-ids))
+      (drop (ref s 'mobjs)) (drop (ref s 'thinkers))
+      (when (s 'broken)
+        (drop (ref s 'out))
+        (fail "savegame: an active ceiling or plat has no thinker"))
+      (return (ok (s 'out))))))
+
+(defn- loader-of (data:Bytes w:&World):Loader
+  (return (Loader data 0 (some w) (make (Vector &Mobj)) (make (Vector &Thinker)))))
+
+(defn- get-header (l:&Loader info:&SaveInfo):(Fallible void)
+  (when (!= (try (get-word l)) SAVE-MAGIC) (fail "not a savegame"))
+  (let (v (try (get-word l)))
+    (when (!= v SAVE-VERSION) (fail "savegame version " v ", not " SAVE-VERSION)))
+  (let (n (try (get-word l)))
+    (when (or (< n 0) (> (+ (l 'pos) (unsafe/cast usize n)) (count (ref l 'data))))
+      (fail "the savegame ends early"))
+    (clear! (ref info 'description))
+    (dotimes (i:i32 n)
+      (let (b (byte-at (ref l 'data) (l 'pos)))
+        (string-push-char (ref info 'description) (as Char (unsafe/cast ui32 (if (and (>= b 32) (< b 127)) b 63)))))
+      (set! (l 'pos) (+ (l 'pos) 1))))
+  (try (save-get l (ref info 'rules)))
+  (return (ok)))
+
+; A save's description and rules, without its world.
+(defn save-info (data:Bytes rules:Rules):(Fallible SaveInfo)
+  (let (info (SaveInfo (make String) rules) l (Loader data 0 none (make (Vector &Mobj)) (make (Vector &Thinker))))
+    (match (get-header &l &info)
+      ((ok) (return (ok info)))
+      ((err e) (drop (ref info 'description)) (return (err e))))))
+
+; The objects' bodies and the world, into a world made for the save.
+(defn- fill (l:&Loader w:&World):(Fallible void)
+  (let (info (SaveInfo (make String) (w 'rules)))
+    (try (get-header l &info))
+    (drop (ref info 'description))
+    (set! (w 'rules) (info 'rules)))
+  (let (nt (try (get-word l)) nm (try (get-word l)))
+    (when (or (< nt 1) (< nm 0) (> nt 1000000) (> nm 1000000)) (fail "savegame: bad counts"))
+    (conj (ref l 'thinkers) (w 'thinker-cap))
+    (dotimes (i:i32 (- nt 1))
+      (conj (ref l 'thinkers) (new Thinker (ref w 'arena) none none false false (Think-cap))))
+    (dotimes (i:i32 nm) (conj (ref l 'mobjs) (new Mobj (ref w 'arena))))
+    (let (ti:usize 0 mi:usize 0)
+      (dotimes (k:i32 (+ nt nm))
+        ; ISSUE-031: case evaluates its form once per value it tries.
+        (let (tag (try (get-word l)))
+          (case tag
+            0 (do (when (>= ti (count (ref l 'thinkers))) (fail "savegame: too many thinkers"))
+                  (try (get-thinker l ((ref l 'thinkers) ti)))
+                  (set! ti (+ ti 1)))
+            1 (do (when (>= mi (count (ref l 'mobjs))) (fail "savegame: too many mobjs"))
+                  (try (save-get l ((ref l 'mobjs) mi)))
+                  (set! mi (+ mi 1)))
+            (fail "savegame: a body of kind " tag))))))
+  (try (get-world l w))
+  ; ISSUE-029: the free thinkers were read through the nullable overload.
+  (dotimes (i:usize (count (ref w 'free-thinkers)))
+    (when (= (unsafe/cast usize ((ref w 'free-thinkers) i)) 0) (fail "savegame: a free thinker is none")))
+  (when (!= (try (get-word l)) SAVE-END) (fail "savegame: no end marker"))
+  (return (ok)))
+
+; The world of a save made by world-save, over a fresh load of its level `lv`.
+; Every object is made first, so a pointer can name one not read yet.
+(defn world-load (data:Bytes lv:pm/Level pics:PicData rules:Rules):(Fallible &World)
+  (let (in-game (make (Vector bool)) players (make (Vector Player)))
+    (dotimes (i:usize MAXPLAYERS) (conj &in-game false) (conj &players (player-zero)))
+    (let (w (world-new lv rules players &in-game (random-new) pics)
+          l (loader-of data w)
+          r (fill &l w))
+      (drop &in-game)
+      (drop (ref l 'mobjs)) (drop (ref l 'thinkers))
+      (match r
+        ((ok) (return (ok w)))
+        ((err e)
+         (drop (ref w 'players))
+         (world-free w)
+         (return (err e)))))))

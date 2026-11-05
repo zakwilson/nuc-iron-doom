@@ -1,0 +1,22 @@
+; ISSUE-010 (second probe): a quasiquote naming `count` (or `conj`) is refused once any file
+; of the program has `(import-ct nucleus.node)`, which defines them too; in a
+; bigger program the error lists one namespace per method, ~60 of them.
+; flags: -I $ROOT/probes/issue-010b
+; fixed-when: output-contains 3 2
+; Actual: "macro 'len-of' names 'count', whose methods here come from
+; namespaces 'nucleus.vector', 'nucleus.node', 'nucleus.hashmap', …".
+; Writing ~'count works.
+
+(import-use "stdio.h")
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use issue010b.nodes)
+
+(defmacro len-of (v) `(count ~v))
+
+(defn main ():i32
+  (let (v (make (Vector i32)))
+    (conj &v 1) (conj &v 2) (conj &v 3)
+    (printf "%d %d\n" (unsafe/cast i32 (len-of &v)) (two))
+    (return 0)))

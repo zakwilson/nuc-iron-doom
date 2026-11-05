@@ -21,6 +21,7 @@
 (import-use tests.sound)
 (import-use tests.music)
 (import-use tests.config)
+(import-use tests.saveg)
 
 (defn main (argc:i32 argv:ptr):int
   (return (as int (test-main argc argv))))

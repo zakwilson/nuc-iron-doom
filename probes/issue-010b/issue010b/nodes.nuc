@@ -1,0 +1,4 @@
+; A module that builds nodes in its own macros, as any deriving macro does.
+(ns issue010b.nodes)
+(import-ct nucleus.node)
+(defmacro two () (let (n:&Node (node-int 2)) n))

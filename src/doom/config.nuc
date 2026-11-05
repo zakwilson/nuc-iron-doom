@@ -122,8 +122,8 @@
     (str-into &out " }}\n")
     (return out)))
 
-; M_SaveDefaults, making the directory if it isn't there.
-(defn config-save (cfg:&Config path:StrView):(Fallible void)
+; The directory a file goes in, and its parent, made if they aren't there.
+(defn make-parent-dirs (path:StrView):(Fallible void)
   (when-some (slash (strview-rfind-byte &path (as ui8 47)))
     (let (dir (str (try (strview-sub-bytes &path 0 slash))) parent (str ""))
       ; One level up first, for ~/.config itself.
@@ -132,6 +132,11 @@
           (set! parent (str (try (strview-sub-bytes &dv 0 s2))))))
       (when (> (count (ref parent 'bytes)) 0) (match (make-dir (string-as-view &parent)) ((ok) 0) ((err e) 0)))
       (match (make-dir (string-as-view &dir)) ((ok) 0) ((err e) 0))))
+  (return (ok)))
+
+; M_SaveDefaults, making the directory if it isn't there.
+(defn config-save (cfg:&Config path:StrView):(Fallible void)
+  (try (make-parent-dirs path))
   (let (text (config-text cfg))
     (with (f (try (file-create &path)))
       (try (write-str &f (string-as-view &text)))))

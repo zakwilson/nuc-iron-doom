@@ -1,0 +1,15 @@
+; ISSUE-031: `case` evaluates its form again for every value it tries, as its
+; documented expansion into `cond` says, so a form with an effect runs up to
+; once per arm.
+; fixed-when: output-contains calls 1
+; Actual: "calls 2": the form ran for the 5 and again for the 6.
+
+(import-use "stdio.h")
+
+(defvar N:i32 0)
+(defn next ():i32 (set! N (+ N 1)) (return N))
+
+(defn main ():i32
+  (let (r (case (next) 5 50 6 60 0))
+    (printf "calls %d (r %d)\n" N r)
+    (return 0)))

@@ -213,9 +213,16 @@ an out-parameter is how the option parser fills each field, as Rust's
   to compile in a file importing `nucleus.vector` and `nucleus.slice`; actual
   `macro 'total' names 'count', whose methods here come from namespaces
   'nucleus.vector', 'nucleus.slice', and a full name reaches one`
-- **Port sites:** `src/doom/cli.nuc` (`defoptions`)
+- **Second probe:** `probes/issue-010b.nuc` (with a module in
+  `probes/issue-010b/`) — the same refusal in a file importing only
+  `nucleus.vector`, because another file of the program has
+  `(import-ct nucleus.node)`
+- **Port sites:** `src/doom/cli.nuc` (`defoptions`),
+  `src/doom/play/saveg.nuc` (`put-vec`, `get-vec`, `get-vec-sized`),
+  `src/tests/saveg.nuc` (`sizes-match`)
 - **Workaround:** write the full name of the one namespace you mean,
-  `nucleus.slice/count`, in the template.
+  `nucleus.slice/count`, in the template, or `~'count` for the caller's
+  own name.
 - **Suggestion:** a protocol that every collection's `count` conforms to (a
   `Counted` protocol, or `Coll` covering `Slice`) gives hygiene a single full
   name. At the least, say "write one of these full names in the template:
@@ -229,6 +236,13 @@ can't use `count` in a template, though the same file calls it freely. In
 `src/doom/cli.nuc` the message listed `'nucleus.vector'` thirteen times among
 twenty-one entries, and "a full name reaches one" reads as a statement rather
 than the fix.
+
+It came back in milestone 7 without a second collection in sight. Any macro
+that builds code with `node-push` needs `nucleus.node` at compile time, and
+`nucleus.node` defines `count`, `conj`, `iter` and `empty?` for `Node`. So the
+savegame's `defsave` (in `doom.play.saveg`) stopped every other file's
+templates from saying `count`, including a test file's helper macro that
+imports nothing of the kind. The fix there was `~'count`.
 
 ## ISSUE-011: a macro-defined struct can't appear in any other function's signature
 
@@ -666,6 +680,86 @@ type's rules", which reads as if nesting composes. It doesn't: the inner
 commit runs `(edn-release (ref saved 'names))` and then the outer commit runs
 `(edn-release (ref saved 'inner))` on a shallow snapshot holding the same
 vector. A crash in `free` from a config read is a costly way to find that.
+
+## ISSUE-029: overloads can't differ only in a pointer's nullability
+
+- **Severity:** minor
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-029.nuc` — expected `(defn f (x:?&Q) …)` beside
+  `(defn f (x:&Q) …)` to be two overloads; actual `duplicate definition of
+  'f' — the same parameter types are already defined`
+- **Port sites:** `src/doom/play/saveg.nuc` (`save-put`/`save-get` for
+  `&?&Mobj` and `&?&Thinker`, `get-mobj-vec`, and the free-thinker check in
+  `fill`)
+- **Workaround:** one overload, the nullable one, serves both. A writer
+  handles `&Mobj` fine that way, but a reader can store none in a non-null
+  slot, so the loader reads the non-null vectors through `mobj-of` (which
+  refuses -1) or checks them for null afterwards.
+- **Suggestion:** let nullability take part in overload identity when the
+  two signatures differ only there, as it already does for template instance
+  names since nuc-doom ISSUE-013 (`stamp-arg-token`). Failing that, say in
+  the error that `?&T` and `&T` are one type to the overload table, which
+  `docs/generics.md` states only for conformances.
+
+Context: `defsave` writes a field by calling `save-put` on its address, so
+the field's type picks the code, as `docs/macros.md` recommends ("overloading
+picks the code for it"). That breaks down exactly where a savegame needs it
+most: a `?&Mobj` field may be none, and a `&Mobj` element may not.
+
+## ISSUE-030: a generic stamped for `&Q` and then `?&Q` reuses the first instance's inner calls
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-030.nuc` — expected `view` (a `(Vector T)` →
+  `(Slice T)` helper over `slice-of`) called on a `(Vector &Q)` and on a
+  `(Vector ?&Q)` to compile; actual `view.pnuc_Vector.qQ: internal: aggregate
+  return of a (Slice &Q) where the declared return type is %nuc_Slice.qQ`
+- **Port sites:** `src/doom/play/saveg.nuc` (`put-mobj-vec` and
+  `get-mobj-vec` for `free-mobjs` and `brain-targets`, which index the
+  vector instead of viewing it)
+- **Workaround:** don't `view` a `(Vector &Mobj)` in a program that also
+  views a `(Vector ?&Mobj)` (the automap does): index it with `(v i)`.
+- **Suggestion:** `view`'s two instances get distinct names, since nuc-doom
+  ISSUE-013 made template arguments keep their pointer kind. The inner
+  `slice-of (p:(ptr T) n)` call doesn't: its argument types `(ptr &Q)` and
+  `(ptr ?&Q)` are equal to `generic-find-method-exact` (type-eq ignores the
+  pointer kind) and mangle the same through `type-mangle-token`, so the
+  second request gets the first instance, which returns `(Slice &Q)`. The
+  memo and `mangle-fn-name` need the pointee's kind wherever a pointer is
+  nested inside a parameter type, as `stamp-arg-token` already does for
+  template arguments.
+
+Context: an internal error in the stdlib's own pattern (a generic over a
+generic), triggered by two unrelated files of the port: the automap walks
+`sector-things`, a `(Vector ?&Mobj)`, and the savegame writer walks
+`free-mobjs`, a `(Vector &Mobj)`. Each compiled alone. The error names
+`util.nuc:12`, the generic, not either caller, and only the `note:` line
+says which call asked for the instance.
+
+## ISSUE-031: `case` evaluates its form once per value it tries
+
+- **Severity:** major
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-031.nuc` — expected `(case (next) 5 50 6 60 0)`
+  to call `next` once; actual twice (`calls 2`), once for each value before
+  the default
+- **Port sites:** `src/doom/session.nuc` (the finale's ticker result) and
+  `src/doom/play/saveg.nuc` (`fill`, each body's kind tag)
+- **Workaround:** bind the form in a `let` and `case` on the variable.
+- **Suggestion:** have `case` bind its form to a gensym once, as C's
+  `switch`, Clojure's `case` and Rust's `match` all evaluate their scrutinee
+  once. The documented expansion, `(cond (= form v1) r1 (= form v2) r2 …)`,
+  is accurate, but nobody reads a `case` as a `cond` that repeats its form.
+
+Context: this was a live bug in the port for two milestones. G_Ticker's
+finale branch was `(case (finale-ticker …) 1 … 2 … 0)`, so every finale tic
+that returned 0 ran F_Ticker a second time: the text typed out and the art
+screen's timer ran at double speed. It surfaced only when the savegame
+loader's `(case (get-word l) 0 … 1 …)` read a second word whenever a body
+wasn't a thinker, and the file seemed corrupt.
 
 ## What worked well
 

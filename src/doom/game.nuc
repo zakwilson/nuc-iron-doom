@@ -19,6 +19,7 @@
 (import-use nucleus.parse)
 (import-use nucleus.math)
 (import-use nucleus.create)
+(import-use nucleus.file)
 (import-use doom.error)
 (import-use doom.util)
 (import-use doom.bytes)
@@ -42,6 +43,7 @@
 (import-use doom.play.mobj)
 (import-use doom.play.setup)
 (import-use doom.play.spec)
+(import-use doom.play.saveg)
 (import-use doom.render.state)
 (import-use doom.render.view)
 (import-use doom.render.things)
@@ -191,6 +193,10 @@
 ; Phase B's D_ProcessEvents: the menu sees each key first. What else
 ; G_Responder does with keys, build-ticcmd reads from SDL's key state.
 (defn- process-events (g:&Game):(Fallible void)
+  (set! ((ref g 'menu) 'in-level)
+        (match (g 'session)
+          ((some s) (and (= (s 'gamestate) GS-LEVEL) (some? (s 'world))))
+          ((none) false)))
   (let (evs (poll-events) v (view &evs)
         gt (match (g 'session) ((some s) (s 'gametic)) ((none) (g 'tic))))
     (dotimes (i:usize (count &v))
@@ -277,8 +283,90 @@
              (set! ((player-at w (unsafe/cast usize ((ref w 'rules) 'console-player))) 'message)
                    (some (unsafe/cast CStr (t 'data)))))))
         ((view-size) (set-view-size (ref g 'renderer) (m 'screenblocks)))
-        ((sound n) (menu-sound g n))))
+        ((sound n) (menu-sound g n))
+        ((read-saves) (read-saves g))
+        ((load-game slot)
+         (match (load-saved g slot)
+           ((ok) 0)
+           ((err e) (let (t (str "couldn't load the game:\n" (failure-text &e) "\n\npress a key."))
+                      (menu-message m (string-as-view &t))
+                      (drop &t)))))
+        ((save-game slot)
+         (match (save-slot g slot)
+           ((ok) 0)
+           ((err e) (let (t (str "couldn't save the game:\n" (failure-text &e) "\n\npress a key."))
+                      (menu-message m (string-as-view &t))
+                      (drop &t)))))))
     (clear! (ref m 'requests)))
+  (return (ok)))
+
+; --- savegames ----------------------------------------------------------------
+; Beside the settings file, as Chocolate Doom keeps them in its config
+; directory; not vanilla's format, so not its name.
+
+(defn- save-path (g:&Game slot:i32):(Fallible String)
+  (let (p (string-as-view (ref g 'config-path)) out (make String))
+    (when-some (k (strview-rfind-byte &p (as ui8 47)))
+      (str-into &out (try (strview-sub-bytes &p 0 (+ k 1)))))
+    (str-into &out "doomsav" slot ".nsg")
+    (return (ok out))))
+
+(defn- read-save (g:&Game slot:i32):(Fallible String)
+  (let (path (try (save-path g slot)) pv (string-as-view &path))
+    (with (f (try (file-open-read &pv)))
+      (return (ok (try (file-read-to-string f)))))))
+
+(defn- bytes-of (s:&String):Bytes
+  (let (v (string-as-view s)) (return (slice-of (v 'data) (v 'len)))))
+
+; M_ReadSaveStrings: a slot that won't read is empty.
+(defn- read-saves (g:&Game):void
+  (let (rules (single-player-rules SK-MEDIUM (game-mode (ref g 'assets)) 1 1))
+    (dotimes (i:i32 SAVE-SLOTS)
+      (match (read-save g i)
+        ((ok data)
+         (match (save-info (bytes-of &data) rules)
+           ((ok info)
+            (let (d (ref info 'description))
+              (menu-set-slot (ref g 'menu) i (some (string-as-view d)))
+              (drop d)))
+           ((err e) (menu-set-slot (ref g 'menu) i none)))
+         (drop &data))
+        ((err e) (menu-set-slot (ref g 'menu) i none))))))
+
+; G_DoLoadGame from the menu, into the session the attract loop may be using.
+(defn- load-saved (g:&Game slot:i32):(Fallible void)
+  (let (data (try (read-save g slot))
+        s (match (g 'session) ((some old) old) ((none) (try (new-session g)))))
+    (set! (g 'session) (some s))
+    (let (r (session-load s (ref g 'assets) (bytes-of &data)))
+      (drop &data)
+      (try r))
+    (set! (s 'demo) none)
+    (set! (s 'demo-ended) false)
+    (set! ((ref s 'rules) 'demo-playback) false)
+    (set! (g 'page) none)
+    (set! (g 'advance-demo) false)
+    (set! ((ref g 'menu) 'user-game) true)
+    (set! (g 'pending) (some (Mode-level))))
+  (return (ok)))
+
+; G_DoSaveGame from the menu.
+(defn- save-slot (g:&Game slot:i32):(Fallible void)
+  (match (g 'session)
+    ((none) (fail "no game is being played"))
+    ((some s)
+     (let (text (string-as-view (slot-text-of (ref g 'menu) slot))
+           data (try (session-save s text))
+           path (try (save-path g slot)))
+       (try (make-parent-dirs (string-as-view &path)))
+       (with (f (try (file-create &(string-as-view &path))))
+         (try (file-write-bytes f (unsafe/cast &ui8 ((view &data) 'data)) (count &data))))
+       (drop &data)
+       (drop &path)
+       (let (w (session-world s))
+         (set! ((player-at w (unsafe/cast usize ((ref w 'rules) 'console-player))) 'message)
+               (some "game saved."))))))
   (return (ok)))
 
 ; S_StartSound from nowhere, for the menus: M_Random is the game's if one is
@@ -510,7 +598,9 @@
 ; Loaded once; the copy returned shares its patches.
 (defn- font-of (g:&Game):(Fallible HuFont)
   (when (none? (g 'hu-font))
-    (set! (g 'hu-font) (some (try (hu-font-load (ref (ref g 'assets) 'wad))))))
+    (let (f (try (hu-font-load (ref (ref g 'assets) 'wad))))
+      (menu-set-font (ref g 'menu) &f)
+      (set! (g 'hu-font) (some f))))
   (match (g 'hu-font)
     ((some f) (return (ok f)))
     ((none) (fail "no HU font"))))
@@ -623,6 +713,13 @@
            (do (try (start-demo g d))
                (set! (g 'pending) (some (Mode-level))))
            (cond ((ref g 'cl) 'iron-render) (set! (g 'pending) (some (Mode-intro 0)))
+                 ; -loadgame, or the title if it won't load.
+                 (some? ((ref g 'cl) 'loadgame))
+                 (match (load-saved g (match ((ref g 'cl) 'loadgame) ((some n) n) ((none) 0)))
+                   ((ok) 0)
+                   ((err e) (println "Couldn't load the game: " (failure-text &e))
+                            (end-game g)
+                            (set! (g 'pending) (some (Mode-level)))))
                  (autostart? (ref g 'cl)) (do (try (start-game g))
                                               (set! (g 'pending) (some (Mode-level))))
                  ; D_StartTitle.

@@ -6,8 +6,9 @@
 ; The menus. Vanilla's menu items hold function pointers that reach into the
 ; whole game; here an item names an action, and what the game must do (start
 ; a game, end it, quit, resize the view) comes back as requests for the game
-; layer to carry out, as G_DeferedInitNew defers the new game anyway.
-; Loading and saving aren't ported (milestone 7): their items say so.
+; layer to carry out, as G_DeferedInitNew defers the new game anyway. The
+; savegame files are the game's too: it fills in the slots' descriptions
+; when the menu asks.
 
 (ns doom.menu)
 
@@ -33,22 +34,24 @@
 (defconst LINEHEIGHT 16)
 (defconst SKULLXOFF -32)
 
-(defenum MenuId MAIN-MENU EPI-MENU NEW-MENU OPTIONS-MENU READ1-MENU READ2-MENU SOUND-MENU)
+(defenum MenuId MAIN-MENU EPI-MENU NEW-MENU OPTIONS-MENU READ1-MENU READ2-MENU SOUND-MENU
+  LOAD-MENU SAVE-MENU)
 
 (defenum MenuAction
   ACT-NONE ACT-NEWGAME ACT-OPTIONS ACT-LOADGAME ACT-SAVEGAME ACT-READTHIS ACT-READTHIS2
   ACT-FINISHREADTHIS ACT-QUITDOOM ACT-EPISODE ACT-CHOOSESKILL ACT-ENDGAME ACT-MESSAGES
-  ACT-DETAIL ACT-SCREENSIZE ACT-SENSITIVITY ACT-SOUND ACT-SFXVOL ACT-MUSICVOL)
+  ACT-DETAIL ACT-SCREENSIZE ACT-SENSITIVITY ACT-SOUND ACT-SFXVOL ACT-MUSICVOL
+  ACT-LOADSELECT ACT-SAVESELECT)
 
 ; What a message's answer does (messageRoutine).
-(defenum MessageRoutine MSG-NONE MSG-NIGHTMARE MSG-ENDGAME MSG-QUIT)
+(defenum MessageRoutine MSG-NONE MSG-NIGHTMARE MSG-ENDGAME MSG-QUIT MSG-QUICKSAVE MSG-QUICKLOAD)
 
 ; status: 1 selectable, 2 a slider (left and right work), -1 a blank line.
 (defstruct MenuItem status:i32 name:StrView action:i32 alpha:i32)
 
 ; Which of the menu's own drawers it calls (its routine).
 (defenum MenuDrawer DRAW-MAIN DRAW-EPISODE DRAW-NEWGAME DRAW-OPTIONS DRAW-READ1 DRAW-READ2
-  DRAW-READ-COMMERCIAL DRAW-SOUND)
+  DRAW-READ-COMMERCIAL DRAW-SOUND DRAW-LOAD DRAW-SAVE)
 
 (defstruct Menu items:(Vector MenuItem) prev:i32 drawer:i32 x:i32 y:i32 last-on:i32)
 
@@ -59,7 +62,15 @@
   (quit)
   (player-message text:StrView)
   (view-size)
-  (sound name:i32))
+  (sound name:i32)
+  ; M_ReadSaveStrings: the game answers with menu-set-slot.
+  (read-saves)
+  (load-game slot:i32)
+  ; The description is the slot's text.
+  (save-game slot:i32))
+
+(defconst SAVE-SLOTS 6)
+(defconst SAVESTRINGSIZE 24)
 
 (defstruct MenuState
   menus:(Vector Menu)
@@ -75,6 +86,15 @@
   requests:(Vector MenuRequest)
   ; A game is being played (usergame): End Game needs one.
   user-game:bool
+  ; A level is being played (gamestate == GS_LEVEL): saving needs one.
+  in-level:bool
+  ; Each slot's description, and the one being typed (saveStringEnter).
+  slots:(Vector String)
+  save-entry:bool save-slot:i32 save-old:String
+  ; -1 for none yet, -2 while the save menu picks one.
+  quick-save-slot:i32
+  ; The HUD font's widths for M_StringWidth, which the game fills in.
+  char-widths:(Vector i32)
   commercial:bool shareware:bool ultimate:bool)
 
 (defn- item (status:i32 n:CStr action:i32 alpha:i32):MenuItem
@@ -88,7 +108,12 @@
   (let (ms (make (Vector Menu))
         main (make (Vector MenuItem)) epi (make (Vector MenuItem)) newg (make (Vector MenuItem))
         opt (make (Vector MenuItem)) r1 (make (Vector MenuItem)) r2 (make (Vector MenuItem))
-        snd (make (Vector MenuItem)))
+        snd (make (Vector MenuItem)) ld (make (Vector MenuItem)) sv (make (Vector MenuItem))
+        slots (make (Vector String)))
+    (dotimes (i:i32 SAVE-SLOTS)
+      (conj &ld (item 1 "" ACT-LOADSELECT (+ 49 i)))
+      (conj &sv (item 1 "" ACT-SAVESELECT (+ 49 i)))
+      (conj &slots (str EMPTYSTRING)))
     (conj &main (item 1 "M_NGAME" ACT-NEWGAME 110))
     (conj &main (item 1 "M_OPTION" ACT-OPTIONS 111))
     (conj &main (item 1 "M_LOADG" ACT-LOADGAME 108))
@@ -130,10 +155,13 @@
                 (menu r1 MAIN-MENU DRAW-READ1 280 185 0)))
     (conj &ms (menu r2 (if ultimate -1 READ1-MENU) DRAW-READ2 330 175 0))
     (conj &ms (menu snd OPTIONS-MENU DRAW-SOUND 80 64 0))
+    (conj &ms (menu ld MAIN-MENU DRAW-LOAD 80 54 0))
+    (conj &ms (menu sv MAIN-MENU DRAW-SAVE 80 54 0))
     (return (MenuState ms false MAIN-MENU 0 10 0
                        false (make String) MSG-NONE false false 0
                        true 0 7 10 8 8 5
-                       (make (Vector MenuRequest)) false commercial shareware ultimate))))
+                       (make (Vector MenuRequest)) false false slots false 0 (make String) -1
+                       (make (Vector i32)) commercial shareware ultimate))))
 
 (defn- menu-at (m:&MenuState id:i32):&Menu
   (let (s (view (ref m 'menus))) (return (&s (unsafe/cast usize id)))))
@@ -164,7 +192,9 @@
 (defconst NIGHTMARE-MSG "are you sure? this skill level\nisn't even remotely fair.\n\npress y or n.")
 (defconst SWSTRING "this is the shareware version of doom.\n\nyou need to order the entire trilogy.\n\npress a key.")
 (defconst ENDGAME-MSG "are you sure you want to end the game?\n\npress y or n.")
-(defconst NOTPORTED "loading and saving aren't ported yet.\n\npress a key.")
+(defconst SAVEDEAD "you can't save if you aren't playing!\n\npress a key.")
+(defconst QSAVESPOT "you haven't picked a quicksave slot yet!\n\npress a key.")
+(defconst EMPTYSTRING "empty slot")
 
 (defvar DOOM1-ENDMSG:(array CStr 8) (array CStr
   "are you sure you want to\nquit this great game?"
@@ -219,14 +249,116 @@
     (sound m SFX-OOF)
     (start-message m (strview-from-cstr ENDGAME-MSG) MSG-ENDGAME true)))
 
+; --- loading and saving --------------------------------------------------------
+
+(defn- slot-text (m:&MenuState i:i32):&String
+  (let (s (view (ref m 'slots))) (return (&s (unsafe/cast usize i)))))
+
+(defn slot-text-of (m:&MenuState i:i32):&String (return (slot-text m i)))
+
+; The game's answer to read-saves: a slot's description, or none for an empty
+; one, which can't be loaded.
+(defn menu-set-slot (m:&MenuState i:i32 text:?StrView):void
+  (let (t (slot-text m i) items (view (ref (menu-at m LOAD-MENU) 'items)) it (&items (unsafe/cast usize i)))
+    (clear! t)
+    (match text
+      ((some v) (str-into t v) (set! (it 'status) 1))
+      ((none) (str-into t EMPTYSTRING) (set! (it 'status) 0)))))
+
+(defn menu-set-font (m:&MenuState font:&HuFont):void
+  (clear! (ref m 'char-widths))
+  (dotimes (i:i32 HU-FONTSIZE) (conj (ref m 'char-widths) (unsafe/cast i32 ((font-patch font i) 'width)))))
+
+; M_StringWidth from the game's widths.
+(defn- text-width (m:&MenuState s:StrView):i32
+  (let (w 0)
+    (dotimes (i:usize (s 'len))
+      (let (k (font-index (byte-of s i)))
+        (set! w (+ w (if (or (< k 0) (>= (unsafe/cast usize k) (count (ref m 'char-widths)))) 4
+                       ((ref m 'char-widths) (unsafe/cast usize k)))))))
+    (return w)))
+
+; A message to dismiss, from the game: a save that couldn't be read or written.
+(defn menu-message (m:&MenuState text:StrView):void (start-message m text MSG-NONE false))
+
+(defn- load-game (m:&MenuState):void
+  (setup-next-menu m LOAD-MENU)
+  (request m (MenuRequest-read-saves)))
+
+(defn- save-game (m:&MenuState):void
+  (cond (not (m 'user-game)) (start-message m (strview-from-cstr SAVEDEAD) MSG-NONE false)
+        (m 'in-level) (do (setup-next-menu m SAVE-MENU) (request m (MenuRequest-read-saves)))
+        true 0))
+
+(defn- load-select (m:&MenuState choice:i32):void
+  (request m (MenuRequest-load-game choice))
+  (clear-menus m))
+
+; M_SaveSelect: typing starts, over the old description unless it's empty.
+(defn- save-select (m:&MenuState choice:i32):void
+  (let (t (slot-text m choice) old (ref m 'save-old))
+    (set! (m 'save-entry) true)
+    (set! (m 'save-slot) choice)
+    (clear! old)
+    (str-into old (string-as-view t))
+    (when (= (string-as-view t) (strview-from-cstr EMPTYSTRING)) (clear! t))))
+
+(defn- do-save (m:&MenuState slot:i32):void
+  (request m (MenuRequest-save-game slot))
+  (clear-menus m)
+  (when (= (m 'quick-save-slot) -2) (set! (m 'quick-save-slot) slot)))
+
+; A message with a slot's description in it.
+(defn- slot-message (m:&MenuState before:CStr slot:i32 after:CStr routine:i32):void
+  (let (s (str before (string-as-view (slot-text m slot)) after))
+    (start-message m (string-as-view &s) routine true)
+    (drop &s)))
+
+(defn- quick-save (m:&MenuState):void
+  (cond (not (m 'user-game)) (sound m SFX-OOF)
+        (not (m 'in-level)) 0
+        (< (m 'quick-save-slot) 0)
+        (do (open-panel m)
+            (setup-next-menu m SAVE-MENU)
+            (request m (MenuRequest-read-saves))
+            (set! (m 'quick-save-slot) -2))
+        true (slot-message m "quicksave over your game named\n\n'" (m 'quick-save-slot)
+                           "'?\n\npress y or n." MSG-QUICKSAVE)))
+
+(defn- quick-load (m:&MenuState):void
+  (if (< (m 'quick-save-slot) 0)
+    (start-message m (strview-from-cstr QSAVESPOT) MSG-NONE false)
+    (slot-message m "do you want to quickload the game named\n\n'" (m 'quick-save-slot)
+                  "'?\n\npress y or n." MSG-QUICKLOAD)))
+
+; The description being typed takes every key (saveStringEnter).
+(defn- save-entry-key (m:&MenuState key:i32 ch:i32):void
+  (let (t (slot-text m (m 'save-slot)) n (count (ref t 'bytes)))
+    (cond (= key KEY-BACKSPACE) (when (> n 0) (string-truncate t (- n 1)))
+          (= key KEY-ESCAPE)
+          (do (set! (m 'save-entry) false)
+              (clear! t)
+              (str-into t (string-as-view (ref m 'save-old))))
+          (= key KEY-ENTER)
+          (do (set! (m 'save-entry) false)
+              (when (> n 0) (do-save m (m 'save-slot))))
+          true
+          (let (c (if (and (>= ch 97) (<= ch 122)) (- ch 32) ch))
+            (when (and (or (= c 32) (>= (font-index c) 0)) (>= c 32) (<= c 127)
+                       (< n (- SAVESTRINGSIZE 1))
+                       (< (text-width m (string-as-view t)) (* (- SAVESTRINGSIZE 2) 8)))
+              (string-push-char t (as Char (unsafe/cast ui32 c))))))))
+
 ; An item's routine, with its choice: the item's index, or 0 or 1 for a
 ; slider's left or right.
 (defn- run-action (m:&MenuState action:i32 choice:i32 gametic:i32):void
   (case action
     ACT-NEWGAME (setup-next-menu m (if (m 'commercial) NEW-MENU EPI-MENU))
     ACT-OPTIONS (setup-next-menu m OPTIONS-MENU)
-    ACT-LOADGAME (start-message m (strview-from-cstr NOTPORTED) MSG-NONE false)
-    ACT-SAVEGAME (start-message m (strview-from-cstr NOTPORTED) MSG-NONE false)
+    ACT-LOADGAME (load-game m)
+    ACT-SAVEGAME (save-game m)
+    ACT-LOADSELECT (load-select m choice)
+    ACT-SAVESELECT (save-select m choice)
     ACT-READTHIS (setup-next-menu m READ1-MENU)
     ACT-READTHIS2 (setup-next-menu m READ2-MENU)
     ACT-FINISHREADTHIS (setup-next-menu m MAIN-MENU)
@@ -268,6 +400,8 @@
                     (clear-menus m)
                     (request m (MenuRequest-end-game)))
       MSG-QUIT (when yes (request m (MenuRequest-quit)))
+      MSG-QUICKSAVE (when yes (do-save m (m 'quick-save-slot)))
+      MSG-QUICKLOAD (when yes (load-select m (m 'quick-save-slot)))
       0)))
 
 ; M_StartControlPanel.
@@ -287,6 +421,9 @@
     (return true))
   (when (!= (ev 'type) EV-KEYDOWN) (return false))
   (let (key (ev 'key) ch (ev 'ch))
+    (when (m 'save-entry)
+      (save-entry-key m key ch)
+      (return true))
     (when (m 'to-print)
       (when (and (m 'needs-input)
                  (not (or (= key 32) (= key KEY-ESCAPE) (= key 121) (= key 110))))
@@ -307,6 +444,11 @@
                                (set! (m 'item-on) 0)
                                (sound m SFX-SWTCHN)
                                (return true))
+            ; F2 and F3: the save and load menus; F6 and F9: quicksave and quickload.
+            (= key (+ KEY-F1 1)) (do (open-panel m) (sound m SFX-SWTCHN) (save-game m) (return true))
+            (= key (+ KEY-F1 2)) (do (open-panel m) (sound m SFX-SWTCHN) (load-game m) (return true))
+            (= key (+ KEY-F1 5)) (do (sound m SFX-SWTCHN) (quick-save m) (return true))
+            (= key (+ KEY-F1 8)) (do (sound m SFX-SWTCHN) (quick-load m) (return true))
             (= key (+ KEY-F1 6)) (do (sound m SFX-SWTCHN) (end-game m) (return true))
             (= key (+ KEY-F1 7)) (do (change-messages m) (sound m SFX-SWTCHN) (return true))
             (= key (+ KEY-F1 9)) (do (sound m SFX-SWTCHN) (quit-doom m gametic) (return true))
@@ -417,7 +559,17 @@
   (try (draw-named w buf (+ x 8 (* dot 8)) y "M_THERMO"))
   (return (ok)))
 
-(defn- draw-menu-routine (m:&MenuState w:&Wad buf:&Buffer):(Fallible void)
+; M_DrawSaveLoadBorder and each slot's description.
+(defn- draw-slots (m:&MenuState w:&Wad font:&HuFont buf:&Buffer x:i32 y:i32):(Fallible void)
+  (dotimes (i:i32 SAVE-SLOTS)
+    (let (yy (+ y (* LINEHEIGHT i)) t (string-as-view (slot-text m i)))
+      (try (draw-named w buf (- x 8) (+ yy 7) "M_LSLEFT"))
+      (dotimes (k:i32 24) (try (draw-named w buf (+ x (* k 8)) (+ yy 7) "M_LSCNTR")))
+      (try (draw-named w buf (+ x 192) (+ yy 7) "M_LSRGHT"))
+      (try (write-line font buf x yy t 0 (t 'len)))))
+  (return (ok)))
+
+(defn- draw-menu-routine (m:&MenuState w:&Wad font:&HuFont buf:&Buffer):(Fallible void)
   (let (cur (menu-at m (m 'current)) x (cur 'x) y (cur 'y))
     (case (cur 'drawer)
       DRAW-MAIN (try (draw-named w buf 94 2 "M_DOOM"))
@@ -434,6 +586,14 @@
       DRAW-READ1 (try (draw-named w buf 0 0 "HELP2"))
       DRAW-READ2 (try (draw-named w buf 0 0 "HELP1"))
       DRAW-READ-COMMERCIAL (try (draw-named w buf 0 0 "HELP"))
+      DRAW-LOAD (do (try (draw-named w buf 72 28 "M_LOADG"))
+                    (try (draw-slots m w font buf x y)))
+      DRAW-SAVE (do (try (draw-named w buf 72 28 "M_SAVEG"))
+                    (try (draw-slots m w font buf x y))
+                    (when (m 'save-entry)
+                      (let (t (string-as-view (slot-text m (m 'save-slot))) u (strview-from-cstr "_"))
+                        (try (write-line font buf (+ x (string-width font t 0 (t 'len)))
+                                         (+ y (* LINEHEIGHT (m 'save-slot))) u 0 1)))))
       DRAW-SOUND (do (try (draw-named w buf 60 38 "M_SVOL"))
                      (try (draw-thermo w buf x (+ y LINEHEIGHT) 16 (m 'sfx-volume)))
                      (try (draw-thermo w buf x (+ y (* LINEHEIGHT 3)) 16 (m 'music-volume))))
@@ -457,7 +617,7 @@
           (set! j (+ j 1)))))
     (return (ok)))
   (when (not (m 'active)) (return (ok)))
-  (try (draw-menu-routine m w buf))
+  (try (draw-menu-routine m w font buf))
   (let (cur (menu-at m (m 'current)) x (cur 'x) y (cur 'y))
     (dotimes (i:i32 (item-count cur))
       (let (it (item-at cur i))
