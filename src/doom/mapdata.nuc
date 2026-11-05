@@ -50,7 +50,9 @@
   nodes:(Vector MapNode)
   sectors:(Vector MapSector)
   reject:Bytes
-  block-map:MapBlockMap)
+  block-map:MapBlockMap
+  ; Chocolate Doom reads the blockmap as the whole lump of words.
+  blockmap-lump:Bytes)
 
 (defn- i16s (b:&Bytes):(Vector i16)
   (let (v (make (Vector i16)) i:usize 0)
@@ -83,7 +85,7 @@
       (return (ok (Map (records-of MapThing 1) (records-of MapLine 2) (records-of MapSide 3)
                        (records-of MapVertex 4) (records-of MapSegment 5)
                        (records-of MapSubSector 6) (records-of MapNode 7)
-                       (records-of MapSector 8) rj (read-block-map &bm)))))
+                       (records-of MapSector 8) rj (read-block-map &bm) bm))))
     (fail "Missing Map " nm)))
 
 (defn map-name (episode:i32 m:i32):Name

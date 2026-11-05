@@ -15,6 +15,7 @@ provisional until milestone 8.)
 | ISSUE-009 | `(some v)`/`none` aren't target-typed through a `deref` or `aref` place | minor | bug |
 | ISSUE-013 | Float `!=` was ordered, so NaN != NaN was false | minor | bug |
 | ISSUE-015 | A float constant doesn't adapt to an overload's `f32` parameter | minor | design |
+| ISSUE-019 | A struct literal passed to a generic binds `T` to `&S` | minor | bug |
 | ISSUE-010 | A macro template can't call `count` where two collection namespaces are imported | minor | design |
 | ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature |
 | ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature |
@@ -25,7 +26,8 @@ provisional until milestone 8.)
 | ISSUE-007 | A call named like a field is silently a designated initializer | papercut | diagnostics |
 | ISSUE-008 | A `defconst`'s value is not macro-expanded | papercut | design |
 | ISSUE-017 | `str` and `println` can't format a `ui32`, `i16` or `ui8` | papercut | missing-feature |
-| ISSUE-012 | `->` is legal in a symbol but not in a function name | papercut | design |
+| ISSUE-012 | `->`, `+` and other symbol punctuation can't be in a function name | papercut | design |
+| ISSUE-018 | `deftype` refuses the documented fn-pointer spelling | papercut | diagnostics |
 
 ---
 
@@ -254,7 +256,7 @@ twice in spirit, once as a `defstruct` and once as the macro's row list for
 serde derives), but the language pushed the port there rather than letting it
 choose.
 
-## ISSUE-012: `->` is legal in a symbol but not in a function name
+## ISSUE-012: `->`, `+` and other symbol punctuation can't be in a function name
 
 - **Severity:** papercut
 - **Kind:** design
@@ -263,8 +265,9 @@ choose.
   compile; actual `illegal character '>' in generated symbol for 'f32->i32'
   (ir-name '@doom.vec2__f32->i32') — LLVM identifiers allow only
   [A-Za-z0-9$._-]`
-- **Port sites:** `src/doom/vec2.nuc` (`f32-to-i32`, `f32-to-usize`)
-- **Workaround:** spell the conversion `f32-to-i32`.
+- **Port sites:** `src/doom/vec2.nuc` (`f32-to-i32`, `f32-to-usize`),
+  `src/doom/fixed.nuc` (`wrap-add`, `wrap-sub`, first written `wrap+`)
+- **Workaround:** spell it out: `f32-to-i32`, `wrap-add`.
 - **Suggestion:** map `>` and `<` (and the other reader-legal punctuation) to
   mnemonics, as `?` and `!` already are.
 
@@ -385,6 +388,51 @@ A `ui32` widens to `i64`, `usize` and `ui64` equally, and an `i16` to `i32`
 and `i64`, so the call is ambiguous and the message doesn't say which
 candidates tied. Doom's data is mostly `i16` (WAD records), `ui8` (pixels)
 and `ui32` (binary angles), so every debug print in the port needs a cast.
+
+## ISSUE-018: `deftype` refuses the documented fn-pointer spelling
+
+- **Severity:** papercut
+- **Kind:** diagnostics
+- **Status:** worked-around
+- **Probe:** `probes/issue-018.nuc` — expected `(deftype Op (fn i32)(i32 i32))`
+  to alias the type `f:(fn i32)(i32 i32)` spells; actual `deftype: expects a
+  name and one type — (deftype Name Type)`
+- **Port sites:** `src/doom/render/bsp.nuc` (`AddSprites`, the sprite-pass
+  callback the BSP walk takes)
+- **Workaround:** the canonical form, `(deftype Op ((fn i32) (i32 i32)))`.
+- **Suggestion:** let `deftype` take the two adjacent groups as the colon-paren
+  sugar does, or name the canonical form in the error.
+
+Context: `docs/types.md` teaches `(fn ret)(params)` as *the* function-pointer
+type and mentions `((fn ret) (params))` only in passing as the desugared
+form. The sugar is a reader fuse that exists only after `name:`, so in a
+`deftype` it is two forms. The error says "one type" but doesn't say that the
+spelling the docs use everywhere isn't one, so the natural conclusion is that
+fn types can't be aliased at all, which is what I first wrote down.
+
+## ISSUE-019: a struct literal passed to a generic binds `T` to `&S`
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-019.nuc` — expected `(vec-of 3 (P 0 0))`, with
+  `vec-of (n:i32 v:T):(Vector T)`, to be a `(Vector P)`; actual `let: init
+  type mismatch for 'v': value is (Vector &P), slot is (Vector P)`
+- **Port sites:** `src/doom/render/state.nuc` (`renderer-new`, the
+  `solid-segs` vector)
+- **Workaround:** bind the literal to a typed local first
+  (`no-range:ClipRange (ClipRange 0 0)`) and pass that.
+- **Suggestion:** apply nucleus ISSUE-025's rule (a struct literal in an
+  untyped binding is the value `S`) to template argument inference too.
+
+Context: a compound literal `(S …)` is an `&S` to a temporary, and nucleus
+ISSUE-025 (`design/doom-port-fixes/struct-literals.md`) made an untyped `let`
+of one bind the value. Inference of a template's type variable from an
+argument didn't get the same rule. Where I hit it, the vector went straight
+into a struct literal, and the error was `struct literal: type mismatch for
+field 'solid-segs' (positional initializer)`, which says nothing about the
+generic. Bound to an untyped `let`, the result is silently a `(Vector &P)`
+whose every element points at the same temporary.
 
 ## What worked well
 

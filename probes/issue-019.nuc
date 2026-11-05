@@ -1,0 +1,20 @@
+; ISSUE-019: a struct literal passed to a generic binds T to &S, not S.
+; fixed-when: runs
+; Actual: "let: init type mismatch for 'v': value is (Vector &P), slot is
+; (Vector P)". As a struct field it is "struct literal: type mismatch for
+; field ... (positional initializer)", which doesn't mention the generic.
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+
+(defstruct P a:i32 b:i32)
+
+(defn- vec-of (n:i32 v:T):(Vector T)
+  (let (out (make (Vector T)))
+    (dotimes (i:i32 n) (conj &out v))
+    (return out)))
+
+(defn main ():i32
+  (let (v:(Vector P) (vec-of 3 (P 0 0)))
+    (return (- (unsafe/cast i32 (count &v)) 3))))

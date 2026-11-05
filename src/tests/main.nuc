@@ -13,6 +13,7 @@
 (import-use tests.cli)
 (import-use tests.iwad)
 (import-use tests.level)
+(import-use tests.render)
 
 (defn main (argc:i32 argv:ptr):int
   (return (as int (test-main argc argv))))

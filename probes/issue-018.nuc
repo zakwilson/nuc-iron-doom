@@ -1,0 +1,13 @@
+; ISSUE-018: deftype can't name a function-pointer type, whose spelling,
+; (fn ret)(params), is two forms. The canonical ((fn ret) (params)) works,
+; and the error doesn't mention it.
+; fixed-when: runs
+; Actual: "deftype: expects a name and one type — (deftype Name Type)".
+
+(deftype Op (fn i32)(i32 i32))
+
+(defn add (a:i32 b:i32):i32 (return (+ a b)))
+(defn apply2 (f:Op a:i32 b:i32):i32 (return (f a b)))
+
+(defn main ():i32
+  (return (- (apply2 add 2 3) 5)))

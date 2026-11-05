@@ -21,13 +21,16 @@
   flats:Flats
   textures:WallTextures
   palettes:(Vector Palette)
+  ; COLORMAP: 32 light levels, invulnerability and an unused black map.
+  colormaps:Bytes
   title:Patch)
 
 (defn assets-load (path:StrView):(Fallible Assets)
   (let (w (try (wad-open path))
-        title (try (patch-parse (ref (try (lump-named &w "TITLEPIC")) 'data))))
+        title (try (patch-parse (ref (try (lump-named &w "TITLEPIC")) 'data)))
+        colormaps ((try (lump-named &w "COLORMAP")) 'data))
     (return (ok (Assets w (maps-parse &w) (try (flats-parse &w)) (try (textures-parse &w))
-                        (try (palettes-parse &w)) title)))))
+                        (try (palettes-parse &w)) colormaps title)))))
 
 (defn find-map (a:&Assets episode:i32 m:i32):?Map
   (return (get (ref a 'maps) (map-name episode m))))

@@ -1,0 +1,325 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_setup.c, r_defs.h); this port is GPLv3,
+; see COPYING.
+;
+; A level in fixed point, as the playsim and the renderer share it. C's
+; pointers between the arrays become indices into them.
+
+(ns doom.play.map)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.mapdata)
+(import-use doom.graphics)
+(import-use nucleus.math)
+(import-use doom.fixed)
+
+(defconst ML-BLOCKING 1)
+(defconst ML-TWOSIDED 4)
+(defconst ML-DONTPEGTOP 8)
+(defconst ML-DONTPEGBOTTOM 16)
+(defconst ML-SECRET 32)
+(defconst ML-SOUNDBLOCK 64)
+(defconst ML-DONTDRAW 128)
+(defconst ML-MAPPED 256)
+
+; A node child with this bit set is a subsector.
+(defconst NF-SUBSECTOR 0x8000)
+
+(defconst MAPBLOCKSHIFT 23)
+(defconst MAXRADIUS 2097152)
+
+(defstruct Vertex x:Fixed y:Fixed)
+
+(defstruct Sector
+  floor-height:Fixed ceiling-height:Fixed
+  floor-pic:i32 ceiling-pic:i32
+  light-level:i32 special:i32 tag:i32
+  ; The lines bounding it, as a run of `sector-lines` in the map.
+  first-line:usize line-count:usize
+  ; Its bounding box in blockmap cells.
+  block-box:BBox
+  ; The centre of its bounding box, where its sounds come from.
+  sound-x:Fixed sound-y:Fixed)
+
+(defstruct Side
+  texture-offset:Fixed row-offset:Fixed
+  top-texture:i32 bottom-texture:i32 mid-texture:i32
+  sector:usize)
+
+(defenum SlopeType ST-HORIZONTAL ST-VERTICAL ST-POSITIVE ST-NEGATIVE)
+
+(defstruct Line
+  v1:usize v2:usize dx:Fixed dy:Fixed
+  flags:i32 special:i32 tag:i32
+  ; -1 for no side.
+  side-num:(array i32 2)
+  bbox:BBox slope-type:i32
+  front-sector:?usize back-sector:?usize)
+
+(defstruct SubSector sector:usize num-lines:usize first-line:usize)
+
+(defstruct Seg
+  v1:usize v2:usize offset:Fixed angle:Angle
+  side:usize line:usize
+  front-sector:usize back-sector:?usize)
+
+(defstruct Node
+  x:Fixed y:Fixed dx:Fixed dy:Fixed
+  ; Right (0) and left (1).
+  bbox:(array BBox 2)
+  children:(array i32 2))
+
+(defstruct Level
+  vertexes:(Vector Vertex)
+  sectors:(Vector Sector)
+  sides:(Vector Side)
+  lines:(Vector Line)
+  sub-sectors:(Vector SubSector)
+  nodes:(Vector Node)
+  segs:(Vector Seg)
+  ; Every sector's lines, back to back (P_GroupLines's linebuffer).
+  sector-lines:(Vector usize)
+  ; The blockmap lump as 16-bit words; cell offsets index into it.
+  blockmap:(Vector i16)
+  bmap-org-x:Fixed bmap-org-y:Fixed bmap-width:i32 bmap-height:i32
+  reject:Bytes
+  sky-flat:i32)
+
+(defn vertex-at (l:&Level i:usize):&Vertex (let (s (view (ref l 'vertexes))) (return (&s i))))
+(defn sector-at (l:&Level i:usize):&Sector (let (s (view (ref l 'sectors))) (return (&s i))))
+(defn side-at (l:&Level i:usize):&Side (let (s (view (ref l 'sides))) (return (&s i))))
+(defn line-at (l:&Level i:usize):&Line (let (s (view (ref l 'lines))) (return (&s i))))
+(defn sub-sector-at (l:&Level i:usize):&SubSector (let (s (view (ref l 'sub-sectors))) (return (&s i))))
+(defn node-at (l:&Level i:usize):&Node (let (s (view (ref l 'nodes))) (return (&s i))))
+(defn seg-at (l:&Level i:usize):&Seg (let (s (view (ref l 'segs))) (return (&s i))))
+
+(defn- fx (i:i16):Fixed (return (int-to-fixed (as i32 i))))
+
+; An index field read as vanilla's SHORT does, checked against its table.
+(defn- index-in (i:i16 n:usize what:CStr):(Fallible usize)
+  (when (or (< i 0) (>= (as usize (as i32 i)) n))
+    (fail what " " (as i32 i) " is out of range (" n ")"))
+  (return (ok (as usize (as i32 i)))))
+
+(defn- load-sectors (m:&Map fl:&Flats):(Fallible (Vector Sector))
+  (let (out (make (Vector Sector)) ms (view (ref m 'sectors)))
+    (dotimes (i:usize (count &ms))
+      (let (s (&ms i)
+            floor (flat-index fl (s 'floor-tex))
+            ceil (flat-index fl (s 'ceiling-tex)))
+        (when (none? floor) (fail "R_FlatNumForName: " (s 'floor-tex) " not found"))
+        (when (none? ceil) (fail "R_FlatNumForName: " (s 'ceiling-tex) " not found"))
+        (conj &out (Sector (fx (s 'floor-height)) (fx (s 'ceiling-height))
+                           (unsafe/cast i32 (unwrap-or floor 0)) (unsafe/cast i32 (unwrap-or ceil 0))
+                           (as i32 (s 'light-level)) (as i32 (s 'special)) (as i32 (s 'tag))
+                           0 0 (bbox-clear) 0 0))))
+    (return (ok out))))
+
+(defn- texture-num (tx:&WallTextures n:Name):(Fallible i32)
+  (if-some (i (texture-index tx n))
+    (return (ok (unsafe/cast i32 i)))
+    (fail "R_TextureNumForName: " n " not found")))
+
+(defn- load-sides (m:&Map l:&Level tx:&WallTextures):(Fallible (Vector Side))
+  (let (out (make (Vector Side)) ms (view (ref m 'sides)))
+    (dotimes (i:usize (count &ms))
+      (let (s (&ms i))
+        (conj &out (Side (fx (s 'x-offset)) (fx (s 'y-offset))
+                         (try (texture-num tx (s 'top-texture)))
+                         (try (texture-num tx (s 'lower-texture)))
+                         (try (texture-num tx (s 'middle-texture)))
+                         (try (index-in (s 'sector) (count (ref l 'sectors)) "sidedef sector"))))))
+    (return (ok out))))
+
+(defn- side-sector (l:&Level side:i32):?usize
+  (when (= side -1) (return none))
+  (return (some ((side-at l (as usize side)) 'sector))))
+
+(defn- load-lines (m:&Map l:&Level):(Fallible (Vector Line))
+  (let (out (make (Vector Line)) ms (view (ref m 'lines)) nv (count (ref l 'vertexes))
+        ns (count (ref l 'sides)))
+    (dotimes (i:usize (count &ms))
+      (let (ml (&ms i)
+            i1 (try (index-in (ml 'v1) nv "linedef vertex"))
+            i2 (try (index-in (ml 'v2) nv "linedef vertex"))
+            v1 @(vertex-at l i1) v2 @(vertex-at l i2)
+            dx (wrap-sub (v2 'x) (v1 'x)) dy (wrap-sub (v2 'y) (v1 'y))
+            s0 (as i32 (ml 'front-side)) s1 (as i32 (ml 'back-side))
+            slope (cond (= dx 0) ST-VERTICAL
+                        (= dy 0) ST-HORIZONTAL
+                        (> (fixed-div dy dx) 0) ST-POSITIVE
+                        true ST-NEGATIVE)
+            bb (BBox (max (v1 'y) (v2 'y)) (min (v1 'y) (v2 'y))
+                     (min (v1 'x) (v2 'x)) (max (v1 'x) (v2 'x))))
+        (when (or (< s0 -1) (>= s0 (unsafe/cast i32 ns)) (< s1 -1) (>= s1 (unsafe/cast i32 ns)))
+          (fail "linedef " i " references a non-existent sidedef"))
+        (conj &out (Line i1 i2 dx dy (as i32 (ml 'flags)) (as i32 (ml 'special)) (as i32 (ml 'tag))
+                         (array i32 s0 s1) bb slope (side-sector l s0) (side-sector l s1)))))
+    (return (ok out))))
+
+(defn- load-sub-sectors (m:&Map):(Vector SubSector)
+  (let (out (make (Vector SubSector)) ms (view (ref m 'sub-sectors)))
+    (dotimes (i:usize (count &ms))
+      (let (s (&ms i))
+        ; The sector is filled in from the first seg once segs are loaded.
+        (conj &out (SubSector 0 (as usize (as i32 (s 'num-segs))) (as usize (as i32 (s 'first-seg)))))))
+    (return out)))
+
+(defn- node-bbox (top:i16 bottom:i16 left:i16 right:i16):BBox
+  (return (BBox (fx top) (fx bottom) (fx left) (fx right))))
+
+(defn- load-nodes (m:&Map):(Vector Node)
+  (let (out (make (Vector Node)) ms (view (ref m 'nodes)))
+    (dotimes (i:usize (count &ms))
+      (let (n (&ms i))
+        (conj &out (Node (fx (n 'x)) (fx (n 'y)) (fx (n 'dx)) (fx (n 'dy))
+                         (array BBox
+                           (node-bbox (n 'right-box-top) (n 'right-box-bottom)
+                                      (n 'right-box-left) (n 'right-box-right))
+                           (node-bbox (n 'left-box-top) (n 'left-box-bottom)
+                                      (n 'left-box-left) (n 'left-box-right)))
+                         ; Unsigned in the lump.
+                         (array i32 (bit-and (as i32 (n 'right-child)) 0xffff)
+                                    (bit-and (as i32 (n 'left-child)) 0xffff))))))
+    (return out)))
+
+(defn- load-segs (m:&Map l:&Level):(Fallible (Vector Seg))
+  (let (out (make (Vector Seg)) ms (view (ref m 'segments)) nv (count (ref l 'vertexes)))
+    (dotimes (i:usize (count &ms))
+      (let (s (&ms i)
+            li (try (index-in (s 'line) (count (ref l 'lines)) "seg linedef"))
+            ld (line-at l li)
+            side (as usize (bit-and (as i32 (s 'side)) 1))
+            sn (aref (ld 'side-num) (as i64 side)))
+        (when (or (< sn 0) (>= sn (unsafe/cast i32 (count (ref l 'sides)))))
+          (fail "P_LoadSegs: linedef " li " for seg " i " references a non-existent sidedef " sn))
+        (let (sd (side-at l (as usize sn))
+              other (aref (ld 'side-num) (as i64 (bit-xor side 1)))
+              ; Vanilla reads a missing back side's sector from address 0;
+              ; Chocolate fakes that, and the shareware maps never need it.
+              back:?usize (if (!= (bit-and (ld 'flags) ML-TWOSIDED) 0)
+                     (if (or (< other 0) (>= other (unsafe/cast i32 (count (ref l 'sides)))))
+                       none
+                       (some ((side-at l (as usize other)) 'sector)))
+                     none))
+          (conj &out (Seg (try (index-in (s 'v1) nv "seg vertex")) (try (index-in (s 'v2) nv "seg vertex"))
+                          (fx (s 'offset)) (bit-shl (unsafe/cast ui32 (as i32 (s 'angle))) 16)
+                          (as usize sn) li (sd 'sector) back)))))
+    (return (ok out))))
+
+(defn- is-sector? (a:?usize b:usize):bool
+  (if-some (x a) (return (= x b)) (return false)))
+
+; Each subsector's sector, each sector's lines, bounding box and sound origin.
+(defn- group-lines (l:&Level):void
+  (let (sss (view (ref l 'sub-sectors)))
+    (dotimes (i:usize (count &sss))
+      (let (ss (&sss i))
+        (set! (ss 'sector) ((side-at l ((seg-at l (ss 'first-line)) 'side)) 'sector)))))
+  (let (secs (view (ref l 'sectors)) lines (view (ref l 'lines)))
+    (dotimes (i:usize (count &lines))
+      (let (li (&lines i))
+        (when-some (f (li 'front-sector))
+          (let (s (&secs f)) (set! (s 'line-count) (+ (s 'line-count) 1))))
+        (when-some (b (li 'back-sector))
+          (when (not (is-sector? (li 'front-sector) b))
+            (let (s (&secs b)) (set! (s 'line-count) (+ (s 'line-count) 1)))))))
+    (let (next:usize 0)
+      (dotimes (i:usize (count &secs))
+        (let (s (&secs i))
+          (set! (s 'first-line) next)
+          (set! next (+ next (s 'line-count)))
+          (set! (s 'line-count) 0)))
+      (dotimes (i:usize next) (conj (ref l 'sector-lines) 0)))
+    (dotimes (i:usize (count &lines))
+      (let (li (&lines i))
+        (when-some (f (li 'front-sector))
+          (let (s (&secs f))
+            (set (ref l 'sector-lines) (+ (s 'first-line) (s 'line-count)) i)
+            (set! (s 'line-count) (+ (s 'line-count) 1))))
+        (when-some (b (li 'back-sector))
+          (when (not (is-sector? (li 'front-sector) b))
+            (let (s (&secs b))
+              (set (ref l 'sector-lines) (+ (s 'first-line) (s 'line-count)) i)
+              (set! (s 'line-count) (+ (s 'line-count) 1)))))))
+    (dotimes (i:usize (count &secs))
+      (let (s (&secs i) bb (bbox-clear))
+        (dotimes (j:usize (s 'line-count))
+          (let (li (&lines ((ref l 'sector-lines) (+ (s 'first-line) j)))
+                v1 (vertex-at l (li 'v1)) v2 (vertex-at l (li 'v2)))
+            (bbox-add &bb (v1 'x) (v1 'y))
+            (bbox-add &bb (v2 'x) (v2 'y))))
+        (set! (s 'sound-x) (/ (wrap-add (bb 'right) (bb 'left)) 2))
+        (set! (s 'sound-y) (/ (wrap-add (bb 'top) (bb 'bottom)) 2))
+        (let (ox (l 'bmap-org-x) oy (l 'bmap-org-y)
+              top (bit-shr (wrap-add (wrap-sub (bb 'top) oy) MAXRADIUS) MAPBLOCKSHIFT)
+              bottom (bit-shr (wrap-sub (wrap-sub (bb 'bottom) oy) MAXRADIUS) MAPBLOCKSHIFT)
+              right (bit-shr (wrap-add (wrap-sub (bb 'right) ox) MAXRADIUS) MAPBLOCKSHIFT)
+              left (bit-shr (wrap-sub (wrap-sub (bb 'left) ox) MAXRADIUS) MAPBLOCKSHIFT))
+          (set! (s 'block-box)
+                (BBox (if (>= top (l 'bmap-height)) (- (l 'bmap-height) 1) top)
+                      (if (< bottom 0) 0 bottom)
+                      (if (< left 0) 0 left)
+                      (if (>= right (l 'bmap-width)) (- (l 'bmap-width) 1) right))))))))
+
+(defn- load-blockmap (l:&Level b:&Bytes):void
+  (let (i:usize 0)
+    (while (< (+ i 1) (count b))
+      (conj (ref l 'blockmap) (le-i16 b i))
+      (set! i (+ i 2))))
+  (let (bm (ref l 'blockmap))
+    (set! (l 'bmap-org-x) (int-to-fixed (as i32 (bm 0))))
+    (set! (l 'bmap-org-y) (int-to-fixed (as i32 (bm 1))))
+    (set! (l 'bmap-width) (as i32 (bm 2)))
+    (set! (l 'bmap-height) (as i32 (bm 3)))))
+
+; P_SetupLevel's loading, up to the things.
+(defn level-load (m:&Map fl:&Flats tx:&WallTextures):(Fallible Level)
+  (let (l (Level (make (Vector Vertex)) (make (Vector Sector)) (make (Vector Side))
+                 (make (Vector Line)) (make (Vector SubSector)) (make (Vector Node))
+                 (make (Vector Seg)) (make (Vector usize)) (make (Vector i16))
+                 0 0 0 0 (m 'reject)
+                 (unsafe/cast i32 (unwrap-or (flat-index fl (name "F_SKY1")) 0))))
+    (load-blockmap &l (ref m 'blockmap-lump))
+    (let (mv (view (ref m 'vertexes)))
+      (dotimes (i:usize (count &mv))
+        (conj (ref l 'vertexes) (Vertex (fx ((&mv i) 'x)) (fx ((&mv i) 'y))))))
+    (set! (l 'sectors) (try (load-sectors m fl)))
+    (set! (l 'sides) (try (load-sides m &l tx)))
+    (set! (l 'lines) (try (load-lines m &l)))
+    (set! (l 'sub-sectors) (load-sub-sectors m))
+    (set! (l 'nodes) (load-nodes m))
+    (set! (l 'segs) (try (load-segs m &l)))
+    (group-lines &l)
+    (return (ok l))))
+
+; --- geometry shared by the renderer and the playsim ------------------------------
+
+; Which side of a node's partition line a point is on: 0 front, 1 back.
+(defn point-on-side (x:Fixed y:Fixed n:&Node):i32
+  (when (= (n 'dx) 0)
+    (return (if (<= x (n 'x)) (if (> (n 'dy) 0) 1 0) (if (< (n 'dy) 0) 1 0))))
+  (when (= (n 'dy) 0)
+    (return (if (<= y (n 'y)) (if (< (n 'dx) 0) 1 0) (if (> (n 'dx) 0) 1 0))))
+  (let (dx (wrap-sub x (n 'x)) dy (wrap-sub y (n 'y)))
+    ; Opposite signs settle it without a multiply.
+    (when (!= (bit-and (bit-xor (bit-xor (n 'dy) (n 'dx)) (bit-xor dx dy)) FIXED-MIN) 0)
+      (return (if (!= (bit-and (bit-xor (n 'dy) dx) FIXED-MIN) 0) 1 0)))
+    (let (left (fixed-mul (bit-shr (n 'dy) FRACBITS) dx)
+          right (fixed-mul dy (bit-shr (n 'dx) FRACBITS)))
+      (return (if (< right left) 0 1)))))
+
+(defn point-in-sub-sector (l:&Level x:Fixed y:Fixed):usize
+  (when (= (count (ref l 'nodes)) 0) (return 0))
+  (let (n:i32 (unsafe/cast i32 (- (count (ref l 'nodes)) 1)))
+    (while (= (bit-and n NF-SUBSECTOR) 0)
+      (let (node (node-at l (as usize n)))
+        (set! n (aref (node 'children) (as i64 (point-on-side x y node))))))
+    (return (as usize (bit-and n (bit-not NF-SUBSECTOR))))))
