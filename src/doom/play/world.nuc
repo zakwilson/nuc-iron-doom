@@ -440,3 +440,27 @@
   (let (out (make (Vector bool)))
     (dotimes (i:usize MAXPLAYERS) (conj &out (= i 0)))
     (return out)))
+
+; Frees a level's world once the session has taken what carries over. No
+; struct gets a drop of its fields (ISSUE-025), so each owning field is listed
+; here. `players` and `pics` share buffers with the session's through shallow
+; copies, so they stay.
+(defn world-free (w:&World):void
+  (let (l (ref w 'level))
+    (drop (ref l 'vertexes)) (drop (ref l 'sectors)) (drop (ref l 'sides))
+    (drop (ref l 'lines)) (drop (ref l 'sub-sectors)) (drop (ref l 'nodes))
+    (drop (ref l 'segs)) (drop (ref l 'sector-lines)) (drop (ref l 'blockmap)))
+  ; Every mobj and thinker.
+  (drop (ref w 'arena))
+  (drop (ref w 'free-mobjs)) (drop (ref w 'free-thinkers))
+  (drop (ref w 'sector-things)) (drop (ref w 'block-links)) (drop (ref w 'sector-play))
+  (drop (ref w 'line-valid)) (drop (ref w 'player-in-game))
+  (drop (ref w 'player-starts)) (drop (ref w 'player-start-in-game))
+  (drop (ref w 'deathmatch-starts))
+  (drop (ref w 'active-ceilings)) (drop (ref w 'active-plats)) (drop (ref w 'buttons))
+  (drop (ref (ref w 'scratch) 'spechit)) (drop (ref (ref w 'scratch) 'intercepts))
+  (drop (ref w 'sounds))
+  (drop (ref w 'item-respawn-que)) (drop (ref w 'item-respawn-time)) (drop (ref w 'body-que))
+  (drop (ref w 'texture-translation)) (drop (ref w 'flat-translation))
+  (drop (ref w 'line-specials)) (drop (ref w 'brain-targets))
+  (deallocate (ref heap) (unsafe/cast ?&ui8 w) (as usize (sizeof World)) (as usize (alignof World))))

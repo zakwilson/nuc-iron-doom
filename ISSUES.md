@@ -20,6 +20,7 @@ provisional until milestone 8.)
 | ISSUE-019 | A struct literal passed to a generic binds `T` to `&S` | minor | bug |
 | ISSUE-022 | `none` passed to a generic method isn't typed from its other arguments | minor | bug |
 | ISSUE-024 | A `match` over a pointer `Maybe` doesn't target-type a bare `none` arm | minor | bug |
+| ISSUE-025 | A struct of owning fields gets no drop; freeing one lists every field by hand | minor | missing-feature |
 | ISSUE-010 | A macro template can't call `count` where two collection namespaces are imported | minor | design |
 | ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature |
 | ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature |
@@ -556,6 +557,31 @@ emitted the arm bodies without the tail rewrite, so `none` stayed an untyped
 null and the arms joined to `void`. An untyped `let` of the same match (or
 of an `if` with a bare `none` arm) is also `void`, but that one is the
 documented rule: the join doesn't infer `none`'s type from its sibling.
+
+## ISSUE-025: a struct of owning fields gets no drop, so freeing one lists every field
+
+- **Severity:** minor
+- **Kind:** missing-feature
+- **Status:** worked-around
+- **Probe:** none (not a bug): `Drop` is documented as opt-in per type.
+- **Port sites:** `src/doom/play/world.nuc` (`world-free`); called from
+  `src/doom/session.nuc` (`load-level`, `session-init-new`)
+- **Workaround:** a hand-written `world-free` that drops 30 fields of `World`,
+  `Level` and `MapScratch` one by one, then gives the `World`'s bytes back to
+  the heap. A field added later and left out of it leaks without a word.
+- **Suggestion:** a derived drop for a struct whose fields conform to `Drop`
+  (the compiler already synthesizes a field-wise one for `vfn`/`mfn`
+  closures), or a `(derive-drop T :except (f …))` macro in the stdlib. Pairing
+  `new` with a `delete` that runs it would cover the heap case.
+
+Context: each level's world is about 30 `Vector`s, an `Arena` of mobjs and
+thinkers, and the map's own vectors. Rust frees all of it when the `World`
+goes out of scope. Here, until `world-free` existed, each level change leaked
+the previous level's memory. Writing it exposed the harder part: a struct
+copy is shallow, so the session's `players` and `pics` share buffers with
+the world's copies. The drop has to know which fields are *not* its own,
+and nothing in the types says so. Rust's move semantics would have refused
+the aliasing copy in the first place.
 
 ## What worked well
 

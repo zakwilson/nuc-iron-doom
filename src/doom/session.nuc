@@ -79,10 +79,12 @@
 ; G_DoLoadLevel and P_SetupLevel: the current episode and map, its things
 ; and specials.
 (defn- load-level (s:&Session a:&Assets):(Fallible void)
-  ; Carry the players and the RNG over from the level before.
+  ; Carry the players and the RNG over from the level before, then free it.
   (when-some (w (s 'world))
     (set! (s 'players) (w 'players))
-    (set! (s 'random) (w 'random)))
+    (set! (s 'random) (w 'random))
+    (set! (s 'world) none)
+    (world-free w))
   (let (r (ref s 'rules) players (view (ref s 'players)))
     (dotimes (i:usize MAXPLAYERS)
       (let (p (&players i))
@@ -132,7 +134,9 @@
                        (and (!= sk SK-NIGHTMARE) (= GAME-SKILL SK-NIGHTMARE)))
     (set! GAME-SKILL sk)
     (set! (s 'players) (new-game-players))
-    (set! (s 'world) none)
+    (when-some (w (s 'world))
+      (set! (s 'world) none)
+      (world-free w))
     (set! (r 'demo-playback) false)
     (set! (r 'episode) ep)
     (set! (r 'map) mp)

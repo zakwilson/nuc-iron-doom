@@ -1,0 +1,47 @@
+(ns tests.session)
+
+; The game layer without a screen: level changes, and demo3 played to its
+; end. demo3's last tic hash is the port's own, recorded when all three
+; demos first played through; Chocolate Doom's reference needs
+; scripts/build-reference.sh, and scripts/check-demos.sh compares against it.
+
+(import-use nucleus.test)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use doom.error)
+(import-use doom.assets)
+(import-use doom.play.defs)
+(import-use doom.play.world)
+(import-use doom.session)
+
+; Each exit loads the next map, freeing the last, until E1M8's ends the episode.
+(deftest episode-by-exits
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (let (s (try (session-new &a (game-mode &a))))
+       (try (session-init-new s &a SK-MEDIUM 1 1))
+       (let (m 1)
+         (while (not (s 'finished))
+           (try (check (= ((ref (session-world s) 'rules) 'map) m) "the next map loaded"))
+           (dotimes (k:usize 35) (try (session-tic s &a (ticcmd-zero))))
+           (set! ((session-world s) 'exit) 1)
+           (try (session-tic s &a (ticcmd-zero)))
+           (set! m (+ m 1)))
+         (try (check (= m 9) "E1M8's exit ends the episode")))))))
+
+(deftest demo3-plays-to-its-end
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (let (s (try (session-new &a (game-mode &a))))
+       (set! (s 'tichash) (some (make String)))
+       (try (session-play-demo s &a (strview-from-cstr "demo3")))
+       (while (not (s 'demo-ended)) (try (session-tic s &a (ticcmd-zero))))
+       (try (check (= (s 'gametic) 2134) "2134 gametics"))
+       (when-some (t (s 'tichash))
+         (let (v (string-as-view &t))
+           (try (check (strview-has-suffix v (strview-from-cstr "2133 86 207 8f22bba2 254 0/68/2/20/9/0\n"))
+                       "demo3's last tic"))))))))
