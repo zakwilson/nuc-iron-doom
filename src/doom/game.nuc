@@ -112,6 +112,8 @@
   menu:MenuState
   cheats:Cheats
   automap:Automap
+  ; G_Responder's sendpause, for the next ticcmd.
+  send-pause:bool
   ; The session's new-games when the automap last looked.
   am-new-games:i32
   ; The attract loop (d_main.c): the sequence's step, the page showing
@@ -127,7 +129,7 @@
         menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL)))
     (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
                   (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) 0 -1 none 0 false (random-new) 0 false))))
+                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) false 0 -1 none 0 false (random-new) 0 false))))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -191,7 +193,10 @@
           (when-some (to (cheat-responder (ref g 'cheats) w (ev 'ch)))
             (try (menu-new-game g GAME-SKILL (to 'episode) (to 'map)))
             (return (ok))))
-        (try (automap-responder (ref g 'automap) w (ref (ref g 'assets) 'wad) ev)))))
+        (when (try (automap-responder (ref g 'automap) w (ref (ref g 'assets) 'wad) ev))
+          (return (ok))))))
+  (when (and (= (ev 'type) EV-KEYDOWN) (= (ev 'key) KEY-PAUSE))
+    (set! (g 'send-pause) true))
   (return (ok)))
 
 ; AM_Ticker, and the AM_Stops of G_DoCompleted, G_InitNew, F_StartFinale and
@@ -323,6 +328,9 @@
     (set! (s 'menu-active) ((ref g 'menu) 'active))
     (let (cmd (if ((ref g 'menu) 'active) (ticcmd-zero)
                 (build-ticcmd (ref g 'cmd-turn-held) (not (automap-panning? (ref g 'automap))))))
+      (when (g 'send-pause)
+        (set! (g 'send-pause) false)
+        (set! (cmd 'buttons) (bit-or BT-SPECIAL BTS-PAUSE)))
       (when (some? (s 'record)) (lowres-turn &cmd (ref g 'turn-carry)))
       (try (session-tic s (ref g 'assets) cmd))
       (automap-tic g s))
@@ -481,7 +489,16 @@
     (match (g 'page)
       ((some p) (try (set-palette g 0))
                 (let (pt (try (named-patch g p))) (try (draw-patch (ref g 'screen) 0 0 &pt))))
-      ((none) (when-some (s (g 'session)) (try (draw-session g s)))))
+      ((none) (when-some (s (g 'session))
+                (try (draw-session g s))
+                ; The pause sign, centred on the view, or at the top over the automap.
+                (when (s 'paused)
+                  (let (r (ref g 'renderer)
+                        y (if ((ref g 'automap) 'active) 4 (+ (r 'view-window-y) 4))
+                        pt (try (named-patch g "M_PAUSE")))
+                    (try (draw-patch (ref g 'screen)
+                                     (unsafe/cast usize (+ (r 'view-window-x) (/ (- (r 'view-width) 68) 2)))
+                                     (unsafe/cast usize y) &pt)))))))
     (when-some (st start)
       (let (end (copy-of (ref g 'screen))
             r (match (g 'session)

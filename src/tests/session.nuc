@@ -101,3 +101,20 @@
        ; 440 characters at 3 tics each, then 250 tics to read them.
        (dotimes (k:usize 1100) (try (session-tic s &a (ticcmd-zero))))
        (try (check (= ((ref s 'finale) 'stage) F-STAGE-ARTSCREEN) "the art screen"))))))
+
+; A BTS_PAUSE ticcmd pauses the level, and the next one resumes it.
+(deftest pause-button
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (let (s (try (session-new &a (game-mode &a))) pause (ticcmd-zero))
+       (try (session-init-new s &a SK-MEDIUM 1 1))
+       (set! (pause 'buttons) (bit-or BT-SPECIAL BTS-PAUSE))
+       (try (session-tic s &a (ticcmd-zero)))
+       (try (session-tic s &a pause))
+       (try (check (s 'paused) "paused"))
+       (let (t ((session-world s) 'level-time))
+         (dotimes (k:usize 5) (try (session-tic s &a (ticcmd-zero))))
+         (try (check (= ((session-world s) 'level-time) t) "no level time passes")))
+       (try (session-tic s &a pause))
+       (try (check (not (s 'paused)) "resumed"))))))

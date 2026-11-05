@@ -166,6 +166,7 @@
     (set! (r 'episode) ep)
     (set! (r 'map) mp)
     (set! (r 'skill) sk)
+    (set! (s 'paused) false)
     (set! (s 'new-games) (+ (s 'new-games) 1))
     (return (load-level s a))))
 
@@ -429,6 +430,12 @@
             (try (read-demo-ticcmd s (ref p 'cmd))))
           (write-demo-ticcmd s (ref p 'cmd)))))
     (when (s 'demo-ended) (return (ok)))
+    ; The special buttons: pause. A savegame's is milestone 7's.
+    (dotimes (i:usize MAXPLAYERS)
+      (when ((ref s 'in-game) i)
+        (let (b (((player-at w i) 'cmd) 'buttons))
+          (when (and (!= (bit-and b BT-SPECIAL) 0) (= (bit-and b BT-SPECIALMASK) BTS-PAUSE))
+            (set! (s 'paused) (not (s 'paused)))))))
     (case (s 'gamestate)
       GS-LEVEL
       (do (try (ticker w (s 'paused) (s 'menu-active)))
