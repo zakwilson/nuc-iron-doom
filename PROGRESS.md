@@ -48,7 +48,7 @@ it.
 |---|---|
 | 0. Setup | done, except the reference frames (see below) |
 | 1. Foundations | done: CLI and response files, IWAD search, WAD directory, every lump parser, RNG, 12 unit tests |
-| 2. Screens | not started |
+| 2. Screens | done except the framedump gate: title (tic 2) and melt run; frames can't be compared until the reference is built |
 | 3. Level and walls | not started |
 | 4–8 (phase B) | not started |
 
@@ -70,15 +70,13 @@ as a patch in `nucleus-patches/`, which `setup-cloud.sh` applies.
 | Issue | Nucleus commit | Patch |
 |---|---|---|
 | ISSUE-006 | `06230b5` | `nucleus-patches/0001-*.patch` |
-| ISSUE-009 | not yet committed (gate running) | — |
+| ISSUE-009 | `ac05293` | `nucleus-patches/0002-*.patch` |
 
 ## In flight
 
-- ISSUE-009's compiler gate (`make -k test bootstrap` in `../nucleus`). The
-  fix is in `../nucleus`'s working tree, and the port's `cli.nuc` needs it.
+- Nothing long-running.
 
 ## Next steps
 
-- Commit ISSUE-009 in `../nucleus` and add its patch.
-- Milestone 2: SDL video (palette, gamma, 320×200 into a 4:3 window), patch
-  drawing, title screen, melt, input, exit, `-framedump`.
+- Milestone 3: level loading, player controls and movement, camera, the BSP
+  wall and sky renderer.

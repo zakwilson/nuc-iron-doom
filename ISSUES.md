@@ -171,7 +171,8 @@ as a `defconst` at the site.
 
 - **Severity:** minor
 - **Kind:** bug
-- **Status:** fixed-in-compiler (nucleus `doom-bugfixes`, gate running)
+- **Status:** fixed-in-compiler (nucleus `ac05293`, carried as
+  `nucleus-patches/0002-*.patch`)
 - **Probe:** `probes/issue-009.nuc` — expected `(set! @p (some 4))` with
   `p:&?i32` to store a `some`; actual `some: value must be non-null (ref ...)`,
   and `(set! @p none)` gives `set!: (deref p) place: value type mismatch`
