@@ -90,8 +90,9 @@ as a patch in `nucleus-patches/`, which `setup-cloud.sh` applies.
 | ISSUE-024 | `e15f668` | `nucleus-patches/0006-*.patch` |
 | ISSUE-027 | `40cf7d8` | `nucleus-patches/0007-*.patch` |
 
-Each passed the nucleus gate here (after 0006: 1679 passed, the 4 avr-gcc
-failures of the baseline, 6 skipped; `make bootstrap` PASS once converged).
+Each passed the nucleus gate here (after 0007: 1679 passed, the 4 avr-gcc
+failures of the baseline, 6 skipped; `make bootstrap` PASS once converged;
+0007 doesn't move the bootstrap).
 0003 and 0004 change the compiler's own code generation, so after applying
 them `make bootstrap` reports a diff until it is converged (nucleus
 `context/build.md`, "After a codegen change"). `make` itself is unaffected.
@@ -140,7 +141,7 @@ at once (vanilla waits for the next frame).
 
 ## In flight
 
-- The nucleus gate (`make -k test bootstrap`) for patch 0007 (ISSUE-027).
+- Nothing long-running.
 
 ## Next steps
 
