@@ -1,56 +1,49 @@
 #!/usr/bin/env bash
-# Reruns every probes/issue-NNN.nuc and reports which issues still reproduce.
-# Each probe's header carries one line saying what "fixed" looks like:
-#   ; fixed-when: compiles               the compile succeeds
-#   ; fixed-when: runs                   it compiles, runs and exits 0
-#   ; fixed-when: compile-fails          the compiler rejects it
-#   ; fixed-when: output-contains TEXT   compiler or program output contains TEXT
-# and optionally `; flags: ...` with extra nucleusc arguments ($ROOT expands to
-# the repo root).
+# Rebuilds every probes/issue-NNN.nuc with the bare compiler and says, per
+# issue, whether it still reproduces. A probe states its own pass condition:
+#   ; fixed-when: compiles | runs | compile-fails | output-contains TEXT
+# and may add `; flags: ARGS` for nucleusc ($ROOT is the repo root).
 # Usage: scripts/check-probes.sh [issue-NNN ...]
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 . "$ROOT/scripts/env.sh"
-NUCLEUSC="$NUCLEUS_HOME/build/nucleusc"
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 
-if [ $# -gt 0 ]; then
-    probes=()
-    for p in "$@"; do probes+=("$ROOT/probes/${p%.nuc}.nuc"); done
+if [ $# -eq 0 ]; then
+    set -- "$ROOT"/probes/issue-*.nuc
 else
-    probes=("$ROOT"/probes/issue-*.nuc)
+    set -- "${@/#/$ROOT/probes/}"
+    set -- "${@/%.nuc/}"
+    set -- "${@/%/.nuc}"
 fi
 
-reproduce=0 fixed=0
-for p in "${probes[@]}"; do
-    id=$(basename "$p" .nuc)
-    rule=$(sed -n 's/^; fixed-when: *//p' "$p" | head -1)
-    flags=$(sed -n 's/^; flags: *//p' "$p" | head -1)
-    flags=${flags//\$ROOT/$ROOT}
-    out="$TMP/$id.out"
+still=0 gone=0
+for probe in "$@"; do
+    id=$(basename "$probe" .nuc)
+    rule=$(sed -n 's/^; fixed-when: *//p' "$probe" | head -1)
+    flags=$(sed -n 's/^; flags: *//p' "$probe" | head -1)
+    log="$WORK/$id.log"
     # shellcheck disable=SC2086
-    (cd "$ROOT" && "$NUCLEUSC" $flags "$p" -o "$TMP/$id") > "$out" 2>&1
-    built=$?
+    (cd "$ROOT" && nucleusc ${flags//\$ROOT/$ROOT} "$probe" -o "$WORK/$id") >"$log" 2>&1
+    compiled=$?
     ran=1
-    if [ $built -eq 0 ]; then
-        (cd "$ROOT" && timeout 20 "$TMP/$id") >> "$out" 2>&1
+    if [ $compiled -eq 0 ]; then
+        (cd "$ROOT" && timeout -k 5 20 "$WORK/$id") >>"$log" 2>&1
         ran=$?
     fi
     case "$rule" in
-        compiles)          [ $built -eq 0 ] ;;
-        runs)              [ $built -eq 0 ] && [ $ran -eq 0 ] ;;
-        compile-fails)     [ $built -ne 0 ] ;;
-        output-contains\ *) grep -qF -- "${rule#output-contains }" "$out" ;;
-        *) echo "$id: no '; fixed-when:' line"; reproduce=$((reproduce + 1)); continue ;;
+        compiles)          fixed=$(( compiled == 0 )) ;;
+        runs)              fixed=$(( compiled == 0 && ran == 0 )) ;;
+        compile-fails)     fixed=$(( compiled != 0 )) ;;
+        output-contains*)  grep -qF -- "${rule#output-contains }" "$log" && fixed=1 || fixed=0 ;;
+        *) echo "$id: missing '; fixed-when:' line"; still=$((still + 1)); continue ;;
     esac
-    if [ $? -eq 0 ]; then
-        echo "$id: FIXED"
-        fixed=$((fixed + 1))
+    if [ "$fixed" -eq 1 ]; then
+        echo "$id: FIXED"; gone=$((gone + 1))
     else
-        echo "$id: reproduces ($(head -1 "$out"))"
-        reproduce=$((reproduce + 1))
+        echo "$id: reproduces -- $(head -1 "$log")"; still=$((still + 1))
     fi
 done
-echo "$reproduce reproduce, $fixed fixed"
+echo "$still reproduce, $gone fixed"

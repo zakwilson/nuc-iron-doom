@@ -32,15 +32,13 @@ repo and never by absolute path.
   design history and known gaps in `design/`.
 - `../nucleus-boot`: the bootstrap IR (`boot/*.ll`), which is gitignored in
   `nucleus`. The setup script copies it into `../nucleus/boot/`.
-- `zakwilson/nuc-doom` on GitHub: the previous, transliterated Chocolate Doom
-  port. Its `ISSUES.md` lists findings already reported (most are fixed), and
-  its `reference/tichash.patch` and `scripts/` are a starting point for the
-  phase-B harness. Read it with the GitHub tools or a shallow clone into the
-  scratchpad. Don't copy its code into this port.
+- The previous Nucleus Doom port (a Chocolate Doom transliteration) is **not
+  available**; don't look for it. Its findings and the rulings on them are
+  recorded in nucleus `design/doom-port-fixes/` and in the nucleus commit log
+  (messages cite `nuc-doom ISSUE-NNN`). Check those before calling a finding
+  new.
 - IWADs: `/usr/share/games/doom/doom1.wad` is shareware **v1.9** (md5
-  `f0cefca49926d00903cf57551d901abe`). Its demos use the v1.9 format, so they
-  don't match the old port's recorded data, which came from an older shareware
-  WAD. Iron Doom's IWAD search already looks in `/usr/share/games/doom`.
+  `f0cefca49926d00903cf57551d901abe`). Its demos use the v1.9 format. Iron Doom's IWAD search already looks in `/usr/share/games/doom`.
   `freedoom1.wad` and `freedoom2.wad` may sit beside it, but they're not in
   the setup's package list.
 
@@ -102,7 +100,7 @@ repo and never by absolute path.
   own machine.
 - **SDL2 needs an explicit package mapping.** `SDL2/SDL.h` resolves through
   clang's default include path, so the build tool never consults pkg-config,
-  and the link fails with undefined `SDL_*` symbols (old ISSUE-001). Put
+  and the link fails with undefined `SDL_*` symbols (nuc-doom ISSUE-001). Put
   `:pkg-config {"SDL2/SDL.h" ["sdl2"] "SDL2/SDL_mixer.h" ["SDL2_mixer"]}` in
   `build.edn`.
 - **Installed by setup:** SDL2 2.30, SDL2_mixer 2.8, SDL2_net 2.2, LLVM and
@@ -161,8 +159,8 @@ Only `env.sh` and `setup-cloud.sh` exist so far. Milestone 0 writes the rest
 - **Language problems go to `ISSUES.md`** when you hit them, in the format
   `PROMPT.md` §7 defines. Each bug needs a probe, and each workaround site is
   tagged `; ISSUE-NNN`. Before calling something new, check `nucleus/docs`,
-  `nucleus/design` and the old port's `ISSUES.md` for whether it's already
-  known.
+  `nucleus/design` (especially `design/doom-port-fixes/`) for whether it's
+  already known.
 - **Port the design, not Bevy.** Iron Doom's ECS, plugins, schedules and states
   are Rust idioms. Rebuild what they accomplish in idiomatic Nucleus
   (`PROMPT.md` §8). Record a finding wherever Nucleus can't express the
