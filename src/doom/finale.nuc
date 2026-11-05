@@ -1,0 +1,165 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom f_finale.c, d_englsh.h); this port is GPLv3,
+; see COPYING.
+;
+; The finale: the episode's text typed over a flat, then its art screen, or
+; for episode 3 the bunny scroll. Its ticker runs in the session's tic. Doom
+; 2's cast call isn't ported: its map 30 ends the game at the text.
+
+(ns doom.finale)
+
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.hufont)
+(import-use doom.play.defs)
+
+(defconst TEXTSPEED 3)
+(defconst TEXTWAIT 250)
+
+(defenum FinaleStage F-STAGE-TEXT F-STAGE-ARTSCREEN F-STAGE-CAST)
+
+(defconst E1-TEXT
+  "Once you beat the big badasses and\nclean out the moon base you're supposed\nto win, aren't you? Aren't you? Where's\nyour fat reward and ticket home? What\nthe hell is this? It's not supposed to\nend this way!\n\nIt stinks like rotten meat, but looks\nlike the lost Deimos base.  Looks like\nyou're stuck on The Shores of Hell.\nThe only way out is through.\n\nTo continue the DOOM experience, play\nThe Shores of Hell and its amazing\nsequel, Inferno!\n")
+
+(defconst E2-TEXT
+  "You've done it! The hideous cyber-\ndemon lord that ruled the lost Deimos\nmoon base has been slain and you\nare triumphant! But ... where are\nyou? You clamber to the edge of the\nmoon and look down to see the awful\ntruth.\n\nDeimos floats above Hell itself!\nYou've never heard of anyone escaping\nfrom Hell, but you'll make the bastards\nsorry they ever heard of you! Quickly,\nyou rappel down to  the surface of\nHell.\n\nNow, it's on to the final chapter of\nDOOM! -- Inferno.")
+
+(defconst E3-TEXT
+  "The loathsome spiderdemon that\nmasterminded the invasion of the moon\nbases and caused so much death has had\nits ass kicked for all time.\n\nA hidden doorway opens and you enter.\nYou've proven too tough for Hell to\ncontain, and now Hell at last plays\nfair -- for you emerge from the door\nto see the green fields of Earth!\nHome at last.\n\nYou wonder what's been happening on\nEarth while you were battling evil\nunleashed. It's good that no Hell-\nspawn could have come through that\ndoor with you ...")
+
+(defconst E4-TEXT
+  "the spider mastermind must have sent forth\nits legions of hellspawn before your\nfinal confrontation with that terrible\nbeast from hell.  but you stepped forward\nand brought forth eternal damnation and\nsuffering upon the horde as a true hero\nwould in the face of something so evil.\n\nbesides, someone was gonna pay for what\nhappened to daisy, your pet rabbit.\n\nbut now, you see spread before you more\npotential pain and gibbitude as a nation\nof demons run amok among our cities.\n\nnext stop, hell on earth!")
+
+(defconst C1-TEXT
+  "YOU HAVE ENTERED DEEPLY INTO THE INFESTED\nSTARPORT. BUT SOMETHING IS WRONG. THE\nMONSTERS HAVE BROUGHT THEIR OWN REALITY\nWITH THEM, AND THE STARPORT'S TECHNOLOGY\nIS BEING SUBVERTED BY THEIR PRESENCE.\n\nAHEAD, YOU SEE AN OUTPOST OF HELL, A\nFORTIFIED ZONE. IF YOU CAN GET PAST IT,\nYOU CAN PENETRATE INTO THE HAUNTED HEART\nOF THE STARBASE AND FIND THE CONTROLLING\nSWITCH WHICH HOLDS EARTH'S POPULATION\nHOSTAGE.")
+
+(defconst C2-TEXT
+  "YOU HAVE WON! YOUR VICTORY HAS ENABLED\nHUMANKIND TO EVACUATE EARTH AND ESCAPE\nTHE NIGHTMARE.  NOW YOU ARE THE ONLY\nHUMAN LEFT ON THE FACE OF THE PLANET.\nCANNIBAL MUTATIONS, CARNIVOROUS ALIENS,\nAND EVIL SPIRITS ARE YOUR ONLY NEIGHBORS.\nYOU SIT BACK AND WAIT FOR DEATH, CONTENT\nTHAT YOU HAVE SAVED YOUR SPECIES.\n\nBUT THEN, EARTH CONTROL BEAMS DOWN A\nMESSAGE FROM SPACE: \"SENSORS HAVE LOCATED\nTHE SOURCE OF THE ALIEN INVASION. IF YOU\nGO THERE, YOU MAY BE ABLE TO BLOCK THEIR\nENTRY.  THE ALIEN BASE IS IN THE HEART OF\nYOUR OWN HOME CITY, NOT FAR FROM THE\nSTARPORT.\" SLOWLY AND PAINFULLY YOU GET\nUP AND RETURN TO THE FRAY.")
+
+(defconst C3-TEXT
+  "YOU ARE AT THE CORRUPT HEART OF THE CITY,\nSURROUNDED BY THE CORPSES OF YOUR ENEMIES.\nYOU SEE NO WAY TO DESTROY THE CREATURES'\nENTRYWAY ON THIS SIDE, SO YOU CLENCH YOUR\nTEETH AND PLUNGE THROUGH IT.\n\nTHERE MUST BE A WAY TO CLOSE IT ON THE\nOTHER SIDE. WHAT DO YOU CARE IF YOU'VE\nGOT TO GO THROUGH HELL TO GET TO IT?")
+
+(defconst C4-TEXT
+  "THE HORRENDOUS VISAGE OF THE BIGGEST\nDEMON YOU'VE EVER SEEN CRUMBLES BEFORE\nYOU, AFTER YOU PUMP YOUR ROCKETS INTO\nHIS EXPOSED BRAIN. THE MONSTER SHRIVELS\nUP AND DIES, ITS THRASHING LIMBS\nDEVASTATING UNTOLD MILES OF HELL'S\nSURFACE.\n\nYOU'VE DONE IT. THE INVASION IS OVER.\nEARTH IS SAVED. HELL IS A WRECK. YOU\nWONDER WHERE BAD FOLKS WILL GO WHEN THEY\nDIE, NOW. WIPING THE SWEAT FROM YOUR\nFOREHEAD YOU BEGIN THE LONG TREK BACK\nHOME. REBUILDING EARTH OUGHT TO BE A\nLOT MORE FUN THAN RUINING IT WAS.\n")
+
+(defconst C5-TEXT
+  "CONGRATULATIONS, YOU'VE FOUND THE SECRET\nLEVEL! LOOKS LIKE IT'S BEEN BUILT BY\nHUMANS, RATHER THAN DEMONS. YOU WONDER\nWHO THE INMATES OF THIS CORNER OF HELL\nWILL BE.")
+
+(defconst C6-TEXT
+  "CONGRATULATIONS, YOU'VE FOUND THE\nSUPER SECRET LEVEL!  YOU'D BETTER\nBLAZE THROUGH THIS ONE!\n")
+
+(defstruct Finale stage:i32 count:i32 text:StrView flat:StrView episode:i32
+  ; F_BunnyScroll's laststage.
+  last-stage:i32)
+
+(defn finale-empty ():Finale
+  (return (Finale F-STAGE-TEXT 0 (strview-from-cstr "") (strview-from-cstr "") 1 0)))
+
+; F_StartFinale: the text screen for this episode or Doom 2 map.
+(defn finale-start (commercial:bool episode:i32 m:i32):Finale
+  (let (text E1-TEXT flat "FLOOR4_8")
+    (if commercial
+      (case m
+        6 (do (set! text C1-TEXT) (set! flat "SLIME16"))
+        11 (do (set! text C2-TEXT) (set! flat "RROCK14"))
+        20 (do (set! text C3-TEXT) (set! flat "RROCK07"))
+        30 (do (set! text C4-TEXT) (set! flat "RROCK17"))
+        15 (do (set! text C5-TEXT) (set! flat "RROCK13"))
+        31 (do (set! text C6-TEXT) (set! flat "RROCK19"))
+        0)
+      (case episode
+        2 (do (set! text E2-TEXT) (set! flat "SFLR6_1"))
+        3 (do (set! text E3-TEXT) (set! flat "MFLR8_4"))
+        4 (do (set! text E4-TEXT) (set! flat "MFLR8_3"))
+        0))
+    (return (Finale F-STAGE-TEXT 0 text flat episode 0))))
+
+; F_Ticker. Returns 1 for Doom 2's "go on" (ga_worlddone) after a button,
+; 2 when the text gives way to the art screen (which forces a wipe), else 0.
+(defn finale-ticker (f:&Finale commercial:bool any-button:bool):i32
+  (when (and commercial (> (f 'count) 50) any-button)
+    (set! (f 'count) (+ (f 'count) 1))
+    (return 1))
+  (set! (f 'count) (+ (f 'count) 1))
+  (when commercial (return 0))
+  (when (and (= (f 'stage) F-STAGE-TEXT)
+             (> (f 'count) (+ (* (unsafe/cast i32 ((f 'text) 'len)) TEXTSPEED) TEXTWAIT)))
+    (set! (f 'count) 0)
+    (set! (f 'stage) F-STAGE-ARTSCREEN)
+    (return 2))
+  (return 0))
+
+; --- drawing ----------------------------------------------------------------
+
+(defn- lump-patch (w:&Wad n:StrView):(Fallible Patch)
+  (return (patch-parse (ref (try (lump-named w (name n))) 'data))))
+
+; F_TextWrite: the flat tiled, and the text typed so far.
+(defn- text-write (f:&Finale w:&Wad font:&HuFont buf:&Buffer):(Fallible void)
+  (let (src ((try (lump-named w (name (f 'flat)))) 'data))
+    (dotimes (y:usize 200)
+      (dotimes (x:usize 320)
+        (set buf x y @(&src (+ (* (bit-and y 63) 64) (bit-and x 63)))))))
+  (let (cx 10 cy 10 t (f 'text) i:usize 0 n (/ (- (f 'count) 10) TEXTSPEED))
+    (while (and (> n 0) (< i (t 'len)))
+      (let (c (byte-of t i))
+        (if (= c 10)
+          (do (set! cx 10) (set! cy (+ cy 11)))
+          (let (k (font-index c))
+            (if (< k 0)
+              (set! cx (+ cx 4))
+              (let (p (font-patch font k) pw (unsafe/cast i32 (p 'width)))
+                (when (> (+ cx pw) 320) (return (ok)))
+                (try (draw-patch buf (unsafe/cast usize cx) (unsafe/cast usize cy) p))
+                (set! cx (+ cx pw)))))))
+      (set! i (+ i 1))
+      (set! n (- n 1))))
+  (return (ok)))
+
+; F_DrawPatchCol: one column of a patch, from the top of the screen.
+(defn- draw-patch-col (buf:&Buffer x:usize p:&Patch col:usize):void
+  (draw-column (patch-column p col) buf x 0))
+
+; F_BunnyScroll: PFUB2 and PFUB1 side by side, scrolling, then "THE END".
+(defn- bunny-scroll (f:&Finale w:&Wad buf:&Buffer):(Fallible void)
+  (let (p1 (try (lump-patch w (strview-from-cstr "PFUB2")))
+        p2 (try (lump-patch w (strview-from-cstr "PFUB1")))
+        scrolled (max 0 (min 320 (- 320 (/ (- (f 'count) 230) 2)))))
+    (dotimes (x:i32 320)
+      (if (< (+ x scrolled) 320)
+        (draw-patch-col buf (unsafe/cast usize x) &p1 (unsafe/cast usize (+ x scrolled)))
+        (draw-patch-col buf (unsafe/cast usize x) &p2 (unsafe/cast usize (- (+ x scrolled) 320)))))
+    (when (< (f 'count) 1130) (return (ok)))
+    (let (stage (if (< (f 'count) 1180) 0 (min 6 (/ (- (f 'count) 1180) 5)))
+          n (str "END" stage)
+          p (try (lump-patch w (string-as-view &n))))
+      ; Vanilla's pistol shot for each letter is a drawer-side sound; not
+      ; played yet.
+      (set! (f 'last-stage) stage)
+      (try (draw-patch buf (/ (- 320 (* 13 8)) 2) (/ (- 200 (* 8 8)) 2) &p))))
+  (return (ok)))
+
+(defn- min (a:i32 b:i32):i32 (return (if (< a b) a b)))
+(defn- max (a:i32 b:i32):i32 (return (if (> a b) a b)))
+
+; F_Drawer.
+(defn finale-drawer (f:&Finale w:&Wad font:&HuFont buf:&Buffer ultimate:bool):(Fallible void)
+  (if (= (f 'stage) F-STAGE-TEXT)
+    (try (text-write f w font buf))
+    (if (= (f 'episode) 3)
+      (try (bunny-scroll f w buf))
+      (let (lump (case (f 'episode) 1 (if ultimate "CREDIT" "HELP2") 2 "VICTORY2" 4 "ENDPIC" ""))
+        (when (> (lump 'len) 0)
+          (let (p (try (lump-patch w lump))) (try (draw-patch buf 0 0 &p)))))))
+  (return (ok)))

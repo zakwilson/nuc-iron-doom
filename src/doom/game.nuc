@@ -49,6 +49,8 @@
 (import-use doom.statusbar)
 (import-use doom.intermission)
 (import-use doom.wipe)
+(import-use doom.finale)
+(import-use doom.hufont)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
 
@@ -99,13 +101,15 @@
   wipe-state:i32
   seen-loads:i32
   wi-graphics:?WiGraphics
+  seen-forced-wipes:i32
+  hu-font:?HuFont
   tic:i32
   quit:bool)
 
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
   (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
                 (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                none GS-DEMOSCREEN 0 none 0 false)))
+                none GS-DEMOSCREEN 0 none 0 none 0 false)))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -190,9 +194,8 @@
     (let (cmd (build-ticcmd (ref g 'cmd-turn-held)))
       (when (some? (s 'record)) (lowres-turn &cmd (ref g 'turn-carry)))
       (try (session-tic s (ref g 'assets) cmd)))
-    ; G_CheckDemoStatus quits after a -playdemo or -timedemo, and without a
-    ; finale yet so does the episode's end.
-    (when (or (s 'demo-ended) (s 'finished)) (set! (g 'quit) true)))
+    ; G_CheckDemoStatus quits after a -playdemo or -timedemo.
+    (when (s 'demo-ended) (set! (g 'quit) true)))
   (return (ok)))
 
 (defn- name-from-episode (e:i32):Name
@@ -239,6 +242,14 @@
       (try (set-palette g (st-palette p)))))
   (return (ok)))
 
+; Loaded once; the copy returned shares its patches.
+(defn- font-of (g:&Game):(Fallible HuFont)
+  (when (none? (g 'hu-font))
+    (set! (g 'hu-font) (some (try (hu-font-load (ref (ref g 'assets) 'wad))))))
+  (match (g 'hu-font)
+    ((some f) (return (ok f)))
+    ((none) (fail "no HU font"))))
+
 ; D_Display's gamestate switch.
 (defn- draw-session (g:&Game s:&Session):(Fallible void)
   (let (r (ref (session-world s) 'rules) commercial (= (r 'mode) COMMERCIAL))
@@ -252,6 +263,10 @@
           (set! (g 'wi-graphics) (some (try (wi-graphics-load (ref (ref g 'assets) 'wad) epsd (r 'ultimate))))))
         (when-some (wg (g 'wi-graphics))
           (let (wgv wg) (try (wi-drawer wi &wgv (ref g 'screen) commercial)))))
+      GS-FINALE
+      (do (try (set-palette g 0))
+          (let (font (try (font-of g)))
+            (try (finale-drawer (ref s 'finale) (ref (ref g 'assets) 'wad) &font (ref g 'screen) (r 'ultimate)))))
       0))
   (return (ok)))
 
@@ -269,6 +284,9 @@
   (when (!= (s 'loads) (g 'seen-loads))
     (set! (g 'seen-loads) (s 'loads))
     (when (= (g 'wipe-state) GS-LEVEL) (set! (g 'wipe-state) -1)))
+  (when (!= (s 'forced-wipes) (g 'seen-forced-wipes))
+    (set! (g 'seen-forced-wipes) (s 'forced-wipes))
+    (set! (g 'wipe-state) -1))
   (let (gs (s 'gamestate) start:?Buffer (if (!= gs (g 'wipe-state)) (some (copy-of (ref g 'screen))) none))
     (try (draw-session g s))
     (when-some (st start)

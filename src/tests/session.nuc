@@ -16,6 +16,8 @@
 (import-use doom.play.world)
 (import-use doom.session)
 (import-use doom.intermission)
+(import-use doom.finale)
+(import-use doom.hufont)
 (import-use doom.framedump)
 (import-use doom.util)
 (import-use doom.buffer)
@@ -77,3 +79,25 @@
              ps (view (ref a 'palettes)))
          (try (wi-drawer (ref s 'wi) &g &screen false))
          (try (framedump-write (strview-from-cstr "build") 9999 &screen (&ps 0) 0)))))))
+
+; E1M8's exit goes to the finale: its text, then the art screen. The text
+; part way is drawn to build/tic09998.ppm for checking by eye.
+(deftest finale-runs
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (let (s (try (session-new &a (game-mode &a))))
+       (try (session-init-new s &a SK-MEDIUM 1 8))
+       (dotimes (k:usize 10) (try (session-tic s &a (ticcmd-zero))))
+       (set! ((session-world s) 'exit) 1)
+       (dotimes (k:usize 600) (try (session-tic s &a (ticcmd-zero))))
+       (try (check (= (s 'gamestate) GS-FINALE) "in the finale"))
+       (try (check (= ((ref s 'finale) 'stage) F-STAGE-TEXT) "still typing"))
+       (let (font (try (hu-font-load (ref a 'wad)))
+             screen (array2d (as usize 320) (as usize 200) (as ui8 0))
+             ps (view (ref a 'palettes)))
+         (try (finale-drawer (ref s 'finale) (ref a 'wad) &font &screen false))
+         (try (framedump-write (strview-from-cstr "build") 9998 &screen (&ps 0) 0)))
+       ; 440 characters at 3 tics each, then 250 tics to read them.
+       (dotimes (k:usize 1100) (try (session-tic s &a (ticcmd-zero))))
+       (try (check (= ((ref s 'finale) 'stage) F-STAGE-ARTSCREEN) "the art screen"))))))

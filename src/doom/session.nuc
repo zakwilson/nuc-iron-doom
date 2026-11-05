@@ -33,6 +33,7 @@
 (import-use doom.play.tick)
 (import-use doom.statusbar)
 (import-use doom.intermission)
+(import-use doom.finale)
 (import doom.play.map pm)
 
 ; The v1.9 executable's demo version byte, and the end-of-demo marker.
@@ -69,14 +70,18 @@
   gamestate:i32 gameaction:i32 secret-exit:bool
   wi:Intermission
   ; Levels loaded: G_DoLoadLevel forces a wipe, which the game layer does.
-  loads:i32)
+  loads:i32
+  finale:Finale
+  ; F_Ticker's forced wipes (wipegamestate = -1), for the game layer.
+  forced-wipes:i32)
 
 (defn session-new (a:&Assets mode:i32):(Fallible &Session)
   (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
                        (single-player-rules SK-MEDIUM mode 1 1)
                        (single-player-in-game) (new-game-players) (random-new)
                        none 0 none false false none none (status-bar-new)
-                       GS-LEVEL GA-NOTHING false (intermission-empty) 0))))
+                       GS-LEVEL GA-NOTHING false (intermission-empty) 0
+                       (finale-empty) 0))))
 
 ; D_IdentifyVersion: told apart by which maps the IWAD has.
 (defn game-mode (a:&Assets):i32
@@ -314,7 +319,13 @@
 (defn- world-done (s:&Session):void
   (set! (s 'gameaction) GA-WORLDDONE)
   (when (s 'secret-exit)
-    (set! ((player-at (session-world s) (unsafe/cast usize ((ref s 'rules) 'console-player))) 'did-secret) true)))
+    (set! ((player-at (session-world s) (unsafe/cast usize ((ref s 'rules) 'console-player))) 'did-secret) true))
+  ; Doom 2's text screens between its chapters.
+  (let (r (ref s 'rules) m (r 'map))
+    (when (and (= (r 'mode) COMMERCIAL)
+               (or (= m 6) (= m 11) (= m 20) (= m 30)
+                   (and (s 'secret-exit) (or (= m 15) (= m 31)))))
+      (start-finale s))))
 
 ; G_DoWorldDone: the map the intermission pointed at.
 (defn- do-world-done (s:&Session a:&Assets):(Fallible void)
@@ -324,11 +335,13 @@
   (set! (s 'gameaction) GA-NOTHING)
   (return (ok)))
 
-; F_StartFinale. The finale itself isn't ported yet, so the game ends here.
+; F_StartFinale. `finished` marks Doom 1's episode end, for tests.
 (defn- start-finale (s:&Session):void
-  (set! (s 'gameaction) GA-NOTHING)
-  (set! (s 'gamestate) GS-FINALE)
-  (set! (s 'finished) true))
+  (let (r (ref s 'rules) commercial (= (r 'mode) COMMERCIAL))
+    (set! (s 'gameaction) GA-NOTHING)
+    (set! (s 'gamestate) GS-FINALE)
+    (when (not commercial) (set! (s 'finished) true))
+    (set! (s 'finale) (finale-start commercial (r 'episode) (r 'map)))))
 
 ; The -tichash line: as reference/tichash.patch writes it.
 (defn- hash-word (h:ui32 v:i32):ui32
@@ -419,6 +432,17 @@
             (set! (s 'gameaction) GA-COMPLETED)))
       GS-INTERMISSION
       (when (wi-ticker (ref s 'wi) w commercial) (world-done s))
+      GS-FINALE
+      (let (any false)
+        (dotimes (i:usize MAXPLAYERS)
+          (when (and ((ref s 'in-game) i) (!= (((player-at w i) 'cmd) 'buttons) 0)) (set! any true)))
+        (case (finale-ticker (ref s 'finale) commercial any)
+          ; F_StartCast isn't ported: map 30's text ends the game.
+          1 (if (= ((ref s 'rules) 'map) 30)
+              (set! (s 'finished) true)
+              (set! (s 'gameaction) GA-WORLDDONE))
+          2 (set! (s 'forced-wipes) (+ (s 'forced-wipes) 1))
+          0))
       0)
     (when-some (out (s 'tichash))
       (let (line (tichash-line s) o out)
