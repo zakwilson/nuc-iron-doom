@@ -610,6 +610,34 @@ works, and so does the same `if` as a `let` init or a `return` value, so the
 result falls to the pointer `Maybe` and is refused, while a string literal
 passes. The message points at `as-ref`, which is the wrong fix here.
 
+## ISSUE-027: an untyped `let` binding can consume the want its body tail needs
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed-in-compiler (nucleus `40cf7d8`, carried as
+  `nucleus-patches/0007-*.patch`)
+- **Probe:** `probes/issue-027.nuc` (with modules in `probes/issue-027/`) —
+  expected `(let (pos:?Point (match s ((some k) (let (bx (box-at k)) (some
+  (Point …)))) ((none) none))) …)` to bind `pos`; actual `value is either
+  ?&Point or ?Point`, but only while another loaded namespace also defines
+  `box-at`
+- **Port sites:** none left; it struck `src/doom/mixer.nuc`
+  (`mixer-update`, a channel's position from its sector), where the other
+  `sector-at` is phase A's in `doom.level`.
+- **Workaround:** before the fix, a type on the binding (`sec:&Sector`).
+- **Suggestion:** (done) `emit-let` and `emit-with` capture the want on entry
+  and re-arm the body tail with it, as their comment already said they did.
+
+Context: the mixer compiled on its own and failed only inside the game,
+which made it look like a namespace leak. Dispatch was right; what changed
+was that a call to a name with methods in two loaded namespaces goes through
+generic resolution, which uses up the want, and an untyped binding's init
+sees the `let`'s outer want (documented, for closures). The `let` then read
+the want *after* its bindings to re-arm its tail, found nothing, and the
+`(some (Point …))` tail became a pointer `Maybe`. A program's meaning
+changing with what else is loaded is the costly part: the error points at a
+line that is correct.
+
 ## What worked well
 
 - Computing the 256-byte RNG table from its LCG in a macro body (ordinary

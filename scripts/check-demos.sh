@@ -5,9 +5,11 @@
 #   scripts/check-demos.sh --record   rewrite the references with the patched
 #                                     Chocolate Doom from scripts/build-reference.sh
 # IWAD defaults to /usr/share/games/doom/doom1.wad; DEMOS to "demo1 demo2 demo3".
-# Column 2, M_Random's index, is left out unless STRICT=1: Chocolate Doom also
-# draws it in the screen wipe and in S_StartSound's pitch variation (only for
-# sounds in earshot), neither of which touches the playsim.
+# Column 2, M_Random's index, is left out unless STRICT=1. The port now draws
+# it where Chocolate Doom does (the screen wipe, S_StartSound's pitch for
+# sounds in earshot, the status bar's face), but none of that touches the
+# playsim, so a mismatch there isn't a desync. Make STRICT the default once a
+# reference run agrees.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

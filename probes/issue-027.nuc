@@ -1,0 +1,16 @@
+; ISSUE-027: a `let` whose untyped binding calls a function that another
+; loaded namespace also defines loses its want before the body tail, so a
+; `(some (Point …))` tail isn't target-typed. Without issue027.one loaded it
+; compiles; so it does with the binding typed.
+; flags: -I $ROOT/probes/issue-027
+; fixed-when: output-contains 7 1
+; Actual: "let: init type mismatch for 'pos': value is either
+; ?&issue027.user/Point or ?issue027.user/Point, slot is ?issue027.user/Point".
+
+(import-use "stdio.h")
+(import-use issue027.one)
+(import-use issue027.user)
+
+(defn main ():i32
+  (printf "%d %d\n" (first-x (some (as usize 0))) ((box-at 0) 'a))
+  (return 0))

@@ -1,0 +1,9 @@
+(ns issue027.user)
+(import-use issue027.two)
+(defstruct Point x:i32 y:i32)
+; The let in the match arm binds bx without a type; its tail is the some.
+(defn first-x (s:?usize):i32
+  (let (pos:?Point (match s
+                     ((some k) (let (bx (box-at k)) (some (Point (bx 'b) (bx 'c)))))
+                     ((none) none)))
+    (match pos ((some p) (return (p 'x))) ((none) (return -1)))))

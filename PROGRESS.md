@@ -88,6 +88,7 @@ as a patch in `nucleus-patches/`, which `setup-cloud.sh` applies.
 | ISSUE-016 | `7bb5257` | `nucleus-patches/0004-*.patch` |
 | ISSUE-023 | `d13384a` | `nucleus-patches/0005-*.patch` |
 | ISSUE-024 | `e15f668` | `nucleus-patches/0006-*.patch` |
+| ISSUE-027 | `40cf7d8` | `nucleus-patches/0007-*.patch` |
 
 Each passed the nucleus gate here (after 0006: 1679 passed, the 4 avr-gcc
 failures of the baseline, 6 skipped; `make bootstrap` PASS once converged).
@@ -139,7 +140,7 @@ at once (vanilla waits for the next frame).
 
 ## In flight
 
-- Nothing long-running.
+- The nucleus gate (`make -k test bootstrap`) for patch 0007 (ISSUE-027).
 
 ## Next steps
 
