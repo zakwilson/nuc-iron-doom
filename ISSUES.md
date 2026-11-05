@@ -10,6 +10,7 @@ provisional until milestone 8.)
 | Issue | Claim | Severity | Kind |
 |---|---|---|---|
 | ISSUE-016 | A union copy dropped the bytes in its repr member's padding | major | bug |
+| ISSUE-021 | A `let` typed `&T` silently binds a copy of a `T` value | major | bug |
 | ISSUE-011 | A macro-defined struct can't appear in any other function's signature | major | design |
 | ISSUE-006 | A struct defined by a macro can't be a field type | major | bug |
 | ISSUE-009 | `(some v)`/`none` aren't target-typed through a `deref` or `aref` place | minor | bug |
@@ -28,6 +29,7 @@ provisional until milestone 8.)
 | ISSUE-017 | `str` and `println` can't format a `ui32`, `i16` or `ui8` | papercut | missing-feature |
 | ISSUE-012 | `->`, `+` and other symbol punctuation can't be in a function name | papercut | design |
 | ISSUE-018 | `deftype` refuses the documented fn-pointer spelling | papercut | diagnostics |
+| ISSUE-020 | `(new T a v)` with `v:T` reads `v` as the first field | papercut | missing-feature |
 
 ---
 
@@ -397,8 +399,8 @@ and `ui32` (binary angles), so every debug print in the port needs a cast.
 - **Probe:** `probes/issue-018.nuc` — expected `(deftype Op (fn i32)(i32 i32))`
   to alias the type `f:(fn i32)(i32 i32)` spells; actual `deftype: expects a
   name and one type — (deftype Name Type)`
-- **Port sites:** `src/doom/render/bsp.nuc` (`AddSprites`, the sprite-pass
-  callback the BSP walk takes)
+- **Port sites:** none now. `src/doom/render/bsp.nuc` named its sprite-pass
+  callback this way until the BSP walk called the sprite pass directly.
 - **Workaround:** the canonical form, `(deftype Op ((fn i32) (i32 i32)))`.
 - **Suggestion:** let `deftype` take the two adjacent groups as the colon-paren
   sugar does, or name the canonical form in the error.
@@ -433,6 +435,47 @@ into a struct literal, and the error was `struct literal: type mismatch for
 field 'solid-segs' (positional initializer)`, which says nothing about the
 generic. Bound to an untyped `let`, the result is silently a `(Vector &P)`
 whose every element points at the same temporary.
+
+## ISSUE-020: `(new T a v)` with `v:T` reads `v` as the first field
+
+- **Severity:** papercut
+- **Kind:** missing-feature
+- **Status:** worked-around
+- **Probe:** `probes/issue-020.nuc` — expected `(new P heap v)` with `v:P` to
+  allocate a copy of `v`; actual `struct literal: type mismatch for field 'x'
+  (positional initializer)`
+- **Port sites:** `src/doom/play/world.nuc` (`blank-mobj`)
+- **Workaround:** `(new T a)`, then `(set! @p v)`.
+- **Suggestion:** when `new`'s one value has type `T` and `T` has no `init`
+  for it, copy it in. Failing that, name `new` in the error.
+
+Context: the playsim keeps mobjs in a per-level arena so a `&Mobj` survives
+spawning more (vanilla's pointers do). A freed mobj is reused and a new one
+allocated, and both paths want to start from the same zeroed `Mobj` value.
+`new` reads one argument as the struct's first positional field, and the
+error describes a struct literal the source never wrote.
+
+## ISSUE-021: a `let` typed `&T` silently binds a copy of a `T` value
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-021.nuc` — expected `(let (p:&P (&v 0)) …)`, with
+  `v` a `(Vector P)`, to be refused as `&(v 0)` is; actual it compiles and
+  binds the address of a copy, so `(set! (p 'x) 5)` is lost
+- **Port sites:** `src/doom/render/sprites.nuc` (`install`)
+- **Workaround:** index a `Slice` view instead; its `invoke` returns `&T`.
+- **Suggestion:** refuse a value where a `let` slot is typed `&T`, with the
+  same note `ref` gives: bind the value first, or take a view.
+
+Context: `Vector`'s `invoke` returns `T` and `Slice`'s returns `&T`, so `(s i)`
+reads the same in both but means different things. The docs refuse
+`&(v 0)` explicitly because it would point at a copy. A typed `let` performs
+the same conversion with no diagnostic, and a call result does too:
+`(let (p:&P (get-p)) …)` compiles. I hit it filling in sprite frames.
+Every rotation written through `f` was lost, and the only symptom would have
+been "No patches found" at startup. I found it only because I went to check
+whether `(v i)` returned a reference.
 
 ## What worked well
 

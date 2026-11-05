@@ -19,6 +19,8 @@
 (import-use doom.graphics)
 (import-use doom.fixed)
 (import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.render.sprites)
 
 (defconst SCREENWIDTH 320)
 (defconst SCREENHEIGHT 200)
@@ -46,6 +48,9 @@
 (defconst SIL-BOTH 3)
 
 (defconst SHRT-MAX 32767)
+(defconst MAXVISSPRITES 128)
+; Sprites nearer than this are behind the view plane.
+(defconst MINZ (* 4 65536))
 
 ; A run of screen columns walls already cover.
 (defstruct ClipRange first:i32 last:i32)
@@ -64,6 +69,13 @@
   scale1:Fixed scale2:Fixed scale-step:Fixed
   silhouette:i32 bsil-height:Fixed tsil-height:Fixed
   spr-top-clip:ClipRef spr-bottom-clip:ClipRef masked-texture-col:ClipRef)
+
+; A thing projected onto the screen (vissprite_t). `colormap` is -1 for the
+; spectre's fuzz.
+(defstruct VisSprite
+  x1:i32 x2:i32 gx:Fixed gy:Fixed gz:Fixed gzt:Fixed
+  start-frac:Fixed scale:Fixed x-iscale:Fixed texture-mid:Fixed
+  patch:i32 colormap:i32 mobj-flags:i32)
 
 ; A floor or ceiling area: one height, flat and light, and per column the rows
 ; it spans. Rows are bytes, 0xff unset, with a pad column each side.
@@ -120,12 +132,32 @@
   sky-texture:usize
   sky-texture-mid:Fixed
   ; R_DrawFuzzColumn's place in its offset table.
-  fuzz-pos:usize)
+  fuzz-pos:usize
+  ; Sprites (r_things.c): this frame's, the light row of the sector being
+  ; added, and which sectors have been added (validcount).
+  vis-sprites:(Vector VisSprite)
+  sprite-lights:i32
+  sector-valid:(Vector i32) valid-count:i32
+  ; R_DrawSprite's clip rows; -2 is unset.
+  clip-bot:(Vector i16) clip-top:(Vector i16)
+  ; Players 2 to 4's colours: three 256-byte maps of the green ramp.
+  translations:(Vector ui8))
 
 (defn- vec-of (n:i32 v:T):(Vector T)
   (let (out (make (Vector T)))
     (dotimes (i:i32 n) (conj &out v))
     (return out)))
+
+; R_InitTranslationTables: the green ramp 0x70-0x7f becomes grey, brown
+; or red.
+(defn- translation-tables ():(Vector ui8)
+  (let (t (vec-of (* 3 256) (as ui8 0)))
+    (dotimes (i:i32 256)
+      (let (green (and (>= i 0x70) (<= i 0x7f)) lo (bit-and i 0xf))
+        (set &t (as usize i) (unsafe/cast ui8 (if green (+ 0x60 lo) i)))
+        (set &t (as usize (+ i 256)) (unsafe/cast ui8 (if green (+ 0x40 lo) i)))
+        (set &t (as usize (+ i 512)) (unsafe/cast ui8 (if green (+ 0x20 lo) i)))))
+    (return t)))
 
 (defn visplane-new ():Visplane
   (return (Visplane 0 0 0 0 0 (vec-of (+ SCREENWIDTH 2) (as ui8 0xff))
@@ -211,7 +243,10 @@
                     (vec-of SCREENHEIGHT 0) 0 0
                     (vec-of SCREENHEIGHT 0) (vec-of SCREENHEIGHT 0)
                     (vec-of SCREENHEIGHT 0) (vec-of SCREENHEIGHT 0)
-                    0 0 0 (* (/ SCREENHEIGHT 2) FRACUNIT) 0))
+                    0 0 0 (* (/ SCREENHEIGHT 2) FRACUNIT) 0
+                    (make (Vector VisSprite)) 0 (make (Vector i32)) 0
+                    (vec-of SCREENWIDTH (as i16 0)) (vec-of SCREENWIDTH (as i16 0))
+                    (translation-tables)))
     (dotimes (i:usize MAXVISPLANES) (conj (ref r 'visplanes) (visplane-new)))
     (set-view-size &r blocks)
     (init-light-tables &r)
@@ -224,6 +259,9 @@
   flats:&Flats
   ; The COLORMAP lump: 34 maps of 256 bytes.
   colormaps:&Bytes
+  sprites:&Sprites
+  ; Each sector's things, as the playsim links them.
+  things:&(Vector ?&Mobj)
   screen:&Buffer)
 
 ; --- small accessors --------------------------------------------------------------

@@ -137,7 +137,10 @@
 
 ; --- wall textures -------------------------------------------------------------
 
-(defstruct WallTexture name:Name pixels:Buffer)
+; `masked` is each column as R_GetColumn hands it to the masked drawer: the
+; patch's own column, gaps and all, where exactly one patch covers it, and
+; none where patches overlap (vanilla then reads the composite as posts).
+(defstruct WallTexture name:Name pixels:Buffer masked:(Vector ?Column))
 (defstruct WallTextures list:(Vector WallTexture) index:(HashMap Name usize))
 
 ; One patch placed in a texture definition.
@@ -223,7 +226,16 @@
                     oy (if (> (&ncover x) 1) (as i64 (d 'origin-y)) 0)
                     pc (as-checked usize (- (as-checked i64 x) (as i64 (d 'origin-x)))))
                 (draw-to-texture (patch-column &p pc) &pix x oy)))))
-        (return (ok (WallTexture nm pix)))))))
+        (let (masked (make (Vector ?Column)))
+          (dotimes (x:usize tw)
+            (let (col:?Column none)
+              (when (= (&ncover x) 1)
+                (dotimes (di:usize (count &ds))
+                  (when (&cover x di)
+                    (let (d (&ds di) p (try (get-patch pn w (d 'patch-num))))
+                      (set! col (some @(patch-column &p (as-checked usize (- (as-checked i64 x) (as i64 (d 'origin-x)))))))))))
+              (conj &masked col)))
+          (return (ok (WallTexture nm pix masked))))))))
 
 (defn- textures-add (tx:&WallTextures lump:&Lump pn:&PatchNames w:&Wad):(Fallible void)
   (let (b (ref lump 'data) n (le-i32 b 0))

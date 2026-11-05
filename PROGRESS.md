@@ -52,7 +52,8 @@ it.
 | 1. Foundations | done: CLI and response files, IWAD search, WAD directory, every lump parser, RNG, 12 unit tests |
 | 2. Screens | done except the framedump gate: title (tic 2) and melt run; frames can't be compared until the reference is built |
 | 3. Level and walls | done except the framedump gate (blocked like milestone 2's): E1M1 renders; movement matches an independent f32 model of Iron Doom's bit for bit over 80 tics; playtest requested below |
-| 4–8 (phase B) | not started |
+| 4. Planes and things | in progress: Chocolate Doom's renderer (`doom.render.*`) draws walls, visplanes, sky, light, sprites and masked middle textures. `doom.info` is generated from info.c, and `doom.play.world` spawns the map's things (P_Random in step). E1M1 views were checked by eye and are hashed in `tests.render`. The switch-over of `game.nuc` and the weapon sprites remain |
+| 5–8 | not started |
 
 ## Reference frames
 
@@ -121,6 +122,13 @@ blocked here), so a misplaced texture is worth reporting.
 
 ## Next steps
 
-- Milestone 4 (planes and things): fixed-point math and the trig tables
-  (embedded: `reference/tools/gen-tables.py`, since no rounding of sin, tan
-  or atan reproduces them), then Chocolate Doom's renderer.
+- Milestone 4, rest:
+  - `game.nuc` on the new renderer, with the f32 player converted to a fixed
+    eye and a world spawned from the map. The phase-A float renderer stays
+    as `doom.render` (Iron Doom parity) until the playsim replaces the float
+    player.
+  - The weapon sprites (psprites) come with the player in milestone 5:
+    spawning a player runs weapon state actions.
+- Known gaps: no texture or flat animation (texturetranslation), and freed
+  mobjs are reused last-freed first, which only approximates the zone
+  allocator for stale `target` pointers.

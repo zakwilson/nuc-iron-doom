@@ -70,6 +70,10 @@
 (defn name-byte (n:Name i:usize):ui8
   (return (unsafe/cast ui8 (bit-and (bit-shr (n 'v) (* 8 (as ui64 i))) 255))))
 
+; The first `k` characters: sprite lumps match their sprite by four.
+(defn name-prefix (n:Name k:usize):Name
+  (return (Name (if (>= k 8) (n 'v) (bit-and (n 'v) (- (bit-shl (as ui64 1) (* 8 (as ui64 k))) 1))))))
+
 (extend Name Eq)
 (defn = (a:Name b:Name):bool (return (= (a 'v) (b 'v))))
 (defn != (a:Name b:Name):bool (return (!= (a 'v) (b 'v))))

@@ -36,3 +36,22 @@
 ; rand's `random::<i32>()`: the table byte widened, so never negative.
 (defn next-i32 (r:&Rand):i32
   (return (as i32 (next-u8 r))))
+
+; Chocolate Doom's two indices into the same table (m_random.c): the playsim's
+; P_Random, which demos depend on, and M_Random for everything else.
+(defstruct Random prnd:usize rnd:usize)
+
+(defn random-new ():Random (return (Random 0 0)))
+
+(defn p-random (r:&Random):i32
+  (set! (r 'prnd) (bit-and (+ (r 'prnd) 1) 255))
+  (return (as i32 (aref RAND-TABLE (as i64 (r 'prnd))))))
+
+(defn m-random (r:&Random):i32
+  (set! (r 'rnd) (bit-and (+ (r 'rnd) 1) 255))
+  (return (as i32 (aref RAND-TABLE (as i64 (r 'rnd))))))
+
+; P_SubRandom: a difference of two draws, -255..255.
+(defn p-sub-random (r:&Random):i32
+  (let (a (p-random r))
+    (return (- a (p-random r)))))

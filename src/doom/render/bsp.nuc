@@ -19,6 +19,7 @@
 (import-use doom.render.state)
 (import-use doom.render.plane)
 (import-use doom.render.segs)
+(import-use doom.render.things)
 
 (defn- solid (r:&Renderer i:usize):ClipRange (return ((ref r 'solid-segs) i)))
 (defn- set-solid (r:&Renderer i:usize c:ClipRange):void (set (ref r 'solid-segs) i c))
@@ -170,11 +171,8 @@
         (while (< ((solid r start) 'last) sx2) (inc! start))
         (return (not (and (>= sx1 ((solid r start) 'first)) (<= sx2 ((solid r start) 'last)))))))))
 
-; Hands each subsector's sector to the sprite pass before its segs are drawn.
-; ISSUE-018: only the canonical one-form spelling works in deftype.
-(deftype AddSprites ((fn void) (&Renderer &Scene usize)))
 
-(defn- subsector (r:&Renderer sc:&Scene num:usize add-sprites:AddSprites):(Fallible void)
+(defn- subsector (r:&Renderer sc:&Scene num:usize):(Fallible void)
   (let (l (sc 'level) ss (sub-sector-at l num) sec-i (ss 'sector) front (sector-at l sec-i))
     (set! (r 'front-sector) sec-i)
     (set! (r 'floor-plane)
@@ -192,13 +190,13 @@
       (fail "R_Subsector: solidsegs overflow (vanilla may crash here)")))
   (return (ok)))
 
-(defn render-bsp-node (r:&Renderer sc:&Scene bspnum:i32 add-sprites:AddSprites):(Fallible void)
+(defn render-bsp-node (r:&Renderer sc:&Scene bspnum:i32):(Fallible void)
   (when (!= (bit-and bspnum NF-SUBSECTOR) 0)
-    (try (subsector r sc (if (= bspnum -1) 0 (as usize (bit-and bspnum (bit-not NF-SUBSECTOR)))) add-sprites))
+    (try (subsector r sc (if (= bspnum -1) 0 (as usize (bit-and bspnum (bit-not NF-SUBSECTOR))))))
     (return (ok)))
   (let (node (node-at (sc 'level) (as usize bspnum))
         side (point-on-side (r 'view-x) (r 'view-y) node))
-    (try (render-bsp-node r sc (aref (node 'children) (as i64 side)) add-sprites))
+    (try (render-bsp-node r sc (aref (node 'children) (as i64 side))))
     (when (let (b:BBox (aref (node 'bbox) (as i64 (bit-xor side 1)))) (check-bbox r &b))
-      (try (render-bsp-node r sc (aref (node 'children) (as i64 (bit-xor side 1))) add-sprites))))
+      (try (render-bsp-node r sc (aref (node 'children) (as i64 (bit-xor side 1)))))))
   (return (ok)))

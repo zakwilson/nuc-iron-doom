@@ -15,7 +15,9 @@
 (import-use doom.assets)
 (import-use doom.mapdata)
 (import-use doom.fixed)
+(import-use doom.rand)
 (import-use doom.play.map)
+(import-use doom.play.world)
 (import-use doom.render.state)
 (import-use doom.render.view)
 
@@ -26,8 +28,11 @@
         (set! h (* (bit-xor h (as ui32 (b x y))) 16777619))))
     (return (as i64 h))))
 
-(defn- view-hash (r:&Renderer sc:&Scene x:i32 y:i32 z:i32 a:Angle):(Fallible i64)
-  (let (e (Eye (int-to-fixed x) (int-to-fixed y) (int-to-fixed z) a 0 -1))
+; The eye is 41 units above the floor, as a player's is.
+(defn- view-hash (r:&Renderer sc:&Scene x:i32 y:i32 a:Angle):(Fallible i64)
+  (let (l (sc 'level) fx (int-to-fixed x) fy (int-to-fixed y)
+        fl ((sector-at l ((sub-sector-at l (point-in-sub-sector l fx fy)) 'sector)) 'floor-height)
+        e (Eye fx fy (+ fl (int-to-fixed 41)) a 0 -1))
     (try (render-player-view r sc &e))
     (return (ok (fnv (sc 'screen))))))
 
@@ -39,11 +44,20 @@
        ((none) (try (check false "E1M1 found")))
        ((some m)
         (let (l (try (level-load &m (ref a 'flats) (ref a 'textures)))
+              o (WorldOptions SK-MEDIUM 0 false false false (array bool true false false false))
+              w (try (world-new l &m &o (random-new)))
               screen (array2d (as usize 320) (as usize 200) (as ui8 0))
               r (renderer-new 11)
-              sc (Scene &l (ref a 'textures) (ref a 'flats) (ref a 'colormaps) &screen))
+              sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats) (ref a 'colormaps)
+                        (ref a 'sprites) (ref w 'sector-things) &screen))
+          ; Things spawned on skill 3; the P_Random index after spawning.
+          (try (check-eq-int (as i64 (w 'total-kills)) 6 "kills"))
+          (try (check-eq-int (as i64 (w 'total-items)) 37 "items"))
+          (try (check-eq-int (as i64 ((ref w 'random) 'prnd)) 143 "prndindex"))
           (set! (r 'sky-texture) (unwrap-or (texture-index (ref a 'textures) (name "SKY1")) 0))
           ; The start, facing north and north-west; the courtyard, with sky.
-          (try (check-eq-int (try (view-hash &r &sc 1056 -3616 41 ANG90)) 3602683452 "start view"))
-          (try (check-eq-int (try (view-hash &r &sc 1056 -3616 41 (+ ANG90 ANG45))) 2638432845 "start, turned"))
-          (try (check-eq-int (try (view-hash &r &sc 1934 -3215 -15 ANG270)) 2613644464 "courtyard"))))))))
+          (try (check-eq-int (try (view-hash &r &sc 1056 -3616 ANG90)) 1971587042 "start view"))
+          (try (check-eq-int (try (view-hash &r &sc 1056 -3616 (+ ANG90 ANG45))) 3259163243 "start, turned"))
+          (try (check-eq-int (try (view-hash &r &sc 1934 -3215 ANG270)) 635314135 "courtyard"))
+          ; A lamp and a corpse, beside the sky.
+          (try (check-eq-int (try (view-hash &r &sc 2900 -3000 ANG180)) 3896179092 "lamp"))))))))

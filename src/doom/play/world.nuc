@@ -1,0 +1,308 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_mobj.c, p_maputl.c, p_tick.c, p_setup.c);
+; this port is GPLv3, see COPYING.
+;
+; A level in play: the map, its things, and the thinker list that runs them.
+; Mobjs and thinkers live in the level's arena (vanilla's PU_LEVEL), so a
+; `&Mobj` stays valid while more are spawned, as vanilla's pointers do.
+
+(ns doom.play.world)
+
+(import-use nucleus.allocator)
+(import-use nucleus.create)
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.rand)
+(import-use doom.mapdata)
+(import-use doom.info)
+(import-use doom.play.map)
+
+(defconst MAXPLAYERS 4)
+(defconst ONFLOORZ -2147483648)
+(defconst ONCEILINGZ 2147483647)
+(defconst MAPBLOCKSHIFT 23)
+(defconst MTF-AMBUSH 8)
+
+(defenum Skill SK-BABY SK-EASY SK-MEDIUM SK-HARD SK-NIGHTMARE)
+
+; Fields in mobj_t's order. `state` indexes STATES; `player` indexes the
+; world's players.
+(defstruct Mobj
+  thinker:?&Thinker
+  x:Fixed y:Fixed z:Fixed
+  snext:?&Mobj sprev:?&Mobj
+  angle:Angle sprite:i32 frame:i32
+  bnext:?&Mobj bprev:?&Mobj
+  sub-sector:usize
+  floor-z:Fixed ceiling-z:Fixed radius:Fixed height:Fixed
+  mom-x:Fixed mom-y:Fixed mom-z:Fixed
+  valid-count:i32 type:i32 tics:i32 state:i32 flags:i32 health:i32
+  move-dir:i32 move-count:i32
+  target:?&Mobj
+  reaction-time:i32 threshold:i32
+  player:?usize
+  last-look:i32
+  spawn-point:MapThing
+  tracer:?&Mobj)
+
+; What a thinker runs. Sector movers join this in the playsim.
+(defunion Think (cap) (mobj m:&Mobj))
+
+; A removed thinker stays linked, and is unlinked and freed when the thinker
+; loop reaches it (P_RemoveThinker's function = -1).
+(defstruct Thinker prev:?&Thinker next:?&Thinker removed:bool think:Think)
+
+(defstruct World
+  level:Level
+  arena:Arena
+  skill:i32 deathmatch:i32 netgame:bool no-monsters:bool commercial:bool
+  random:Random
+  thinker-cap:&Thinker
+  ; Freed objects, reused last-freed first as the zone allocator tends to.
+  free-mobjs:(Vector &Mobj) free-thinkers:(Vector &Thinker)
+  ; Each sector's things and each blockmap cell's, most recent first.
+  sector-things:(Vector ?&Mobj)
+  block-links:(Vector ?&Mobj)
+  player-in-game:(Vector bool)
+  player-starts:(Vector MapThing) player-start-in-game:(Vector bool)
+  deathmatch-starts:(Vector MapThing)
+  player-mobjs:(Vector ?&Mobj)
+  total-kills:i32 total-items:i32 total-secret:i32
+  level-time:i32)
+
+(defn mobj-info-of (m:&Mobj):MobjInfo (return (mobj-info (m 'type))))
+
+; --- the thinker list (p_tick.c) ---------------------------------------------
+
+(defn- new-thinker (w:&World t:Think):&Thinker
+  (when (= (count (ref w 'free-thinkers)) 0)
+    (return (new Thinker (ref w 'arena) none none false t)))
+  (let (th (pop-last (ref w 'free-thinkers)))
+    (set! @th (Thinker none none false t))
+    (return th)))
+
+; P_AddThinker: to the end of the list, before the cap.
+(defn add-thinker (w:&World t:Think):&Thinker
+  (let (th (new-thinker w t) cap (w 'thinker-cap))
+    (if-some (last (cap 'prev))
+      (do (set! (last 'next) (some th))
+          (set! (th 'prev) (some last)))
+      0)
+    (set! (th 'next) (some cap))
+    (set! (cap 'prev) (some th))
+    (return th)))
+
+(defn remove-thinker (th:&Thinker):void (set! (th 'removed) true))
+
+; --- positions (p_maputl.c) --------------------------------------------------
+
+(defn- block-of (w:&World x:Fixed y:Fixed):?usize
+  (let (l (ref w 'level)
+        bx (bit-shr (wrap-sub x (l 'bmap-org-x)) MAPBLOCKSHIFT)
+        by (bit-shr (wrap-sub y (l 'bmap-org-y)) MAPBLOCKSHIFT))
+    (if (and (>= bx 0) (< bx (l 'bmap-width)) (>= by 0) (< by (l 'bmap-height)))
+      (return (some (unsafe/cast usize (+ (* by (l 'bmap-width)) bx))))
+      (return none))))
+
+(defn- sector-of (w:&World m:&Mobj):usize
+  (return ((sub-sector-at (ref w 'level) (m 'sub-sector)) 'sector)))
+
+; P_UnsetThingPosition: out of its sector's list and its block's.
+(defn unset-thing-position (w:&World m:&Mobj):void
+  (when (= (bit-and (m 'flags) MF-NOSECTOR) 0)
+    (if-some (n (m 'snext)) (set! (n 'sprev) (m 'sprev)) 0)
+    (match (m 'sprev)
+      ((some p) (set! (p 'snext) (m 'snext)))
+      ((none) (set (ref w 'sector-things) (sector-of w m) (m 'snext)))))
+  (when (= (bit-and (m 'flags) MF-NOBLOCKMAP) 0)
+    (if-some (n (m 'bnext)) (set! (n 'bprev) (m 'bprev)) 0)
+    (match (m 'bprev)
+      ((some p) (set! (p 'bnext) (m 'bnext)))
+      ((none) (if-some (b (block-of w (m 'x) (m 'y)))
+                (set (ref w 'block-links) b (m 'bnext))
+                0)))))
+
+; P_SetThingPosition: find its subsector, and link it at the head of its
+; sector's list and its block's.
+(defn set-thing-position (w:&World m:&Mobj):void
+  (set! (m 'sub-sector) (point-in-sub-sector (ref w 'level) (m 'x) (m 'y)))
+  (when (= (bit-and (m 'flags) MF-NOSECTOR) 0)
+    (let (s (sector-of w m) head ((ref w 'sector-things) s))
+      (set! (m 'sprev) none)
+      (set! (m 'snext) head)
+      (if-some (h head) (set! (h 'sprev) (some m)) 0)
+      (set (ref w 'sector-things) s (some m))))
+  (when (= (bit-and (m 'flags) MF-NOBLOCKMAP) 0)
+    (match (block-of w (m 'x) (m 'y))
+      ((some b)
+       (let (head ((ref w 'block-links) b))
+         (set! (m 'bprev) none)
+         (set! (m 'bnext) head)
+         (if-some (h head) (set! (h 'bprev) (some m)) 0)
+         (set (ref w 'block-links) b (some m))))
+      ((none) (set! (m 'bnext) none) (set! (m 'bprev) none)))))
+
+; --- spawning (p_mobj.c) -----------------------------------------------------
+
+(defn- blank-mobj (w:&World):&Mobj
+  (let (z:Mobj (Mobj none 0 0 0 none none 0 0 0 none none 0 0 0 0 0 0 0 0
+                     0 0 0 0 0 0 0 0 none 0 0 none 0 (MapThing 0 0 0 0 0) none))
+    (let (m (if (= (count (ref w 'free-mobjs)) 0)
+              (new Mobj (ref w 'arena)) ; ISSUE-020: new can't copy z in
+              (pop-last (ref w 'free-mobjs))))
+      (set! @m z)
+      (return m))))
+
+; P_SpawnMobj. The spawn state's action doesn't run: nothing is set up for
+; it yet.
+(defn spawn-mobj (w:&World x:Fixed y:Fixed z:Fixed type:i32):&Mobj
+  (let (m (blank-mobj w) info (mobj-info type) st (state-at (info 'spawn-state)))
+    (set! (m 'type) type)
+    (set! (m 'x) x)
+    (set! (m 'y) y)
+    (set! (m 'radius) (info 'radius))
+    (set! (m 'height) (info 'height))
+    (set! (m 'flags) (info 'flags))
+    (set! (m 'health) (info 'spawn-health))
+    (when (!= (w 'skill) SK-NIGHTMARE)
+      (set! (m 'reaction-time) (info 'reaction-time)))
+    (set! (m 'last-look) (% (p-random (ref w 'random)) MAXPLAYERS))
+    (set! (m 'state) (info 'spawn-state))
+    (set! (m 'tics) (st 'tics))
+    (set! (m 'sprite) (st 'sprite))
+    (set! (m 'frame) (st 'frame))
+    (set-thing-position w m)
+    (let (sec (sector-at (ref w 'level) (sector-of w m)))
+      (set! (m 'floor-z) (sec 'floor-height))
+      (set! (m 'ceiling-z) (sec 'ceiling-height)))
+    (set! (m 'z) (cond (= z ONFLOORZ) (m 'floor-z)
+                       (= z ONCEILINGZ) (- (m 'ceiling-z) (info 'height))
+                       true z))
+    (set! (m 'thinker) (some (add-thinker w (Think-mobj m))))
+    (return m)))
+
+(defn- thing-angle (mt:&MapThing):Angle
+  (return (wrap-mul ANG45 (unsafe/cast ui32 (/ (as i32 (mt 'angle)) 45)))))
+
+; P_SpawnPlayer, as far as the mobj goes. The player's own state (weapons,
+; view height) comes with the playsim.
+(defn- spawn-player (w:&World mt:&MapThing):void
+  (when (not ((ref w 'player-in-game) (unsafe/cast usize (- (as i32 (mt 'thing-type)) 1)))) (return))
+  (let (n (as i32 (mt 'thing-type))
+        m (spawn-mobj w (int-to-fixed (as i32 (mt 'x))) (int-to-fixed (as i32 (mt 'y))) ONFLOORZ MT-PLAYER))
+    ; Players 2 to 4 are recoloured green, grey and brown.
+    (when (> n 1)
+      (set! (m 'flags) (bit-or (m 'flags) (bit-shl (- n 1) MF-TRANSSHIFT))))
+    (set! (m 'angle) (thing-angle mt))
+    (set! (m 'player) (some (unsafe/cast usize (- n 1))))
+    (set (ref w 'player-mobjs) (unsafe/cast usize (- n 1)) (some m))))
+
+(defn- mobj-type-of (doomednum:i32):?i32
+  (dotimes (i:i32 NUMMOBJTYPES)
+    (when (= ((mobj-info i) 'doomednum) doomednum) (return (some i))))
+  (return none))
+
+(defn- skill-bit (skill:i32):i32
+  (cond (= skill SK-BABY) (return 1)
+        (= skill SK-NIGHTMARE) (return 4)
+        ; doom.exe reduces the shift mod 32 (Chocolate Doom issue 1677).
+        true (return (unsafe/cast i32 (bit-shl (as ui32 1) (unsafe/cast ui32 (bit-and (- skill 1) 31)))))))
+
+; P_SpawnMapThing.
+(defn spawn-map-thing (w:&World mt:&MapThing):(Fallible void)
+  (let (n (as i32 (mt 'thing-type)) options (as i32 (mt 'options)))
+    (when (= n 11)
+      (when (< (count (ref w 'deathmatch-starts)) 10)
+        (conj (ref w 'deathmatch-starts) @mt))
+      (return (ok)))
+    ; Type 0 is "player -1 start", which vanilla ignores.
+    (when (<= n 0) (return (ok)))
+    (when (<= n 4)
+      (set (ref w 'player-starts) (unsafe/cast usize (- n 1)) @mt)
+      (set (ref w 'player-start-in-game) (unsafe/cast usize (- n 1)) true)
+      (when (= (w 'deathmatch) 0) (spawn-player w mt))
+      (return (ok)))
+    (when (and (not (w 'netgame)) (!= (bit-and options 16) 0)) (return (ok)))
+    (when (= (bit-and options (skill-bit (w 'skill))) 0) (return (ok)))
+    (let (type (match (mobj-type-of n)
+                 ((some t) t)
+                 ((none) (fail "P_SpawnMapThing: Unknown type " n " at (" (as i32 (mt 'x)) ", " (as i32 (mt 'y)) ")")))
+          info (mobj-info type))
+      (when (and (!= (w 'deathmatch) 0) (!= (bit-and (info 'flags) MF-NOTDMATCH) 0)) (return (ok)))
+      (when (and (w 'no-monsters) (or (= type MT-SKULL) (!= (bit-and (info 'flags) MF-COUNTKILL) 0)))
+        (return (ok)))
+      (let (m (spawn-mobj w (int-to-fixed (as i32 (mt 'x))) (int-to-fixed (as i32 (mt 'y)))
+                          (if (!= (bit-and (info 'flags) MF-SPAWNCEILING) 0) ONCEILINGZ ONFLOORZ)
+                          type))
+        (set! (m 'spawn-point) @mt)
+        (when (> (m 'tics) 0)
+          (set! (m 'tics) (+ 1 (% (p-random (ref w 'random)) (m 'tics)))))
+        (when (!= (bit-and (m 'flags) MF-COUNTKILL) 0) (set! (w 'total-kills) (+ (w 'total-kills) 1)))
+        (when (!= (bit-and (m 'flags) MF-COUNTITEM) 0) (set! (w 'total-items) (+ (w 'total-items) 1)))
+        (set! (m 'angle) (thing-angle mt))
+        (when (!= (bit-and options MTF-AMBUSH) 0)
+          (set! (m 'flags) (bit-or (m 'flags) MF-AMBUSH))))))
+  (return (ok)))
+
+; Doom II's monsters, which a non-commercial game doesn't spawn.
+(defn- doom2-only? (n:i32):bool
+  (return (or (= n 68) (= n 64) (= n 88) (= n 89) (= n 69)
+              (= n 67) (= n 71) (= n 65) (= n 66) (= n 84))))
+
+; P_LoadThings.
+(defn- load-things (w:&World m:&Map):(Fallible void)
+  (let (things (view (ref m 'things)) stop false i:usize 0)
+    (while (and (not stop) (< i (count &things)))
+      (let (mt (&things i))
+        ; Vanilla stops loading here rather than skipping the one thing.
+        (if (and (not (w 'commercial)) (doom2-only? (as i32 (mt 'thing-type))))
+          (set! stop true)
+          (try (spawn-map-thing w mt))))
+      (inc! i)))
+  (when (= (w 'deathmatch) 0)
+    (dotimes (i:usize MAXPLAYERS)
+      (when (and ((ref w 'player-in-game) i) (not ((ref w 'player-start-in-game) i)))
+        (fail "P_LoadThings: Player " (+ (unsafe/cast i32 i) 1) " start missing (vanilla crashes here)"))
+      (set (ref w 'player-start-in-game) i false)))
+  (return (ok)))
+
+(defstruct WorldOptions skill:i32 deathmatch:i32 netgame:bool no-monsters:bool commercial:bool
+  players:(array bool 4))
+
+(defn- filled (n:usize v:?&Mobj):(Vector ?&Mobj)
+  (let (out (make (Vector ?&Mobj)))
+    (dotimes (i:usize n) (conj &out v))
+    (return out)))
+
+(defn- bools (n:usize):(Vector bool)
+  (let (out (make (Vector bool)))
+    (dotimes (i:usize n) (conj &out false))
+    (return out)))
+
+; The part of P_SetupLevel after the map is loaded: the thinkers and things.
+; `random` carries on from the previous level, as vanilla's indices do.
+(defn world-new (l:Level m:&Map o:&WorldOptions random:Random):(Fallible &World)
+  (let (arena (make Arena)
+        cap (new Thinker &arena none none false (Think-cap))
+        nsec (count (ref l 'sectors))
+        nblocks (unsafe/cast usize (* (l 'bmap-width) (l 'bmap-height)))
+        w (new World heap l arena (o 'skill) (o 'deathmatch) (o 'netgame) (o 'no-monsters)
+               (o 'commercial) random cap
+               (make (Vector &Mobj)) (make (Vector &Thinker))
+               (filled nsec none) (filled nblocks none)
+               (bools MAXPLAYERS) (make (Vector MapThing)) (bools MAXPLAYERS)
+               (make (Vector MapThing)) (filled MAXPLAYERS none)
+               0 0 0 0))
+    ; P_InitThinkers: the cap alone is a circular list.
+    (set! (cap 'prev) (some cap))
+    (set! (cap 'next) (some cap))
+    (dotimes (i:usize MAXPLAYERS)
+      (conj (ref w 'player-starts) (MapThing 0 0 0 0 0))
+      (set (ref w 'player-in-game) i (aref (o 'players) (as i64 i))))
+    (try (load-things w m))
+    (return (ok w))))

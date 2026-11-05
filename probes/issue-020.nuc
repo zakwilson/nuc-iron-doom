@@ -1,0 +1,14 @@
+; ISSUE-020: (new T a v) with v already a T reads v as T's first field, so
+; there's no one-call way to put an existing value on the heap.
+; fixed-when: runs
+; Actual: "struct literal: type mismatch for field 'x' (positional
+; initializer)", which doesn't mention new or the copy.
+
+(import-use nucleus.allocator)
+(import-use nucleus.create)
+
+(defstruct P x:i32 y:i32)
+
+(defn main ():i32
+  (let (v (P 1 2) p (new P heap v))
+    (return (- (p 'y) 2))))

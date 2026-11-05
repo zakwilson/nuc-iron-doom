@@ -15,6 +15,7 @@
 (import-use doom.render.state)
 (import-use doom.render.plane)
 (import-use doom.render.bsp)
+(import-use doom.render.things)
 
 ; Where the eye is: R_SetupFrame's inputs from the player.
 (defstruct Eye x:Fixed y:Fixed z:Fixed angle:Angle extra-light:i32 fixed-colormap:i32)
@@ -29,15 +30,15 @@
   (set! (r 'view-cos) (angle-cos (e 'angle)))
   (set! (r 'fixed-colormap) (e 'fixed-colormap)))
 
-(defn- no-sprites (r:&Renderer sc:&Scene sector:usize):void)
-
 (defn render-player-view (r:&Renderer sc:&Scene e:&Eye):(Fallible void)
   (setup-frame r e)
   (clear-clip-segs r)
   (clear! (ref r 'draw-segs))
   (clear-planes r)
+  (clear-sprites r sc)
   (let (n (count (ref (sc 'level) 'nodes)))
     ; A map of one subsector has no nodes; -1 is that subsector.
-    (try (render-bsp-node r sc (if (= n 0) -1 (unsafe/cast i32 (- n 1))) no-sprites)))
+    (try (render-bsp-node r sc (if (= n 0) -1 (unsafe/cast i32 (- n 1))))))
   (draw-planes r sc)
+  (draw-masked r sc)
   (return (ok)))
