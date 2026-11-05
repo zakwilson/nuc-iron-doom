@@ -1,0 +1,164 @@
+From 06230b589766592ab43f5979d95729ad59b0be70 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 01:39:32 +0000
+Subject: [PATCH] Defer a struct whose field type a macro defines
+ (nuc-iron-doom ISSUE-006)
+
+The layout pre-scan resolves every defstruct's field types before any macro
+has expanded, so a written defstruct naming a struct that a macro produces
+died with unknown type, in the same file or across an import. The pre-scan
+now arms g-layout-defer for an unknown name, as it already did for an array
+length that will not fold, and the struct is laid out at emission. A
+misspelt type is still diagnosed there.
+
+Test: doom-macro-struct-as-field-type, doom-deferred-field-typo.
+Gate: 1672 pass, the same 4 suite-build AVR failures; bootstrap PASS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8hzrZakM3KWb32SpqKh
+---
+ design/progress.md                          | 19 +++++++++++++++++++
+ docs/macros.md                              |  4 ++++
+ src/nucleusc.nuc                            |  6 ++++++
+ src/union-registry.nuc                      |  5 +++++
+ tests/fixtures/doom-deferred-field-typo.nuc |  4 ++++
+ tests/manifest/diagnostics.edn              |  4 ++++
+ tests/suite-doom.nuc                        | 16 ++++++++++++++++
+ 7 files changed, 58 insertions(+)
+ create mode 100644 tests/fixtures/doom-deferred-field-typo.nuc
+
+diff --git a/design/progress.md b/design/progress.md
+index 20719f2..875f706 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5534,3 +5534,22 @@ Test: `s16-dot-forms-retired` in `tests/suite-s16.nuc` covers the retired
+ message and the reservation.
+ 
+ Gate: 1676 pass, the same 5 suite-target fail. Bootstrap PASS.
++
++## DOOM-port fix: a macro-produced struct as a field type (2026-11-05)
++
++nuc-iron-doom ISSUE-006. `defrecord`-style macros produce structs, and a
++written `defstruct` naming one as a field type died in the layout pre-scan
++(Stage 15 W9 item 40) with `unknown type`, in the same file or from an
++imported one, because no macro has expanded when that pre-scan runs.
++
++- `g-layout-probe` is set while `extract-decl-name-and-type-layout` resolves
++  a field. `resolve-type-name` then answers an unknown name by arming
++  `g-layout-defer`, as an unfoldable array length already did, and
++  `defstruct-fill-layout` abandons the struct to `emit-defstruct`.
++- A misspelt field type is still diagnosed, at emission, with the same words.
++
++Test: `doom-macro-struct-as-field-type` in `tests/suite-doom.nuc`,
++`doom-deferred-field-typo` in `tests/manifest/diagnostics.edn`.
++
++Gate: 1672 pass, the same 4 suite-build AVR failures. Bootstrap PASS; the
++compiler's own IR is unchanged.
+diff --git a/docs/macros.md b/docs/macros.md
+index e9b700c..0e857e7 100644
+--- a/docs/macros.md
++++ b/docs/macros.md
+@@ -735,6 +735,10 @@ after the pre-scans have already walked the file:
+   `defn` produced by an expansion on line 90 cannot be called from a `defn`
+   written on line 10. Ordinary definition order applies to it, not the
+   file-wide visibility the pre-scans give hand-written ones.
++- A struct a macro produces **may be a by-value field** of a written `defstruct`
++  that is emitted after the expansion: below the call, or in a file importing
++  this one. The layout pre-scan leaves that `defstruct` to its own emission
++  instead of refusing the field type.
+ 
+ Otherwise a macro-produced definition is registered exactly like a written one.
+ The expansion's protocols, struct names, `defn` signatures and values are
+diff --git a/src/nucleusc.nuc b/src/nucleusc.nuc
+index f96d734..1e3dfce 100644
+--- a/src/nucleusc.nuc
++++ b/src/nucleusc.nuc
+@@ -516,6 +516,10 @@
+ ; frames down, inside `parse-type-from-node`, whose return type is a non-null
+ ; `ref:Type`.
+ (defvar g-layout-defer:i32 0)
++; Set while the layout prescan resolves a field's type. A type name a macro will
++; define is unknown until that macro's call is emitted (nuc-iron-doom ISSUE-006),
++; so the prescan defers the struct, through `g-layout-defer`, instead of dying.
++(defvar g-layout-probe:i32 0)
+ ; Stage 15 W8 G-3: "this initializer may turn out not to be constant". Armed
+ ; (save/set/restore) only around `defvar-const-init-ir`'s single classifying
+ ; call into `defvar-init-ir`, where it turns that function's terminal
+@@ -1838,7 +1842,9 @@
+ ; by `defstruct-fill-layout` alone.
+ (defn extract-decl-name-and-type-layout (node:?&Node out-name:&Symbol line:i32):?&Type
+   (set! g-array-ok 3)
++  (set! g-layout-probe 1)
+   (let (t:?&Type (extract-name-and-type node out-name line))
++    (set! g-layout-probe 0)
+     (set! g-array-ok 0)
+     (return t)))
+ 
+diff --git a/src/union-registry.nuc b/src/union-registry.nuc
+index dcee480..7edd040 100644
+--- a/src/union-registry.nuc
++++ b/src/union-registry.nuc
+@@ -528,6 +528,11 @@
+   ; Stage 15 W1c: `unknown-type-message` (src/nucleusc.nuc) says plainly that
+   ; the name is defined nowhere in the unit, and — for §2.7's reachability
+   ; constraint, which W1 keeps — names the on-path file that does define it.
++  ; The layout prescan asks again at emission instead (`g-layout-probe`); the
++  ; placeholder is never laid out, because the deferred struct is abandoned.
++  (when (!= g-layout-probe 0)
++    (set! g-layout-defer 1)
++    (return ty-i32))
+   (die-at line (unknown-type-message name))))
+ 
+ ; The registered Type for a StructDef — TY-UNION when the def is an untagged
+diff --git a/tests/fixtures/doom-deferred-field-typo.nuc b/tests/fixtures/doom-deferred-field-typo.nuc
+new file mode 100644
+index 0000000..c996040
+--- /dev/null
++++ b/tests/fixtures/doom-deferred-field-typo.nuc
+@@ -0,0 +1,4 @@
++(defmacro defpoint (nm) `(defstruct ~nm x:i32 y:i32))
++(defpoint Inner)
++(defstruct Outer (p Innr))
++(defn main ():i32 0)
+diff --git a/tests/manifest/diagnostics.edn b/tests/manifest/diagnostics.edn
+index 1e08514..b5bb0f0 100644
+--- a/tests/manifest/diagnostics.edn
++++ b/tests/manifest/diagnostics.edn
+@@ -1450,6 +1450,10 @@
+ {:name "doom-get-on-struct" :expect :reject
+  :file "tests/fixtures/doom-get-on-struct.nuc" :line 3
+  :messages ["get: no `get` method takes Pt -- `get` looks up a key; read a field with (field x 'f) or (x 'f)"]}
++; A field type the layout pre-scan deferred is still checked at emission (nuc-iron-doom ISSUE-006).
++{:name "doom-deferred-field-typo" :expect :reject
++ :file "tests/fixtures/doom-deferred-field-typo.nuc" :line 3
++ :messages ["unknown type: Innr (did you mean 'Inner'?)"]}
+ ; `set!` on a Slice element whose `set` the file reaches only by prefix (nuc-doom ISSUE-049).
+ {:name "doom-set-place-unimported" :expect :reject
+  :file "tests/fixtures/doom-set-place-unimported.nuc" :line 4
+diff --git a/tests/suite-doom.nuc b/tests/suite-doom.nuc
+index d4cd82a..5d693bc 100644
+--- a/tests/suite-doom.nuc
++++ b/tests/suite-doom.nuc
+@@ -691,3 +691,19 @@ missing key :sens for #user/Opt"))
+         ov:StrView (string-as-view &out))
+     (try (check-eq (strview-trim-end &ov) "2 2 1 3 12 4 5"))
+     (drop &out)))
++
++; nuc-iron-doom ISSUE-006: the layout pre-scan runs before any macro expands.
++(deftest doom-macro-struct-as-field-type
++  (let (out:String (try (build-run-source "(import-use \"stdio.h\")
++(defmacro defpoint (nm) `(defstruct ~nm x:i32 y:i32))
++(defpoint Inner)
++(defstruct Outer (p Inner) (n i64))
++(defn mk (a:i32):Outer (return (Outer (Inner a 2) 40)))
++(defn main ():i32
++  (let (o (mk 7))
++    (printf \"%d %lld\\n\" ((ref o 'p) 'x) (+ (o 'n) ((ref o 'p) 'y))))
++  0)
++"))
++        ov:StrView (string-as-view &out))
++    (try (check-eq (strview-trim-end &ov) "7 42"))
++    (drop &out)))
+-- 
+2.43.0
+

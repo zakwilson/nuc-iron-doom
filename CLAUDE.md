@@ -83,6 +83,13 @@ repo and never by absolute path.
   repo only. Before pushing a compiler fix, call `add_repo`
   (`zakwilson/nucleus`, and `zakwilson/nucleus-boot` if needed) with
   `access: "push"`. Push only to `doom-bugfixes`.
+  - **On 2026-11-05 the push was refused** (the Claude GitHub App has no
+    access to `zakwilson/nucleus`). Until that changes, commit each fix in
+    `../nucleus` as usual, then `git format-patch -1 <sha> -o nucleus-patches/`
+    here and push this repo. `setup-cloud.sh` applies any patch in
+    `nucleus-patches/` that isn't already in `../nucleus` and rebuilds. The
+    user applies them with `git am` on their machine. Once the patches reach
+    `doom-bugfixes`, delete them here.
 - **The container is reclaimed when idle.** Uncommitted or unpushed work is
   lost, and so are the compiler build and `reference/build/`. Push after every
   commit. Before any long step, make sure `PROGRESS.md` says what's in flight.

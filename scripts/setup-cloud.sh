@@ -42,9 +42,19 @@ if [ ! -f "$BASE/nucleus/boot/nucleusc.ll" ]; then
     cp "$BASE/nucleus-boot/boot/"*.ll "$BASE/nucleus/boot/"
 fi
 
+# Compiler fixes the port needs that aren't on nucleus doom-bugfixes yet ride
+# here: sessions can't push to nucleus. A patch that reverses cleanly is in.
+applied=0
+for p in "$ROOT"/nucleus-patches/*.patch; do
+    [ -e "$p" ] || continue
+    git -C "$BASE/nucleus" apply --check --reverse "$p" 2>/dev/null && continue
+    git -C "$BASE/nucleus" am -q "$p"
+    applied=1
+done
+
 # The Makefile finds llvm-config on PATH, and /usr/bin/llvm-config is LLVM 18.
 export PATH="$(llvm-config-$LLVM --bindir):$PATH"
-[ -x "$BASE/nucleus/build/nucleusc" ] && exit 0
+[ -x "$BASE/nucleus/build/nucleusc" ] && [ "$applied" = 0 ] && exit 0
 if ! make -s -C "$BASE/nucleus" -j"$(nproc)"; then
     # nucleus-boot's main predates the `_get` → `field` rename, so build the
     # commits that bridge it, each with the one before, and boot from the last.

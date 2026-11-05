@@ -106,7 +106,8 @@ move on growth), and `Slice` is the type that hands out references
 
 - **Severity:** major
 - **Kind:** bug
-- **Status:** fixed-in-compiler (nucleus `doom-bugfixes`, gate pending)
+- **Status:** fixed-in-compiler (nucleus `06230b5`, carried as
+  `nucleus-patches/0001-*.patch` until it can be pushed)
 - **Probe:** `probes/issue-006.nuc` — expected `(defstruct Outer (p Inner))` to
   compile after `(defpoint Inner)` expands to a `defstruct`; actual `unknown
   type: Inner — not defined anywhere in this compilation unit`, in the same
