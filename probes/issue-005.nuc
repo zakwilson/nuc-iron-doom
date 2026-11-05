@@ -1,0 +1,16 @@
+; ISSUE-005: a Vector that has stopped growing can't be viewed as a Slice.
+; fixed-when: compiles
+; Actual: "unknown: as-slice" -- nothing in nucleus.vector or nucleus.slice
+; turns a (Vector T) into a (Slice T), so &v[i] needs a hand cast of 'data.
+
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+
+(defn main ():i32
+  (let (v (make (Vector i32)))
+    (conj &v 5)
+    (let (s:(Slice i32) (as-slice &v)
+          p:&i32 (&s 0))
+      (return (- @p 5)))))

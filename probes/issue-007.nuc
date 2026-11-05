@@ -1,0 +1,13 @@
+; ISSUE-007: a call named like a field, inside a struct literal, is silently a
+; designated initializer, and the error doesn't say so.
+; fixed-when: output-contains designated
+; Actual: "struct literal: type mismatch for field 'inner'"
+
+(defstruct Inner a:i32)
+(defstruct Outer n:i32 inner:Inner)
+
+(defn inner (x:i32):Inner (return (Inner x)))
+
+(defn main ():i32
+  (let (o:Outer (Outer 1 (inner 2)))
+    (return (- ((ref o 'inner) 'a) 2))))

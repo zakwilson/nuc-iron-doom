@@ -9,10 +9,13 @@ provisional until milestone 8.)
 
 | Issue | Claim | Severity | Kind |
 |---|---|---|---|
+| ISSUE-006 | A struct defined by a macro can't be a field type | major | bug |
 | ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature |
+| ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature |
 | ISSUE-004 | `dotimes` over a literal binds an `i32` that can't meet a `usize` | minor | design |
 | ISSUE-003 | A `:where` after the return type gets an unrelated error | papercut | diagnostics |
 | ISSUE-002 | Colon type sugar can't carry an unquote in a template | papercut | design |
+| ISSUE-007 | A call named like a field is silently a designated initializer | papercut | diagnostics |
 
 ---
 
@@ -77,6 +80,67 @@ message names the protocol as if it were a function the body calls.
 
 Context: the literal `8` would adapt to `usize` anywhere, but once it seeds the
 loop variable it fixes the type at `i32`. Rust infers `usize` from the use.
+
+## ISSUE-005: a finished `Vector` can't be viewed as a `Slice`
+
+- **Severity:** minor
+- **Kind:** missing-feature
+- **Status:** worked-around
+- **Probe:** `probes/issue-005.nuc` — expected some `(as-slice &v)`; actual
+  `unknown: as-slice`, and nothing else in `nucleus.vector` or `nucleus.slice`
+  converts
+- **Port sites:** `src/doom/util.nuc` (`view`)
+- **Workaround:** a generic `view` that casts the vector's `data` field.
+- **Suggestion:** `(as-slice v)` in `nucleus.slice`, documented as valid until
+  the next growth.
+
+Context: the WAD directory, the map arrays and the texture list are built by
+appending and then never grow again, and the port needs `&T` into them, as Rust
+uses `&v[i]`. `Vector`'s `invoke` returns by value (correctly, since elements
+move on growth), and `Slice` is the type that hands out references
+(nuc-doom ISSUE-021's ruling), but nothing connects the two. The cast needs
+`unsafe/cast` from the vector's type-erased `?&ui8`.
+
+## ISSUE-006: a struct defined by a macro can't be a field type
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed-in-compiler (nucleus `doom-bugfixes`, gate pending)
+- **Probe:** `probes/issue-006.nuc` — expected `(defstruct Outer (p Inner))` to
+  compile after `(defpoint Inner)` expands to a `defstruct`; actual `unknown
+  type: Inner — not defined anywhere in this compilation unit`, in the same
+  file or from an imported one
+- **Port sites:** `src/doom/mapdata.nuc` (`Map` holds a `Vector` of each
+  `defrecord` type)
+- **Workaround:** none short of not generating structs with macros.
+
+Context: the layout prescan (Stage 15 W9 item 40) resolves every `defstruct`'s
+field types before any macro has been expanded, and dies on a name only a
+macro defines. A `let` in a body accepted the same type, because bodies are
+emitted after the macro has run. This blocks any macro that defines a struct
+(`defrecord`, a component-store macro) from being composed with ordinary
+structs. Fix: the prescan now defers that struct's layout to emission, as it
+already did for an array length that won't fold yet; a misspelt type is still
+diagnosed at emission.
+
+## ISSUE-007: a call named like a field is silently a designated initializer
+
+- **Severity:** papercut
+- **Kind:** diagnostics
+- **Status:** worked-around
+- **Probe:** `probes/issue-007.nuc` — expected `(Outer 1 (inner 2))` to fail
+  with a message naming the designated reading; actual `struct literal: type
+  mismatch for field 'inner'`
+- **Port sites:** `src/doom/mapdata.nuc` (`read-block-map`)
+- **Workaround:** name the function differently from the field.
+- **Suggestion:** when a designated `(name v)` fails to type-check and `name`
+  is also a function, add a note: "read as a designated initializer for field
+  'name'; bind the call first to pass it positionally".
+
+Context: the rule is documented (a field name wins over a function), but naming
+a reader after the field it fills is the natural spelling, as in Iron Doom's
+`block_map: MapBlockMapParser::parse(...)`. The message pointed at a type
+mismatch that the source didn't seem to contain.
 
 ## What worked well
 

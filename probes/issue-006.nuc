@@ -1,0 +1,14 @@
+; ISSUE-006: a struct defined by a macro can't be a field type of a later defstruct.
+; fixed-when: compiles
+; Actual: "unknown type: Inner — not defined anywhere in this compilation unit"
+; at the Outer field, though a `let` in a function body accepts the type.
+
+(import-use nucleus.vector)
+
+(defmacro defpoint (nm) `(defstruct ~nm x:i32 y:i32))
+(defpoint Inner)
+(defstruct Outer (p Inner))
+
+(defn main ():i32
+  (let (o:Outer (Outer (Inner 1 2)))
+    (return (- ((ref o 'p) 'y) 2))))
