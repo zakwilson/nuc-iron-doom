@@ -163,7 +163,7 @@
     ((plat p) (set! (p 'wait) v))
     ((floor f) (set! (f 'new-special) v))
     ((ceiling c) (set! (c 'speed) v))
-    ((cap) 0) ((mobj m) 0) ((flash l) 0) ((strobe s) 0) ((glow g) 0) ((flicker f) 0)))
+    (_ 0)))
 
 ; EV_VerticalDoor: a door opened by hand, from the line's back sector.
 (defn vertical-door (w:&World li:usize thing:&Mobj):(Fallible void)
@@ -197,12 +197,11 @@
                             (do (eprintln "EV_VerticalDoor: Tried to close something that wasn't a door.")
                                 (set-aliased-direction th -1))
                             (set! (d 'direction) -1)))
-                ((cap) 0) ((mobj m) 0)
                 ((floor f) (eprintln "EV_VerticalDoor: Tried to close something that wasn't a door.")
                  (set-aliased-direction th -1))
                 ((ceiling c) (eprintln "EV_VerticalDoor: Tried to close something that wasn't a door.")
                  (set-aliased-direction th -1))
-                ((flash x) 0) ((strobe s) 0) ((glow g) 0) ((flicker f) 0))))
+                (_ 0))))
           (return (ok))))
       (start-sector-sound w si (if (case sp (:or 117 118) true false) SFX-BDOPN SFX-DOROPN))
       (let (d (spawn-door w si VLD-NORMAL 1 VDOORSPEED 0 0))

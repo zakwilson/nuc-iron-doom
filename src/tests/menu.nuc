@@ -48,8 +48,7 @@
            (match @(&rs i)
              ((new-game skill ep) (try (check (and (= skill 2) (= ep 1)) "skill 2, episode 1"))
                                   (set! found true))
-             ((end-game) 0) ((quit) 0) ((player-message t) 0) ((view-size) 0) ((sound n) 0)
-             ((read-saves) 0) ((load-game k) 0) ((save-game k) 0)))
+             (_ 0)))
          (try (check found "a new game was asked for")))))))
 
 (deftest shareware-episode-two-refused
@@ -72,8 +71,7 @@
         ((read-saves) (set! (out 'reads) (+ (out 'reads) 1)))
         ((load-game k) (set! (out 'load) k))
         ((save-game k) (set! (out 'save) k))
-        ((new-game skill ep) 0) ((end-game) 0) ((quit) 0) ((player-message t) 0)
-        ((view-size) 0) ((sound n) 0)))
+        (_ 0)))
     (clear! (ref m 'requests))
     (return out)))
 

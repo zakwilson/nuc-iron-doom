@@ -14,6 +14,7 @@
 (import-use doom.buffer)
 (import-use doom.graphics)
 (import-use doom.hufont)
+(import-use doom.bytes)
 (import-use doom.play.world)
 
 (defconst HU-MSGTIMEOUT 140)

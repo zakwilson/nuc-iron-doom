@@ -14,7 +14,7 @@
 (import-use nucleus.fmt)
 (import-use nucleus.create)
 (import-use doom.fixed)
-(import-use doom.hufont)
+(import-use doom.bytes)
 (import-use doom.play.defs)
 (import-use doom.play.world)
 (import-use doom.play.inter)

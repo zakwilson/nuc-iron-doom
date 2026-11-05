@@ -44,6 +44,3 @@
 (defn font-patch (f:&HuFont i:i32):&Patch
   (let (s (view (ref f 'patches))) (return (&s (unsafe/cast usize i)))))
 
-; A byte of a StrView.
-(defn byte-of (s:StrView i:usize):i32
-  (return (as i32 @(unsafe/cast &ui8 (unsafe/ptr+ (unsafe/cast &ui8 (s 'data)) (as-checked i64 i))))))

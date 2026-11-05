@@ -10,7 +10,7 @@
 (import-use doom.play.world)
 (import-use doom.session)
 (import-use doom.cheats)
-(import-use doom.hufont)
+(import-use doom.bytes)
 
 (defn- type-text (c:&Cheats w:&World text:CStr):?Clev
   (let (v (strview-from-cstr text) i:usize 0 out:?Clev none)

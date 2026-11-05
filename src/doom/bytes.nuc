@@ -89,3 +89,8 @@
     (let (c (name-byte self i))
       (when (!= c 0) (string-push-char out (as Char (as ui32 c))))))
   (return (ok)))
+
+; A byte of a StrView, for loops bounded by its length: strview-byte-at's
+; Result would be checked twice.
+(defn byte-of (s:StrView i:usize):i32
+  (return (as i32 @(unsafe/cast &ui8 (unsafe/ptr+ (unsafe/cast &ui8 (s 'data)) (as-checked i64 i))))))
