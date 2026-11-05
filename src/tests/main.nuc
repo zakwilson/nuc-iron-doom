@@ -19,6 +19,7 @@
 (import-use tests.cheats)
 (import-use tests.automap)
 (import-use tests.sound)
+(import-use tests.music)
 
 (defn main (argc:i32 argv:ptr):int
   (return (as int (test-main argc argv))))

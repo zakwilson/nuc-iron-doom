@@ -1,0 +1,62 @@
+(ns tests.music)
+
+; mus2mid against Chocolate Doom's own: every MUS lump converted, and each
+; MIDI file's length and FNV-1a hash compared with the line
+; scripts/mus2mid-ref.sh recorded from mus2mid.c.
+
+(import-use nucleus.test)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.string-split)
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.assets)
+(import-use doom.mus2mid)
+
+(defn- hex16 (h:ui64):String
+  (let (s (make String) i 15)
+    (while (>= i 0)
+      (let (d (unsafe/cast i32 (bit-and (bit-shr h (unsafe/cast ui64 (* 4 i))) 15)))
+        (str-into &s (hex d)))
+      (set! i (- i 1)))
+    (return s)))
+
+(defn- fnv (v:&(Vector ui8)):ui64
+  (let (h:ui64 0xcbf29ce484222325 s (view v))
+    (dotimes (i:usize (count &s))
+      (set! h (* (bit-xor h (as ui64 @(&s i))) 0x100000001b3)))
+    (return h)))
+
+(deftest mus2mid-matches-chocolate-doom
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (match (read-file (strview-from-cstr "reference/data/mus2mid/doom1.txt"))
+       ((err e) (skip! "no reference: run scripts/mus2mid-ref.sh"))
+       ((ok text)
+        (let (tv (string-as-view &text) lines (strview-lines &tv) n 0)
+          (while-some (line (next &lines))
+            (when (> (line 'len) 0)
+              (let (sp (strview-from-cstr " ") parts (strview-split &line &sp)
+                    lump-name (unwrap-or (next &parts) (strview-from-cstr ""))
+                    st (mus2mid-new))
+                (match (lump-named (ref a 'wad) (name lump-name))
+                  ((err e) (try (check false "the lump is in the IWAD")))
+                  ((ok l)
+                   (match (mus2mid &st (ref l 'data))
+                     ((none) (try (check false "mus2mid converts it")))
+                     ((some mid)
+                      (let (got (make String))
+                        (str-into &got lump-name " " (count &mid) " ")
+                        (let (h (hex16 (fnv &mid)) hv (string-as-view &h))
+                          (str-into &got hv))
+                        (try (check (= (string-as-view &got) line) "the MIDI matches mus2mid.c's")))))))
+                (set! n (+ n 1)))))
+          (try (check (= n 13) "all 13 of doom1.wad's songs"))))))))

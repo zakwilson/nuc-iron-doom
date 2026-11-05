@@ -1,0 +1,184 @@
+; Copyright (C) 2005-2014 Simon Howard
+; Copyright (C) 2006 Ben Ryves
+; GPLv2 or later (Chocolate Doom mus2mid.c); this port is GPLv3, see COPYING.
+;
+; MUS to a type 0 MIDI file. mus2mid.c keeps the channel velocities and the
+; queued delay in statics that outlive a song; here they're a `Mus2Mid` the
+; caller keeps, so the game can carry them across songs as Chocolate Doom
+; does and a test can start each song afresh as its reference run did.
+
+(ns doom.mus2mid)
+
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use doom.bytes)
+
+(defconst NUM-CHANNELS 16)
+(defconst MIDI-PERCUSSION-CHAN 9)
+(defconst MUS-PERCUSSION-CHAN 15)
+
+(defconst MUS-RELEASEKEY 0x00)
+(defconst MUS-PRESSKEY 0x10)
+(defconst MUS-PITCHWHEEL 0x20)
+(defconst MUS-SYSTEMEVENT 0x30)
+(defconst MUS-CHANGECONTROLLER 0x40)
+(defconst MUS-SCOREEND 0x60)
+
+(defconst MIDI-RELEASEKEY 0x80)
+(defconst MIDI-PRESSKEY 0x90)
+(defconst MIDI-CHANGECONTROLLER 0xB0)
+(defconst MIDI-CHANGEPATCH 0xC0)
+(defconst MIDI-PITCHWHEEL 0xE0)
+
+; MUS controller numbers to MIDI's.
+(defvar CONTROLLER-MAP:(array i32 15) (array i32
+  0x00 0x20 0x01 0x07 0x0A 0x0B 0x5B 0x5D 0x40 0x43 0x78 0x7B 0x7E 0x7F 0x79))
+
+(defstruct Mus2Mid
+  velocities:(array i32 16)
+  queued-time:ui32
+  ; Per conversion: the track's length so far, and each MUS channel's MIDI one.
+  track-size:ui32
+  channel-map:(array i32 16)
+  out:(Vector ui8))
+
+(defn mus2mid-new ():Mus2Mid
+  (return (Mus2Mid (array i32 127 127 127 127 127 127 127 127 127 127 127 127 127 127 127 127)
+                   0 0 (array i32 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0) (make (Vector ui8)))))
+
+(defn- put (st:&Mus2Mid b:i32):void (conj (ref st 'out) (unsafe/cast ui8 (bit-and b 0xff))))
+
+; WriteTime: the queued delay as a variable-length number. Its bytes count
+; toward the track, and the queue empties.
+(defn- write-time (st:&Mus2Mid):void
+  (let (time (st 'queued-time) buffer (bit-and time 0x7f))
+    (set! time (bit-shr time 7))
+    (while (!= time 0)
+      (set! buffer (bit-or (bit-shl buffer 8) (bit-or (bit-and time 0x7f) 0x80)))
+      (set! time (bit-shr time 7)))
+    (while true
+      (put st (unsafe/cast i32 (bit-and buffer 0xff)))
+      (set! (st 'track-size) (+ (st 'track-size) 1))
+      (if (!= (bit-and buffer 0x80) 0)
+        (set! buffer (bit-shr buffer 8))
+        (do (set! (st 'queued-time) 0)
+            (return))))))
+
+(defn- write-event (st:&Mus2Mid a:i32 b:i32 c:i32):void
+  (write-time st)
+  (put st a) (put st b) (put st c)
+  (set! (st 'track-size) (+ (st 'track-size) 3)))
+
+; WriteChangeController_Valued: a value with its top bit set becomes 0x7F.
+(defn- write-controller (st:&Mus2Mid channel:i32 control:i32 value:i32):void
+  (write-event st (bit-or MIDI-CHANGECONTROLLER channel) (bit-and control 0x7f)
+               (if (!= (bit-and value 0x80) 0) 0x7f value)))
+
+; AllocateMIDIChannel: one past the highest in use, skipping percussion.
+(defn- allocate-channel (st:&Mus2Mid):i32
+  (let (top -1)
+    (dotimes (i:i64 NUM-CHANNELS)
+      (when (> (aref (st 'channel-map) i) top) (set! top (aref (st 'channel-map) i))))
+    (let (r (+ top 1))
+      (return (if (= r MIDI-PERCUSSION-CHAN) (+ r 1) r)))))
+
+; GetMIDIChannel: a channel's first use also resets its controllers (0x7B).
+(defn- midi-channel (st:&Mus2Mid mus-channel:i32):i32
+  (when (= mus-channel MUS-PERCUSSION-CHAN) (return MIDI-PERCUSSION-CHAN))
+  (let (i (as i64 mus-channel))
+    (when (= (aref (st 'channel-map) i) -1)
+      (set! (aref (st 'channel-map) i) (allocate-channel st))
+      (write-controller st (aref (st 'channel-map) i) 0x7b 0))
+    (return (aref (st 'channel-map) i))))
+
+; The MIDI file for a MUS lump, or none where mus2mid() returns true.
+(defn mus2mid (st:&Mus2Mid mus:&Bytes):?(Vector ui8)
+  (let (n (count mus) pos:usize 0)
+    (when (< n 16) (return none))
+    (dotimes (i:i64 NUM-CHANNELS) (set! (aref (st 'channel-map) i) -1))
+    (set! (st 'out) (make (Vector ui8)))
+    (set! pos (unsafe/cast usize (le-ui16 mus 6)))
+    ; The header: type 0, one track, 70 ticks per quarter note, then the
+    ; track's length to fill in.
+    (dotimes (i:usize 22)
+      (put st (aref (array i32 0x4d 0x54 0x68 0x64 0 0 0 6 0 0 0 1 0 0x46 0x4d 0x54 0x72 0x6b 0 0 0 0)
+                    (as i64 i))))
+    (set! (st 'track-size) 0)
+    (let (hit-end false)
+      (while (not hit-end)
+        (let (more true)
+          (while (and more (not hit-end))
+            (when (>= pos n) (return none))
+            (let (desc (byte-at mus pos)
+                  channel (midi-channel st (bit-and desc 0x0f))
+                  event (bit-and desc 0x70))
+              (set! pos (+ pos 1))
+              (cond
+                (= event MUS-RELEASEKEY)
+                (do (when (>= pos n) (return none))
+                    (write-event st (bit-or MIDI-RELEASEKEY channel) (bit-and (byte-at mus pos) 0x7f) 0)
+                    (set! pos (+ pos 1)))
+                (= event MUS-PRESSKEY)
+                (let (key 0)
+                  (when (>= pos n) (return none))
+                  (set! key (byte-at mus pos))
+                  (set! pos (+ pos 1))
+                  (when (!= (bit-and key 0x80) 0)
+                    (when (>= pos n) (return none))
+                    (set! (aref (st 'velocities) (as i64 channel)) (bit-and (byte-at mus pos) 0x7f))
+                    (set! pos (+ pos 1)))
+                  (write-event st (bit-or MIDI-PRESSKEY channel) (bit-and key 0x7f)
+                               (bit-and (aref (st 'velocities) (as i64 channel)) 0x7f)))
+                ; A truncated pitch wheel event is skipped, not an error.
+                (= event MUS-PITCHWHEEL)
+                (when (< pos n)
+                  (let (wheel (unsafe/cast i32 (unsafe/cast i16 (* (byte-at mus pos) 64))))
+                    (set! pos (+ pos 1))
+                    (write-event st (bit-or MIDI-PITCHWHEEL channel) (bit-and wheel 0x7f)
+                                 (bit-and (bit-shr wheel 7) 0x7f))))
+                (= event MUS-SYSTEMEVENT)
+                (let (cn 0)
+                  (when (>= pos n) (return none))
+                  (set! cn (byte-at mus pos))
+                  (set! pos (+ pos 1))
+                  (when (or (< cn 10) (> cn 14)) (return none))
+                  (write-controller st channel (aref CONTROLLER-MAP (as i64 cn)) 0))
+                (= event MUS-CHANGECONTROLLER)
+                (let (cn 0 cv 0)
+                  (when (>= (+ pos 1) n) (return none))
+                  (set! cn (byte-at mus pos))
+                  (set! cv (byte-at mus (+ pos 1)))
+                  (set! pos (+ pos 2))
+                  (if (= cn 0)
+                    (do (write-time st)
+                        (put st (bit-or MIDI-CHANGEPATCH channel))
+                        (put st (bit-and cv 0x7f))
+                        (set! (st 'track-size) (+ (st 'track-size) 2)))
+                    (do (when (or (< cn 1) (> cn 9)) (return none))
+                        (write-controller st channel (aref CONTROLLER-MAP (as i64 cn)) cv))))
+                (= event MUS-SCOREEND) (set! hit-end true)
+                true (return none))
+              (when (!= (bit-and desc 0x80) 0) (set! more false)))))
+        (when (not hit-end)
+          (let (delay:ui32 0 done false)
+            (while (not done)
+              (when (>= pos n) (return none))
+              (let (b (byte-at mus pos))
+                (set! pos (+ pos 1))
+                (set! delay (+ (* delay 128) (unsafe/cast ui32 (bit-and b 0x7f))))
+                (when (= (bit-and b 0x80) 0) (set! done true))))
+            (set! (st 'queued-time) (+ (st 'queued-time) delay))))))
+    ; WriteEndTrack, then the track's length into the header.
+    (write-time st)
+    (put st 0xff) (put st 0x2f) (put st 0)
+    (set! (st 'track-size) (+ (st 'track-size) 3))
+    (let (ts (st 'track-size) o (ref st 'out))
+      (set o 18 (unsafe/cast ui8 (bit-and (bit-shr ts 24) 0xff)))
+      (set o 19 (unsafe/cast ui8 (bit-and (bit-shr ts 16) 0xff)))
+      (set o 20 (unsafe/cast ui8 (bit-and (bit-shr ts 8) 0xff)))
+      (set o 21 (unsafe/cast ui8 (bit-and ts 0xff))))
+    (let (out (st 'out))
+      (set! (st 'out) (make (Vector ui8)))
+      (return (some out)))))
