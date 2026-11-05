@@ -1,0 +1,282 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom g_game.c); this port is GPLv3, see COPYING.
+;
+; A game in progress: starting one, loading its levels, playing back a demo
+; and running each gametic (G_InitNew, G_DoLoadLevel, G_Ticker).
+
+(ns doom.session)
+
+(import-use nucleus.create)
+(import-use nucleus.allocator)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.slice)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.file)
+(import-use nucleus.fmt)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.mapdata)
+(import-use doom.assets)
+(import-use doom.fixed)
+(import-use doom.rand)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.world)
+(import-use doom.play.setup)
+(import-use doom.play.spec)
+(import-use doom.play.tick)
+(import doom.play.map pm)
+
+; The v1.9 executable's demo version byte, and the end-of-demo marker.
+(defconst DOOM-VERSION 109)
+(defconst DEMOMARKER 0x80)
+
+; A demo being played back: the lump and the read position.
+(defstruct Demo data:Bytes pos:usize)
+
+(defstruct Session
+  pics:PicData
+  rules:Rules
+  in-game:(Vector bool)
+  ; Players and the RNG between levels; during one they're the world's.
+  players:(Vector Player)
+  random:Random
+  world:?&World
+  gametic:i32
+  demo:?Demo
+  ; Set when the demo reaches its end marker (G_CheckDemoStatus).
+  demo-ended:bool
+  ; The game ended: the shareware episode's last map was finished.
+  finished:bool
+  ; -tichash's lines, written when the session ends.
+  tichash:?String)
+
+(defn session-new (a:&Assets mode:i32):(Fallible &Session)
+  (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
+                       (single-player-rules SK-MEDIUM mode 1 1)
+                       (single-player-in-game) (new-game-players) (random-new)
+                       none 0 none false false none))))
+
+; D_IdentifyVersion: told apart by which maps the IWAD has.
+(defn game-mode (a:&Assets):i32
+  (let (w (ref a 'wad))
+    (return (cond (some? (lump-index w "MAP01")) COMMERCIAL
+                  (some? (lump-index w "E4M1")) RETAIL
+                  (some? (lump-index w "E3M1")) REGISTERED
+                  true SHAREWARE))))
+
+(defn session-world (s:&Session):&World (return (unwrap (s 'world))))
+
+; G_DoLoadLevel and P_SetupLevel: the current episode and map, its things
+; and specials.
+(defn- load-level (s:&Session a:&Assets):(Fallible void)
+  ; Carry the players and the RNG over from the level before.
+  (when-some (w (s 'world))
+    (set! (s 'players) (w 'players))
+    (set! (s 'random) (w 'random)))
+  (let (r (ref s 'rules) players (view (ref s 'players)))
+    (dotimes (i:usize MAXPLAYERS)
+      (let (p (&players i))
+        (when (and ((ref s 'in-game) i) (= (p 'state) PST-DEAD)) (set! (p 'state) PST-REBORN))
+        (dotimes (k:usize 4) (set! (aref (p 'frags) (as i64 k)) 0))
+        ; P_SetupLevel's.
+        (set! (p 'kill-count) 0)
+        (set! (p 'secret-count) 0)
+        (set! (p 'item-count) 0)))
+    (match (find-map a (r 'episode) (r 'map))
+      ((none) (fail "Tried to load invalid map: E" (r 'episode) "M" (r 'map)))
+      ((some m)
+       (let (l (try (pm/level-load &m (ref a 'flats) (ref a 'textures)))
+             w (try (level-setup l &m @r (s 'players) (ref s 'in-game) (s 'random) (s 'pics))))
+         (set! (w 'game-tic) (s 'gametic))
+         (set! (s 'world) (some w))))))
+  (return (ok)))
+
+; G_InitNew: a new game at this skill, episode and map.
+(defn session-init-new (s:&Session a:&Assets skill:i32 episode:i32 m:i32):(Fallible void)
+  (let (r (ref s 'rules) sk (min skill SK-NIGHTMARE)
+        ep (if (r 'ultimate) (if (= episode 0) 4 episode) (max 1 (min episode 3)))
+        mp (max m 1))
+    (when (and (> ep 1) (= (r 'mode) SHAREWARE)) (set! ep 1))
+    (when (and (> mp 9) (!= (r 'mode) COMMERCIAL)) (set! mp 9))
+    ; M_ClearRandom.
+    (set! (s 'random) (random-new))
+    (set! (r 'respawn-monsters) (or (= sk SK-NIGHTMARE) (r 'respawn-monsters)))
+    (set! (s 'players) (new-game-players))
+    (set! (s 'world) none)
+    (set! (r 'demo-playback) false)
+    (set! (r 'episode) ep)
+    (set! (r 'map) mp)
+    (set! (r 'skill) sk)
+    (return (load-level s a))))
+
+(defn- demo-byte (d:&Demo):(Fallible i32)
+  (when (>= (d 'pos) (count (ref d 'data))) (fail "the demo ends early"))
+  (let (b (as i32 @((ref d 'data) (d 'pos))))
+    (set! (d 'pos) (+ (d 'pos) 1))
+    (return (ok b))))
+
+; G_DoPlayDemo: the header, then G_InitNew. Only the v1.9 format.
+(defn session-play-demo (s:&Session a:&Assets lump:StrView):(Fallible void)
+  (match (lump-index (ref a 'wad) (name lump))
+    ((none) (fail "no demo lump " lump))
+    ((some li)
+     (let (d (Demo ((lump-at (ref a 'wad) li) 'data) 0)
+           version (try (demo-byte &d)))
+       (when (!= version DOOM-VERSION)
+         (fail "Demo is from a different game version! (read " version ", should be " DOOM-VERSION ")"))
+       (let (skill (try (demo-byte &d)) episode (try (demo-byte &d)) mp (try (demo-byte &d))
+             r (ref s 'rules))
+         (set! (r 'deathmatch) (try (demo-byte &d)))
+         (set! (r 'respawn-monsters) (!= (try (demo-byte &d)) 0))
+         (set! (r 'fast) (!= (try (demo-byte &d)) 0))
+         (set! (r 'no-monsters) (!= (try (demo-byte &d)) 0))
+         (set! (r 'console-player) (try (demo-byte &d)))
+         (dotimes (i:usize MAXPLAYERS)
+           (set (ref s 'in-game) i (!= (try (demo-byte &d)) 0)))
+         (when ((ref s 'in-game) 1) (set! (r 'netgame) true))
+         (try (session-init-new s a skill episode mp))
+         (set! (r 'demo-playback) true)
+         (set! (s 'demo) (some d))))))
+  (return (ok)))
+
+; G_ReadDemoTiccmd: the end marker ends playback and leaves cmd alone.
+(defn- read-demo-ticcmd (s:&Session cmd:&TicCmd):(Fallible void)
+  (match (s 'demo)
+    ((none) (return (ok)))
+    ((some dd)
+     (let (d dd)
+       (when (= (try (demo-byte &d)) DEMOMARKER)
+         (set! (s 'demo-ended) true)
+         (return (ok)))
+       (set! (d 'pos) (- (d 'pos) 1))
+       (let (fwd (try (demo-byte &d)) side (try (demo-byte &d))
+             turn (try (demo-byte &d)) buttons (try (demo-byte &d)))
+         ; Signed chars; the turn is the angle's high byte.
+         (set! (cmd 'forward-move) (if (> fwd 127) (- fwd 256) fwd))
+         (set! (cmd 'side-move) (if (> side 127) (- side 256) side))
+         (set! (cmd 'angle-turn) (unsafe/cast i32 (unsafe/cast i16 (bit-shl turn 8))))
+         (set! (cmd 'buttons) buttons))
+       (set! (s 'demo) (some d))
+       (return (ok))))))
+
+; G_PlayerFinishLevel: what doesn't carry to the next level.
+(defn- player-finish-level (p:&Player):void
+  (dotimes (i:usize 6) (set! (aref (p 'powers) (as i64 i)) 0))
+  (dotimes (i:usize 6) (set! (aref (p 'cards) (as i64 i)) false))
+  (when-some (mo (p 'mo)) (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-SHADOW))))
+  (set! (p 'extra-light) 0)
+  (set! (p 'fixed-colormap) 0)
+  (set! (p 'damage-count) 0)
+  (set! (p 'bonus-count) 0))
+
+; G_DoCompleted and G_WorldDone, without the intermission yet: on to the
+; next map, or the end of the game.
+(defn- level-completed (s:&Session a:&Assets):(Fallible void)
+  (let (w (session-world s) r (ref s 'rules) secret (= (w 'exit) 2)
+        players (view (ref w 'players)) ep (r 'episode) mp (r 'map))
+    (dotimes (i:usize MAXPLAYERS)
+      (when ((ref s 'in-game) i) (player-finish-level (&players i))))
+    (when (and (!= (r 'mode) COMMERCIAL) (= mp 8))
+      ; The episode's end: the finale.
+      (set! (s 'finished) true)
+      (return (ok)))
+    (set! (r 'map)
+          (cond (= (r 'mode) COMMERCIAL) (+ mp 1)
+                secret 9
+                ; Back from the secret level.
+                (= mp 9) (case ep 1 4 2 6 3 7 4 3 1)
+                true (+ mp 1)))
+    (return (load-level s a))))
+
+; The -tichash line: as reference/tichash.patch writes it.
+(defn- hash-word (h:ui32 v:i32):ui32
+  (let (u (unsafe/cast ui32 v) out h)
+    (dotimes (i:usize 4)
+      (set! out (* (bit-xor out (bit-and (bit-shr u (unsafe/cast ui32 (* 8 i))) 255)) 16777619)))
+    (return out)))
+
+(defn- tichash-line (s:&Session):String
+  (let (w (session-world s) h:ui32 2166136261 n 0
+        cap (w 'thinker-cap) th (unwrap (cap 'next)))
+    (while (not (same? th cap))
+      (when (not (th 'removed))
+        (match (th 'think)
+          ((mobj m)
+           (set! h (hash-word h (m 'x)))
+           (set! h (hash-word h (m 'y)))
+           (set! h (hash-word h (m 'z)))
+           (set! h (hash-word h (unsafe/cast i32 (m 'angle))))
+           (set! h (hash-word h (m 'mom-x)))
+           (set! h (hash-word h (m 'mom-y)))
+           (set! h (hash-word h (m 'mom-z)))
+           (set! h (hash-word h (m 'health)))
+           (set! h (hash-word h (m 'type)))
+           (set! h (hash-word h (m 'state)))
+           (set! h (hash-word h (m 'flags)))
+           (set! n (+ n 1)))
+          ((cap) 0) ((door d) 0) ((floor f) 0) ((ceiling c) 0) ((plat p) 0)
+          ((flash x) 0) ((strobe x) 0) ((glow g) 0) ((flicker f) 0)))
+      (set! th (unwrap (th 'next))))
+    (let (rnd (ref w 'random) hx (hex8 h)
+          line (str (s 'gametic) " " (rnd 'rnd) " " (rnd 'prnd) " " (string-as-view &hx) " " n))
+      (dotimes (i:usize MAXPLAYERS)
+        (when ((ref s 'in-game) i)
+          (let (p (player-at w i))
+            (str-into &line " " (p 'health) "/" (p 'armor-points) "/" (p 'ready-weapon) "/"
+                      (p 'kill-count) "/" (p 'item-count) "/" (p 'secret-count)))))
+      (str-into &line "\n")
+      (return line))))
+
+; Eight hex digits: fmt's hex doesn't pad.
+(defn- hex8 (h:ui32):String
+  (let (out (make String) k 8)
+    (while (> k 0)
+      (set! k (- k 1))
+      (str-into &out (hex (bit-and (bit-shr h (unsafe/cast ui32 (* 4 k))) 15))))
+    (return out)))
+
+; G_Ticker for a level: reborn, read the ticcmds, think, and the status
+; bar's M_Random. `cmd` is the console player's, when not playing a demo.
+(defn session-tic (s:&Session a:&Assets cmd:TicCmd):(Fallible void)
+  (when (none? (s 'world)) (return (ok)))
+  (let (w (session-world s))
+    ; G_DoReborn: in single player, the level starts over.
+    (let (reborn false)
+      (dotimes (i:usize MAXPLAYERS)
+        (when (and ((ref s 'in-game) i) (= ((player-at w i) 'state) PST-REBORN)) (set! reborn true)))
+      (when (and reborn (not ((ref s 'rules) 'netgame)))
+        (try (load-level s a))))
+    (when (!= ((session-world s) 'exit) 0)
+      (try (level-completed s a))
+      (when (s 'finished) (return (ok)))))
+  (let (w (session-world s) cp (unsafe/cast usize ((ref s 'rules) 'console-player)))
+    (set! (w 'game-tic) (s 'gametic))
+    (dotimes (i:usize MAXPLAYERS)
+      (when ((ref s 'in-game) i)
+        (let (p (player-at w i))
+          (set! (p 'cmd) (if (= i cp) cmd (ticcmd-zero)))
+          (when ((ref s 'rules) 'demo-playback)
+            (try (read-demo-ticcmd s (ref p 'cmd)))))))
+    (when (s 'demo-ended) (return (ok)))
+    (try (ticker w))
+    ; ST_Ticker's st_randomnumber.
+    (m-random (ref w 'random))
+    (when-some (out (s 'tichash))
+      (let (line (tichash-line s) o out)
+        (str-into &o (string-as-view &line))
+        (set! (s 'tichash) (some o))))
+    (set! (s 'gametic) (+ (s 'gametic) 1)))
+  (return (ok)))
+
+(defn session-write-tichash (s:&Session path:StrView):(Fallible void)
+  (when-some (t (s 'tichash))
+    (with (f (try (file-create &path)))
+      (try (write-str f (string-as-view &t)))))
+  (return (ok)))

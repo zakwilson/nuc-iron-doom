@@ -15,6 +15,8 @@
 (import-use nucleus.strview)
 (import-use nucleus.string)
 (import-use nucleus.fmt)
+(import-use nucleus.io)
+(import-use nucleus.create)
 (import-use doom.error)
 (import-use doom.util)
 (import-use doom.bytes)
@@ -40,6 +42,8 @@
 (import-use doom.play.spec)
 (import-use doom.render.state)
 (import-use doom.render.view)
+(import-use doom.session)
+(import-use doom.ticcmd)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
 
@@ -71,18 +75,20 @@
   level:?Level
   camera:?Camera
   view:View
-  ; The phase-B side of the level: its fixed-point map and things, drawn by
-  ; Chocolate Doom's renderer unless -ironrender asks for Iron Doom's.
-  world:?&World
+  ; Phase B's game: Chocolate Doom's playsim, drawn by its renderer. Absent
+  ; under -ironrender, which keeps phase A's float player and Iron Doom's renderer.
+  session:?&Session
   renderer:Renderer
   ; Tics a turn key has been held, kept across levels as Iron Doom's Local is.
   turn-held:ui32
+  ; The same for G_BuildTiccmd's turnheld.
+  cmd-turn-held:i32
   tic:i32
   quit:bool)
 
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
   (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
-                (Mode-setup) none none none none (view-new) none (renderer-new 11) 0 0 false)))
+                (Mode-setup) none none none none (view-new) none (renderer-new 11) 0 0 0 false)))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -98,59 +104,74 @@
         (when (and (= t SDL_KEYDOWN) (= (((ref ev 'key) 'keysym) 'scancode) SDL_SCANCODE_ESCAPE))
           (set! (g 'quit) true))))))
 
+(defn- new-session (g:&Game):(Fallible &Session)
+  (let (a (ref g 'assets) s (try (session-new a (game-mode a))))
+    (when (some? ((ref g 'cl) 'tichash)) (set! (s 'tichash) (some (make String))))
+    (return (ok s))))
+
 (defn- load-level (g:&Game episode:i32 m:i32):(Fallible void)
-  (if-some (mp (find-map (ref g 'assets) episode m))
-    (let (a (ref g 'assets)
-          l (try (level-load &mp (ref a 'flats) (ref a 'textures)))
-          fl (try (pm/level-load &mp (ref a 'flats) (ref a 'textures)))
-          in-game (single-player-in-game)
-          pics (try (pic-data-new (ref a 'textures) (ref a 'flats) SHAREWARE))
-          w (try (level-setup fl &mp (single-player-rules SK-MEDIUM SHAREWARE episode m)
-                              (new-game-players) &in-game (random-new) pics)))
-      (set! (g 'camera) (some (camera-new (player &l))))
-      (set! (g 'level) (some l))
-      (set! (g 'world) (some w))
-      ; G_DoLoadLevel's sky for the first three episodes.
-      (let (sky (if (<= episode 3) (name-from-episode episode) (name "SKY4")))
-        (set! ((ref g 'renderer) 'sky-texture) (unwrap-or (texture-index (ref a 'textures) sky) 0))))
-    (fail "Tried to load invalid map: E" episode "M" m))
+  (let (a (ref g 'assets))
+    (if ((ref g 'cl) 'iron-render)
+      (if-some (mp (find-map a episode m))
+        (let (l (try (level-load &mp (ref a 'flats) (ref a 'textures))))
+          (set! (g 'camera) (some (camera-new (player &l))))
+          (set! (g 'level) (some l)))
+        (fail "Tried to load invalid map: E" episode "M" m))
+      (let (s (try (new-session g)))
+        (try (session-init-new s a SK-MEDIUM episode m))
+        (set! (g 'session) (some s)))))
   (return (ok)))
 
+; -playdemo and -timedemo start at once, without the title.
+(defn- demo-lump (cl:&CommandLine):?StrView
+  (return (if-some (d (cl 'timedemo)) (some d) (cl 'playdemo))))
+
+(defn- start-demo (g:&Game lump:StrView):(Fallible void)
+  (let (a (ref g 'assets) s (try (new-session g)))
+    (try (session-play-demo s a lump))
+    (set! (g 'session) (some s)))
+  (return (ok)))
+
+; G_DoLoadLevel's sky for the first three episodes.
+(defn- set-sky (g:&Game episode:i32):void
+  (let (sky (if (<= episode 3) (name-from-episode episode) (name "SKY4")))
+    (set! ((ref g 'renderer) 'sky-texture)
+          (unwrap-or (texture-index (ref (ref g 'assets) 'textures) sky) 0))))
+
 ; FixedUpdate, then FixedPostUpdate's camera update.
-(defn- level-tic (g:&Game):void
+(defn- level-tic (g:&Game):(Fallible void)
   (when-some (l (g 'level))
     (let (a (read-actions) ll l)
       (player-tic (player &ll) &a (ref g 'turn-held))
-      (set! (g 'camera) (some (camera-new (player &ll)))))))
+      (set! (g 'camera) (some (camera-new (player &ll))))))
+  (when-some (s (g 'session))
+    (try (session-tic s (ref g 'assets) (build-ticcmd (ref g 'cmd-turn-held))))
+    ; G_CheckDemoStatus quits after a -playdemo or -timedemo, and without a
+    ; finale yet so does the episode's end.
+    (when (or (s 'demo-ended) (s 'finished)) (set! (g 'quit) true)))
+  (return (ok)))
 
 (defn- name-from-episode (e:i32):Name
   (return (cond (= e 1) (name "SKY1") (= e 2) (name "SKY2") true (name "SKY3"))))
 
-(defconst VIEWHEIGHT (* 41 65536))
-
-; The eye at the float player: its position and facing in fixed point, at
-; the view height over the floor beneath it.
-(defn- player-eye (p:&MapObject l:&pm/Level):Eye
-  (let (pos (p 'pos) dir (p 'dir)
-        x (f32-to-i32 (* (pos 'x) 65536.0))
-        y (f32-to-i32 (* (pos 'y) 65536.0))
-        ; Radians to binary angle: 2^31 per half turn.
-        bam (unsafe/cast ui32 (unsafe/cast i64 (* (as f64 (atan2f (dir 'y) (dir 'x))) 683565275.5764316)))
-        floor ((pm/sector-at l ((pm/sub-sector-at l (pm/point-in-sub-sector l x y)) 'sector)) 'floor-height))
-    (return (Eye x y (+ floor VIEWHEIGHT) bam 0 -1))))
+; The eye at the console player, as R_SetupFrame places it.
+(defn- player-eye (p:&Player):Eye
+  (let (mo (unwrap (p 'mo)))
+    (return (Eye (mo 'x) (mo 'y) (p 'view-z) (mo 'angle) (p 'extra-light) (p 'fixed-colormap)))))
 
 (defn- draw-level (g:&Game):(Fallible void)
   (when-some (l (g 'level))
-    (if ((ref g 'cl) 'iron-render)
-      (when-some (c (g 'camera))
-        (let (ll l cc c)
-          (render-view (ref g 'view) &ll &cc (ref (ref g 'assets) 'textures) (ref g 'screen))))
-      (when-some (w (g 'world))
-        (let (ll l a (ref g 'assets)
-              sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats) (ref a 'colormaps)
-                        (ref a 'sprites) (ref w 'sector-things) (ref g 'screen))
-              e (player-eye (player &ll) (ref w 'level)))
-          (try (render-player-view (ref g 'renderer) &sc &e))))))
+    (when-some (c (g 'camera))
+      (let (ll l cc c)
+        (render-view (ref g 'view) &ll &cc (ref (ref g 'assets) 'textures) (ref g 'screen)))))
+  (when-some (s (g 'session))
+    (when-some (w (s 'world))
+      (set-sky g ((ref w 'rules) 'episode))
+      (let (a (ref g 'assets)
+            sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats) (ref a 'colormaps)
+                      (ref a 'sprites) (ref w 'sector-things) (ref g 'screen))
+            e (player-eye (player-at w (unsafe/cast usize ((ref w 'rules) 'console-player)))))
+        (try (render-player-view (ref g 'renderer) &sc &e)))))
   (return (ok)))
 
 (defn game-tic (g:&Game):(Fallible void)
@@ -172,7 +193,7 @@
          (let (now (+ elapsed TIC-NS))
            (set! (g 'mode) (Mode-intro now))
            (when (and (< elapsed TITLE-NS) (>= now TITLE-NS)) (set! title-done true))))
-        ((level) (level-tic g))
+        ((level) (try (level-tic g)))
         ((melt)
          (when-some (m (g 'melt))
            ; A copy, but its columns and screens are the same heap buffers.
@@ -182,7 +203,11 @@
                (set! (g 'pending) (some (Mode-level))))))))
       ; Update.
       (match (g 'mode)
-        ((setup) (set! (g 'pending) (some (Mode-intro 0))))
+        ((setup)
+         (if-some (d (demo-lump (ref g 'cl)))
+           (do (try (start-demo g d))
+               (set! (g 'pending) (some (Mode-level))))
+           (set! (g 'pending) (some (Mode-intro 0)))))
         ((intro e) 0) ((level) 0) ((melt) 0))
       (when title-done
         (try (load-level g 1 1))
@@ -208,7 +233,8 @@
 
 (defn game-run (g:&Game):(Fallible void)
   (try (video-set-palette (ref g 'video) (palette0 g) 0))
-  (let (headless (some? ((ref g 'cl) 'framedump))
+  (let (cl (ref g 'cl)
+        headless (or (some? (cl 'framedump)) (some? (cl 'timedemo)))
         start-ms (SDL_GetTicks64)
         n:ui64 0)
     (while (not (g 'quit))
@@ -217,5 +243,10 @@
       ; 35 tics a second in real time; a framedump runs as fast as it can.
       (when (not headless)
         (let (due (+ start-ms (/ (* n 1000) 35)) now (SDL_GetTicks64))
-          (when (< now due) (SDL_Delay (unsafe/cast ui32 (- due now))))))))
+          (when (< now due) (SDL_Delay (unsafe/cast ui32 (- due now)))))))
+    (when-some (s (g 'session))
+      (when (some? (cl 'timedemo))
+        (println "timed " (s 'gametic) " gametics in " (- (SDL_GetTicks64) start-ms) " ms"))
+      (when-some (path (cl 'tichash))
+        (try (session-write-tichash s path)))))
   (return (ok)))

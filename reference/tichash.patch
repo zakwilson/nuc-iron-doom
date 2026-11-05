@@ -1,0 +1,100 @@
+--- a/src/doom/g_game.c	2026-11-05 03:42:43.997080698 +0000
++++ b/src/doom/g_game.c	2026-11-05 03:42:52.872370217 +0000
+@@ -74,6 +74,88 @@
+ 
+ 
+ #include "g_game.h"
++#include "m_random.h"
++
++// m_random.c's, which no header declares.
++extern int prndindex;
++
++// -tichash <file>: after each gametic, one line of the playsim's state, to
++// compare a port's demo playback with this one's (nuc-iron-doom).
++static FILE *tichash_file = NULL;
++
++static unsigned int TicHashWord(unsigned int h, int v)
++{
++    int i;
++
++    // FNV-1a over the int's four bytes, low first.
++    for (i = 0; i < 4; ++i)
++    {
++        h ^= ((unsigned int) v >> (8 * i)) & 0xff;
++        h *= 16777619u;
++    }
++    return h;
++}
++
++static void TicHashWrite(void)
++{
++    thinker_t *th;
++    mobj_t *mo;
++    unsigned int h = 2166136261u;
++    int n = 0;
++    int i;
++
++    if (tichash_file == NULL)
++    {
++        i = M_CheckParmWithArgs("-tichash", 1);
++        if (i <= 0)
++        {
++            return;
++        }
++        tichash_file = fopen(myargv[i + 1], "w");
++        if (tichash_file == NULL)
++        {
++            I_Error("Couldn't open %s", myargv[i + 1]);
++        }
++    }
++
++    if (gamestate == GS_LEVEL)
++    {
++        for (th = thinkercap.next; th != &thinkercap; th = th->next)
++        {
++            if (th->function.acp1 != (actionf_p1) P_MobjThinker)
++            {
++                continue;
++            }
++            mo = (mobj_t *) th;
++            h = TicHashWord(h, mo->x);
++            h = TicHashWord(h, mo->y);
++            h = TicHashWord(h, mo->z);
++            h = TicHashWord(h, (int) mo->angle);
++            h = TicHashWord(h, mo->momx);
++            h = TicHashWord(h, mo->momy);
++            h = TicHashWord(h, mo->momz);
++            h = TicHashWord(h, mo->health);
++            h = TicHashWord(h, mo->type);
++            h = TicHashWord(h, (int) (mo->state - states));
++            h = TicHashWord(h, mo->flags);
++            ++n;
++        }
++    }
++
++    fprintf(tichash_file, "%d %d %d %08x %d", gametic, rndindex, prndindex, h, n);
++    for (i = 0; i < MAXPLAYERS; ++i)
++    {
++        if (playeringame[i])
++        {
++            fprintf(tichash_file, " %d/%d/%d/%d/%d/%d", players[i].health,
++                    players[i].armorpoints, players[i].readyweapon,
++                    players[i].killcount, players[i].itemcount,
++                    players[i].secretcount);
++        }
++    }
++    fprintf(tichash_file, "\n");
++    fflush(tichash_file);
++}
+ 
+ 
+ #define SAVEGAMESIZE	0x2c000
+@@ -1078,6 +1160,8 @@
+ 	D_PageTicker (); 
+ 	break;
+     }        
++
++    TicHashWrite();
+ } 
+  
+  

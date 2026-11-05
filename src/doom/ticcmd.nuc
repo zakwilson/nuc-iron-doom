@@ -1,0 +1,61 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom g_game.c); this port is GPLv3, see COPYING.
+;
+; G_BuildTiccmd: the keyboard's state as one tic of player input.
+
+(ns doom.ticcmd)
+
+(import-use "SDL2/SDL.h")
+(import-use doom.play.defs)
+(import-use doom.play.world)
+(import-use nucleus.math)
+
+(defvar FORWARDMOVE:(array i32 2) (array i32 0x19 0x32))
+(defvar SIDEMOVE:(array i32 2) (array i32 0x18 0x28))
+; Normal, fast, and the slow first tics of a turn.
+(defvar ANGLETURN:(array i32 3) (array i32 640 1280 320))
+(defconst SLOWTURNTICS 6)
+(defconst MAXPLMOVE 0x32)
+
+(defn- key? (keys:&ui8 sc:i32):bool
+  (return (!= (aref keys (as i64 sc)) 0)))
+
+; The controls: arrows or WASD to move, Alt to strafe, Shift to run, Ctrl to
+; fire, Space to use, and 1-7 for the weapons. `turn-held` counts the tics a
+; turn key has been down.
+(defn build-ticcmd (turn-held:&i32):TicCmd
+  (let (keys (unsafe/cast &ui8 (SDL_GetKeyboardState null))
+        cmd (ticcmd-zero)
+        speed (if (or (key? keys SDL_SCANCODE_LSHIFT) (key? keys SDL_SCANCODE_RSHIFT)) 1 0)
+        strafe (or (key? keys SDL_SCANCODE_LALT) (key? keys SDL_SCANCODE_RALT))
+        left (key? keys SDL_SCANCODE_LEFT)
+        right (key? keys SDL_SCANCODE_RIGHT)
+        forward 0 side 0)
+    ; Two-stage accelerative turning on the keyboard.
+    (if (or left right) (set! @turn-held (+ @turn-held 1)) (set! @turn-held 0))
+    (let (tspeed (if (< @turn-held SLOWTURNTICS) 2 speed)
+          fm (aref FORWARDMOVE (as i64 speed)) sm (aref SIDEMOVE (as i64 speed)))
+      (if strafe
+        (do (when right (set! side (+ side sm)))
+            (when left (set! side (- side sm))))
+        (do (when right (set! (cmd 'angle-turn) (- (cmd 'angle-turn) (aref ANGLETURN (as i64 tspeed)))))
+            (when left (set! (cmd 'angle-turn) (+ (cmd 'angle-turn) (aref ANGLETURN (as i64 tspeed)))))))
+      (when (or (key? keys SDL_SCANCODE_UP) (key? keys SDL_SCANCODE_W)) (set! forward (+ forward fm)))
+      (when (or (key? keys SDL_SCANCODE_DOWN) (key? keys SDL_SCANCODE_S)) (set! forward (- forward fm)))
+      (when (or (key? keys SDL_SCANCODE_PERIOD) (key? keys SDL_SCANCODE_D)) (set! side (+ side sm)))
+      (when (or (key? keys SDL_SCANCODE_COMMA) (key? keys SDL_SCANCODE_A)) (set! side (- side sm))))
+    (when (or (key? keys SDL_SCANCODE_LCTRL) (key? keys SDL_SCANCODE_RCTRL))
+      (set! (cmd 'buttons) (bit-or (cmd 'buttons) BT-ATTACK)))
+    (when (or (key? keys SDL_SCANCODE_SPACE) (key? keys SDL_SCANCODE_E))
+      (set! (cmd 'buttons) (bit-or (cmd 'buttons) BT-USE)))
+    ; Weapon keys: the first one down.
+    (let (i 0 done false)
+      (while (and (< i 7) (not done))
+        (when (key? keys (+ SDL_SCANCODE_1 i))
+          (set! (cmd 'buttons) (bit-or (cmd 'buttons) (bit-or BT-CHANGE (bit-shl i BT-WEAPONSHIFT))))
+          (set! done true))
+        (inc! i)))
+    (set! (cmd 'forward-move) (max (- 0 MAXPLMOVE) (min forward MAXPLMOVE)))
+    (set! (cmd 'side-move) (max (- 0 MAXPLMOVE) (min side MAXPLMOVE)))
+    (return cmd)))
