@@ -14,6 +14,7 @@
 (import-use nucleus.coll)
 (import-use nucleus.fmt)
 (import-use nucleus.math)
+(import-use nucleus.strview)
 (import-use doom.error)
 (import-use doom.bytes)
 (import-use doom.util)
@@ -86,6 +87,10 @@
           (set buf x (+ y row (post 'top-delta)) @(data row)))))))
 
 ; V_DrawPatch: `x`,`y` name the patch's origin, which its offsets move.
+; A patch by its lump name.
+(defn lump-patch (w:&Wad n:StrView):(Fallible Patch)
+  (return (patch-parse (ref (try (lump-named w (name n))) 'data))))
+
 (defn draw-patch (buf:&Buffer x:usize y:usize p:&Patch):(Fallible void)
   (let (left (as i64 (p 'left-offset)) top (as i64 (p 'top-offset))
         px (- (as-checked i64 x) left) py (- (as-checked i64 y) top))

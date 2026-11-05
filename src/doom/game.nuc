@@ -55,6 +55,7 @@
 (import-use doom.menu)
 (import-use doom.input)
 (import-use doom.cheats)
+(import-use doom.automap)
 (import-use doom.wad)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
@@ -110,6 +111,9 @@
   hu-font:?HuFont
   menu:MenuState
   cheats:Cheats
+  automap:Automap
+  ; The session's new-games when the automap last looked.
+  am-new-games:i32
   ; The attract loop (d_main.c): the sequence's step, the page showing
   ; (GS_DEMOSCREEN) and its tics left, and a pending D_AdvanceDemo.
   demo-sequence:i32 page:?CStr page-tic:i32 advance-demo:bool
@@ -123,7 +127,7 @@
         menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL)))
     (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
                   (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) -1 none 0 false (random-new) 0 false))))
+                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) 0 -1 none 0 false (random-new) 0 false))))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -146,10 +150,10 @@
         gt (match (g 'session) ((some s) (s 'gametic)) ((none) (g 'tic))))
     (dotimes (i:usize (count &v))
       (let (ev (&v i))
-        (when (and (not (menu-responder (ref g 'menu) ev gt)) (= (ev 'type) EV-KEYDOWN))
+        (when (not (menu-responder (ref g 'menu) ev gt ((ref g 'automap) 'active)))
           ; G_Responder: in the attract loop any key brings up the menu.
           (if (and (not ((ref g 'menu) 'user-game)) (none? (demo-lump (ref g 'cl))))
-            (open-panel (ref g 'menu))
+            (when (= (ev 'type) EV-KEYDOWN) (open-panel (ref g 'menu)))
             (try (level-responder g ev)))))))
   (menu-ticker (ref g 'menu))
   (try (do-menu-requests g))
@@ -177,14 +181,31 @@
     (set! (g 'pending) (some (Mode-level))))
   (return (ok)))
 
-; G_Responder's level half: the cheats, in a level not played from a demo.
+; G_Responder's level half: the cheats, in a level not played from a demo,
+; then the automap.
 (defn- level-responder (g:&Game ev:&Event):(Fallible void)
   (when-some (s (g 'session))
     (when-some (w (s 'world))
-      (when (and (= (s 'gamestate) GS-LEVEL) (not ((ref w 'rules) 'demo-playback)))
-        (when-some (to (cheat-responder (ref g 'cheats) w (ev 'ch)))
-          (try (menu-new-game g GAME-SKILL (to 'episode) (to 'map)))))))
+      (when (= (s 'gamestate) GS-LEVEL)
+        (when (and (= (ev 'type) EV-KEYDOWN) (not ((ref w 'rules) 'demo-playback)))
+          (when-some (to (cheat-responder (ref g 'cheats) w (ev 'ch)))
+            (try (menu-new-game g GAME-SKILL (to 'episode) (to 'map)))
+            (return (ok))))
+        (try (automap-responder (ref g 'automap) w (ref (ref g 'assets) 'wad) ev)))))
   (return (ok)))
+
+; AM_Ticker, and the AM_Stops of G_DoCompleted, G_InitNew, F_StartFinale and
+; the console player's death.
+(defn- automap-tic (g:&Game s:&Session):void
+  (let (am (ref g 'automap))
+    (when (or (!= (s 'gamestate) GS-LEVEL) (!= (s 'new-games) (g 'am-new-games)))
+      (set! (g 'am-new-games) (s 'new-games))
+      (automap-stop am))
+    (when-some (w (s 'world))
+      (when (w 'console-died)
+        (set! (w 'console-died) false)
+        (automap-stop am))
+      (when (= (s 'gamestate) GS-LEVEL) (automap-ticker am w)))))
 
 ; D_StartTitle: the attract loop from its start.
 (defn- end-game (g:&Game):void
@@ -300,9 +321,11 @@
       (set! (g 'camera) (some (camera-new (player &ll))))))
   (when-some (s (g 'session))
     (set! (s 'menu-active) ((ref g 'menu) 'active))
-    (let (cmd (if ((ref g 'menu) 'active) (ticcmd-zero) (build-ticcmd (ref g 'cmd-turn-held))))
+    (let (cmd (if ((ref g 'menu) 'active) (ticcmd-zero)
+                (build-ticcmd (ref g 'cmd-turn-held) (not (automap-panning? (ref g 'automap))))))
       (when (some? (s 'record)) (lowres-turn &cmd (ref g 'turn-carry)))
-      (try (session-tic s (ref g 'assets) cmd)))
+      (try (session-tic s (ref g 'assets) cmd))
+      (automap-tic g s))
     ; G_CheckDemoStatus: -playdemo and -timedemo quit, the attract loop goes on.
     (when (s 'demo-ended)
       (if (some? (demo-lump (ref g 'cl)))
@@ -377,18 +400,25 @@
                     (ref a 'sprites) (ref w 'sector-things) (ref g 'screen))
           p (player-at w (unsafe/cast usize ((ref w 'rules) 'console-player)))
           e (player-eye p))
-      (try (fill-back-screen g (= ((ref w 'rules) 'mode) COMMERCIAL)))
-      (try (render-player-view (ref g 'renderer) &sc &e))
-      (draw-player-sprites (ref g 'renderer) &sc p)
+      (if ((ref g 'automap) 'active)
+        (try (automap-drawer (ref g 'automap) w (ref g 'screen)))
+        (do (try (fill-back-screen g (= ((ref w 'rules) 'mode) COMMERCIAL)))
+            (try (render-player-view (ref g 'renderer) &sc &e))
+            (draw-player-sprites (ref g 'renderer) &sc p)))
       (when (none? (g 'st-graphics))
         (set! (g 'st-graphics) (some (try (status-graphics-load (ref a 'wad) 0)))))
-      ; Full screen has no status bar.
-      (when (< ((ref g 'renderer) 'view-height) 200)
+      ; Full screen has no status bar, unless the automap is up.
+      (when (or (< ((ref g 'renderer) 'view-height) 200) ((ref g 'automap) 'active))
         (when-some (sg (g 'st-graphics))
           (let (r (ref w 'rules) sgv sg)
             (try (st-drawer (ref s 'st) &sgv (ref g 'screen) p (!= (r 'deathmatch) 0) (r 'netgame) 0)))))
-      (let (font (try (font-of g)))
-        (try (hud-drawer (ref s 'hud) &font (ref g 'screen))))
+      (let (font (try (font-of g))
+            ; ISSUE-026: the title's `if` is bound before it is an argument.
+            title:?CStr (if ((ref g 'automap) 'active)
+                          (some (hud-title (= ((ref w 'rules) 'mode) COMMERCIAL)
+                                           ((ref w 'rules) 'episode) ((ref w 'rules) 'map)))
+                          none))
+        (try (hud-drawer (ref s 'hud) &font (ref g 'screen) title)))
       (try (set-palette g (st-palette p)))))
   (return (ok)))
 

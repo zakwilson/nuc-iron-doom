@@ -1,0 +1,19 @@
+; ISSUE-026: a call argument target-types a bare `(some v)`, but not one in an
+; `if` arm, so `(some cstr)` there is taken as a pointer Maybe and refused.
+; The same `if` as a typed `let` init or a `return` value works.
+; fixed-when: runs
+; Actual: "some: value must be non-null (ref ...) — launder an unchecked
+; pointer with (as-ref ...)".
+
+(import-use "stdio.h")
+
+(defn title (b:bool):CStr (return (if b "yes" "no")))
+
+(defn show (t:?CStr):void
+  (match t ((some s) (puts s)) ((none) (puts "none"))))
+
+(defn main ():i32
+  (show (some (title true)))
+  (let (c true)
+    (show (if c (some (title false)) none)))
+  (return 0))

@@ -583,6 +583,33 @@ the world's copies. The drop has to know which fields are *not* its own,
 and nothing in the types says so. Rust's move semantics would have refused
 the aliasing copy in the first place.
 
+## ISSUE-026: a sum constructor in an `if` arm isn't target-typed at a call argument
+
+- **Severity:** minor
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-026.nuc` — expected `(show (if c (some (title
+  false)) none))`, with `show` taking a `?CStr` and `title` returning a
+  `CStr`, to pass a `some`; actual `some: value must be non-null (ref ...)`
+- **Port sites:** `src/doom/game.nuc` (`draw-session-level`, the automap's
+  level title for `hud-drawer`)
+- **Workaround:** bind the `if` in a typed `let` first, whose want reaches
+  the arms.
+- **Suggestion:** `arg-target-rewrite` already has the parameter's type when
+  it rewrites a bare constructor, so it could descend into the tails of
+  `if`/`cond`/`do`/`let`/`match` as a binding's want does. The overload is
+  already chosen by then, so the doc's reason for not making an argument a
+  want position doesn't apply to the arms.
+
+Context: `nucleus/src/union-emit.nuc` says a call argument "is not a want
+position (its type may pick the overload), so only the built-in sum
+constructors are target-typed there". A bare `(some (title true))` argument
+works, and so does the same `if` as a `let` init or a `return` value, so the
+`if` form is the only thing that changes the outcome. A `?CStr` is a tagged
+`Maybe`, not a nullable pointer, so an untyped `some` of a function's `CStr`
+result falls to the pointer `Maybe` and is refused, while a string literal
+passes. The message points at `as-ref`, which is the wrong fix here.
+
 ## What worked well
 
 - Computing the 256-byte RNG table from its LCG in a macro body (ordinary

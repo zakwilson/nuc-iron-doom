@@ -20,7 +20,7 @@
 
 (defn- press (m:&MenuState key:i32):bool
   (let (ev (Event EV-KEYDOWN key (if (< key 127) key 0)))
-    (return (menu-responder m &ev 0))))
+    (return (menu-responder m &ev 0 false))))
 
 (deftest new-game-through-the-menus
   (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))

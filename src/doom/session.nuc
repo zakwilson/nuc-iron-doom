@@ -77,7 +77,9 @@
   forced-wipes:i32
   hud:Hud
   ; The game layer's: pause, and the menu being up (which pauses too).
-  paused:bool menu-active:bool)
+  paused:bool menu-active:bool
+  ; G_InitNews, which close the automap.
+  new-games:i32)
 
 (defn session-new (a:&Assets mode:i32):(Fallible &Session)
   (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
@@ -85,7 +87,7 @@
                        (single-player-in-game) (new-game-players) (random-new)
                        none 0 none false false none none (status-bar-new)
                        GS-LEVEL GA-NOTHING false (intermission-empty) 0
-                       (finale-empty) 0 (hud-new) false false))))
+                       (finale-empty) 0 (hud-new) false false 0))))
 
 ; D_IdentifyVersion: told apart by which maps the IWAD has.
 (defn game-mode (a:&Assets):i32
@@ -164,6 +166,7 @@
     (set! (r 'episode) ep)
     (set! (r 'map) mp)
     (set! (r 'skill) sk)
+    (set! (s 'new-games) (+ (s 'new-games) 1))
     (return (load-level s a))))
 
 (defn- demo-byte (d:&Demo):(Fallible i32)

@@ -63,9 +63,6 @@
   arms:(Vector Patch)
   faces:(Vector Patch))
 
-(defn- lump-patch (w:&Wad n:StrView):(Fallible Patch)
-  (return (patch-parse (ref (try (lump-named w (name n))) 'data))))
-
 (defn- numbered (w:&Wad prefix:CStr i:i32):(Fallible Patch)
   (let (s (str prefix i))
     (return (lump-patch w (string-as-view &s)))))

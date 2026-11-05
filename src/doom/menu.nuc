@@ -277,8 +277,9 @@
     (set! (m 'current) MAIN-MENU)
     (set! (m 'item-on) ((menu-at m MAIN-MENU) 'last-on))))
 
-; M_Responder: true when the menu took the event.
-(defn menu-responder (m:&MenuState ev:&Event gametic:i32):bool
+; M_Responder: true when the menu took the event. With the automap up, - and
+; = are its zoom keys.
+(defn menu-responder (m:&MenuState ev:&Event gametic:i32 automap:bool):bool
   (when (= (ev 'type) EV-QUIT)
     (if (and (m 'active) (m 'to-print) (= (m 'routine) MSG-QUIT))
       (request m (MenuRequest-quit))
@@ -298,8 +299,8 @@
       (sound m SFX-SWTCHX)
       (return true))
     (when (not (m 'active))
-      (cond (= key 45) (do (size-display m 0) (sound m SFX-STNMOV) (return true))
-            (= key 61) (do (size-display m 1) (sound m SFX-STNMOV) (return true))
+      (cond (and (= key 45) (not automap)) (do (size-display m 0) (sound m SFX-STNMOV) (return true))
+            (and (= key 61) (not automap)) (do (size-display m 1) (sound m SFX-STNMOV) (return true))
             ; F1: help.
             (= key KEY-F1) (do (open-panel m)
                                (set! (m 'current) (if (m 'ultimate) READ2-MENU READ1-MENU))
@@ -379,9 +380,6 @@
     (set! (m 'skull-counter) 8)))
 
 ; --- drawing ----------------------------------------------------------------
-
-(defn- lump-patch (w:&Wad n:StrView):(Fallible Patch)
-  (return (patch-parse (ref (try (lump-named w (name n))) 'data))))
 
 (defn- draw-named (w:&Wad buf:&Buffer x:i32 y:i32 n:CStr):(Fallible void)
   (let (p (try (lump-patch w (strview-from-cstr n))))

@@ -102,9 +102,6 @@
 
 ; --- drawing ----------------------------------------------------------------
 
-(defn- lump-patch (w:&Wad n:StrView):(Fallible Patch)
-  (return (patch-parse (ref (try (lump-named w (name n))) 'data))))
-
 ; F_TextWrite: the flat tiled, and the text typed so far.
 (defn- text-write (f:&Finale w:&Wad font:&HuFont buf:&Buffer):(Fallible void)
   (let (src ((try (lump-named w (name (f 'flat)))) 'data))

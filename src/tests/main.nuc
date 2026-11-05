@@ -17,6 +17,7 @@
 (import-use tests.session)
 (import-use tests.menu)
 (import-use tests.cheats)
+(import-use tests.automap)
 
 (defn main (argc:i32 argv:ptr):int
   (return (as int (test-main argc argv))))

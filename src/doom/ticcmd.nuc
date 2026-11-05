@@ -23,14 +23,14 @@
 
 ; The controls: arrows or WASD to move, Alt to strafe, Shift to run, Ctrl to
 ; fire, Space to use, and 1-7 for the weapons. `turn-held` counts the tics a
-; turn key has been down.
-(defn build-ticcmd (turn-held:&i32):TicCmd
+; turn key has been down. Without `arrows` the arrow keys are the automap's.
+(defn build-ticcmd (turn-held:&i32 arrows:bool):TicCmd
   (let (keys (unsafe/cast &ui8 (SDL_GetKeyboardState null))
         cmd (ticcmd-zero)
         speed (if (or (key? keys SDL_SCANCODE_LSHIFT) (key? keys SDL_SCANCODE_RSHIFT)) 1 0)
         strafe (or (key? keys SDL_SCANCODE_LALT) (key? keys SDL_SCANCODE_RALT))
-        left (key? keys SDL_SCANCODE_LEFT)
-        right (key? keys SDL_SCANCODE_RIGHT)
+        left (and arrows (key? keys SDL_SCANCODE_LEFT))
+        right (and arrows (key? keys SDL_SCANCODE_RIGHT))
         forward 0 side 0)
     ; Two-stage accelerative turning on the keyboard.
     (if (or left right) (set! @turn-held (+ @turn-held 1)) (set! @turn-held 0))
@@ -41,8 +41,8 @@
             (when left (set! side (- side sm))))
         (do (when right (set! (cmd 'angle-turn) (- (cmd 'angle-turn) (aref ANGLETURN (as i64 tspeed)))))
             (when left (set! (cmd 'angle-turn) (+ (cmd 'angle-turn) (aref ANGLETURN (as i64 tspeed)))))))
-      (when (or (key? keys SDL_SCANCODE_UP) (key? keys SDL_SCANCODE_W)) (set! forward (+ forward fm)))
-      (when (or (key? keys SDL_SCANCODE_DOWN) (key? keys SDL_SCANCODE_S)) (set! forward (- forward fm)))
+      (when (or (and arrows (key? keys SDL_SCANCODE_UP)) (key? keys SDL_SCANCODE_W)) (set! forward (+ forward fm)))
+      (when (or (and arrows (key? keys SDL_SCANCODE_DOWN)) (key? keys SDL_SCANCODE_S)) (set! forward (- forward fm)))
       (when (or (key? keys SDL_SCANCODE_PERIOD) (key? keys SDL_SCANCODE_D)) (set! side (+ side sm)))
       (when (or (key? keys SDL_SCANCODE_COMMA) (key? keys SDL_SCANCODE_A)) (set! side (- side sm))))
     (when (or (key? keys SDL_SCANCODE_LCTRL) (key? keys SDL_SCANCODE_RCTRL))

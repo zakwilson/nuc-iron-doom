@@ -26,6 +26,86 @@
   ; The world's console-spawns at the last HU_Start.
   spawns:i32)
 
+; The level names (d_englsh.h's HUSTR_*), Doom's then Doom II's.
+(defvar MAPNAMES:(array CStr 36) (array CStr
+  "E1M1: Hangar"
+  "E1M2: Nuclear Plant"
+  "E1M3: Toxin Refinery"
+  "E1M4: Command Control"
+  "E1M5: Phobos Lab"
+  "E1M6: Central Processing"
+  "E1M7: Computer Station"
+  "E1M8: Phobos Anomaly"
+  "E1M9: Military Base"
+  "E2M1: Deimos Anomaly"
+  "E2M2: Containment Area"
+  "E2M3: Refinery"
+  "E2M4: Deimos Lab"
+  "E2M5: Command Center"
+  "E2M6: Halls of the Damned"
+  "E2M7: Spawning Vats"
+  "E2M8: Tower of Babel"
+  "E2M9: Fortress of Mystery"
+  "E3M1: Hell Keep"
+  "E3M2: Slough of Despair"
+  "E3M3: Pandemonium"
+  "E3M4: House of Pain"
+  "E3M5: Unholy Cathedral"
+  "E3M6: Mt. Erebus"
+  "E3M7: Limbo"
+  "E3M8: Dis"
+  "E3M9: Warrens"
+  "E4M1: Hell Beneath"
+  "E4M2: Perfect Hatred"
+  "E4M3: Sever The Wicked"
+  "E4M4: Unruly Evil"
+  "E4M5: They Will Repent"
+  "E4M6: Against Thee Wickedly"
+  "E4M7: And Hell Followed"
+  "E4M8: Unto The Cruel"
+  "E4M9: Fear"))
+
+(defvar MAPNAMES-COMMERCIAL:(array CStr 32) (array CStr
+  "level 1: entryway"
+  "level 2: underhalls"
+  "level 3: the gantlet"
+  "level 4: the focus"
+  "level 5: the waste tunnels"
+  "level 6: the crusher"
+  "level 7: dead simple"
+  "level 8: tricks and traps"
+  "level 9: the pit"
+  "level 10: refueling base"
+  "level 11: 'o' of destruction!"
+  "level 12: the factory"
+  "level 13: downtown"
+  "level 14: the inmost dens"
+  "level 15: industrial zone"
+  "level 16: suburbs"
+  "level 17: tenements"
+  "level 18: the courtyard"
+  "level 19: the citadel"
+  "level 20: gotcha!"
+  "level 21: nirvana"
+  "level 22: the catacombs"
+  "level 23: barrels o' fun"
+  "level 24: the chasm"
+  "level 25: bloodfalls"
+  "level 26: the abandoned mines"
+  "level 27: monster condo"
+  "level 28: the spirit world"
+  "level 29: the living end"
+  "level 30: icon of sin"
+  "level 31: wolfenstein"
+  "level 32: grosse"))
+
+; HU_Start's title. v1.9 has no names for Doom II's maps past 32.
+(defn hud-title (commercial:bool episode:i32 m:i32):CStr
+  (if commercial
+    (return (if (and (>= m 1) (<= m 32)) (aref MAPNAMES-COMMERCIAL (as i64 (- m 1))) ""))
+    (let (i (+ (* (- episode 1) 9) (- m 1)))
+      (return (if (and (>= i 0) (< i 36)) (aref MAPNAMES (as i64 i)) "")))))
+
 (defn hud-new ():Hud (return (Hud none false 0 false false true -1)))
 
 ; HU_Start.
@@ -70,9 +150,13 @@
       (set! i (+ i 1))))
   (return (ok)))
 
-; HU_Drawer's message line, at the top left.
-(defn hud-drawer (h:&Hud font:&HuFont buf:&Buffer):(Fallible void)
+; HU_Drawer: the message line at the top left, and with the automap up the
+; level's title just above the status bar.
+(defn hud-drawer (h:&Hud font:&HuFont buf:&Buffer title:?CStr):(Fallible void)
   (when (h 'on)
     (when-some (m (h 'message))
       (try (draw-text font buf 0 0 (strview-from-cstr m)))))
+  (when-some (t title)
+    (let (y (- 167 (unsafe/cast i32 ((font-patch font 0) 'height))))
+      (try (draw-text font buf 0 y (strview-from-cstr t)))))
   (return (ok)))

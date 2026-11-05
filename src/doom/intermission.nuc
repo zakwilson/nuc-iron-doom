@@ -284,9 +284,6 @@
   num:(Vector Patch) minus:?Patch percent:Patch finished:Patch entering:Patch
   kills:Patch sp-secret:Patch items:Patch colon:Patch time:Patch sucks:Patch par:Patch)
 
-(defn- lump-patch (w:&Wad n:StrView):(Fallible Patch)
-  (return (patch-parse (ref (try (lump-named w (name n))) 'data))))
-
 (defn- named (w:&Wad s:String):(Fallible Patch)
   (return (lump-patch w (string-as-view &s))))
 
