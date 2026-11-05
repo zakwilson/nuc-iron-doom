@@ -83,10 +83,13 @@ failures of the baseline, 6 skipped; `make bootstrap` PASS once converged).
 them `make bootstrap` reports a diff until it is converged (nucleus
 `context/build.md`, "After a codegen change"). `make` itself is unaffected.
 The converged `boot/*.ll` can't be pushed to `nucleus-boot` from here.
-## Playtest request (milestone 3)
+## Playtest request (milestone 3, updated for milestone 4)
 
-The port now reaches E1M1 and can be walked around, as far as Iron Doom goes:
-walls and their textures, no floors, ceilings, sprites or collision.
+The port reaches E1M1 and can be walked around with Iron Doom's movement.
+Since milestone 4 it draws with Chocolate Doom's renderer: floors, ceilings,
+sky, sector light and the map's things as sprites. `-ironrender` switches
+back to Iron Doom's renderer (walls and sky only), which is what phase A's
+frame comparison uses.
 
 To build on your machine:
 
@@ -106,15 +109,22 @@ the window to quit.
 Please check:
 
 - The title, then the melt into E1M1 after about 1.7 s.
-- Walls in the start room and beyond: textures aligned, steps and the
-  computer wall where you'd expect them, nothing flickering as you turn.
+- Walls, floors and ceilings in the start room and beyond: textures aligned,
+  steps and the computer wall where you'd expect them, nothing flickering
+  as you turn, light falling off with distance.
+- Sprites: the barrels, the dead marines, the lamps, items and the
+  monsters (standing still) sit on the floor, face the right way as you
+  walk around them, and are hidden by walls in front of them.
+- The outdoor areas show the sky.
 - Turning starts slow for about a sixth of a second, then speeds up.
 - Movement glides to a stop, with no collision (you can walk through walls).
+- With `-ironrender`: the milestone-3 view, unchanged.
 
-Known problems, all Iron Doom's own: no floors or ceilings (black), no
-sprites, no collision, and the view height never follows the floor. The
-frames haven't been compared with Iron Doom's yet (the reference build is
-blocked here), so a misplaced texture is worth reporting.
+Known problems: no collision and no playsim yet (monsters stand still, no
+weapon on screen, no status bar); the view height follows the floor
+instantly, with no smoothing; textures and flats don't animate. The frames
+haven't been compared with the reference engines yet (their build is blocked
+here), so a misplaced texture or sprite is worth reporting.
 
 ## In flight
 

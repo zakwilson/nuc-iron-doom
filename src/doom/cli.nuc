@@ -210,17 +210,18 @@
            (println "  -response <FILES>...\n          "
                     "Load extra command line arguments from the given response file")))))
 
-(defstruct CommandLine iwad:?StrView framedump:?Framedump)
+(defstruct CommandLine iwad:?StrView framedump:?Framedump iron-render:bool)
 
 (defoptions CommandLine
   (iwad "-iwad" "FILE" "Specify an IWAD file to use")
-  (framedump "-framedump" "TICS DIR" "Write the frames of the listed tics (1,2,…) to DIR as PPMs, then exit"))
+  (framedump "-framedump" "TICS DIR" "Write the frames of the listed tics (1,2,…) to DIR as PPMs, then exit")
+  (iron-render "-ironrender" "" "Draw levels with Iron Doom's renderer (walls and sky only), for comparing frames with it"))
 
 (defn command-line-from (args:&Args):(Fallible CommandLine)
   (let (a1 (try (legacy-response-files args))
         a2 (try (load-response-files &a1))
         s (view &a2)
-        cl (CommandLine none none))
+        cl (CommandLine none none false))
     (try (parse-options &cl &s))
     (return (ok cl))))
 

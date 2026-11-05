@@ -31,6 +31,13 @@
 (import-use doom.camera)
 (import-use doom.player)
 (import-use doom.render)
+(import-use doom.fixed)
+(import-use doom.vec2)
+(import-use doom.play.world)
+(import-use doom.render.state)
+(import-use doom.render.view)
+; Its Level and level-load would clash with phase A's doom.level.
+(import doom.play.map pm)
 
 ; Bevy's fixed timestep: Duration::from_secs_f64(1/35), which truncates to whole ns.
 (defconst TIC-NS 28571428)
@@ -60,6 +67,10 @@
   level:?Level
   camera:?Camera
   view:View
+  ; The phase-B side of the level: its fixed-point map and things, drawn by
+  ; Chocolate Doom's renderer unless -ironrender asks for Iron Doom's.
+  world:?&World
+  renderer:Renderer
   ; Tics a turn key has been held, kept across levels as Iron Doom's Local is.
   turn-held:ui32
   tic:i32
@@ -67,7 +78,7 @@
 
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
   (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
-                (Mode-setup) none none none none (view-new) 0 0 false)))
+                (Mode-setup) none none none none (view-new) none (renderer-new 11) 0 0 false)))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -85,9 +96,16 @@
 
 (defn- load-level (g:&Game episode:i32 m:i32):(Fallible void)
   (if-some (mp (find-map (ref g 'assets) episode m))
-    (let (l (try (level-load &mp (ref (ref g 'assets) 'flats) (ref (ref g 'assets) 'textures))))
+    (let (a (ref g 'assets)
+          l (try (level-load &mp (ref a 'flats) (ref a 'textures)))
+          fl (try (pm/level-load &mp (ref a 'flats) (ref a 'textures)))
+          o (WorldOptions SK-MEDIUM 0 false false false (array bool true false false false)))
       (set! (g 'camera) (some (camera-new (player &l))))
-      (set! (g 'level) (some l)))
+      (set! (g 'level) (some l))
+      (set! (g 'world) (some (try (world-new fl &mp &o (random-new)))))
+      ; G_DoLoadLevel's sky for the first three episodes.
+      (let (sky (if (<= episode 3) (name-from-episode episode) (name "SKY4")))
+        (set! ((ref g 'renderer) 'sky-texture) (unwrap-or (texture-index (ref a 'textures) sky) 0))))
     (fail "Tried to load invalid map: E" episode "M" m))
   (return (ok)))
 
@@ -98,11 +116,34 @@
       (player-tic (player &ll) &a (ref g 'turn-held))
       (set! (g 'camera) (some (camera-new (player &ll)))))))
 
+(defn- name-from-episode (e:i32):Name
+  (return (cond (= e 1) (name "SKY1") (= e 2) (name "SKY2") true (name "SKY3"))))
+
+(defconst VIEWHEIGHT (* 41 65536))
+
+; The eye at the float player: its position and facing in fixed point, at
+; the view height over the floor beneath it.
+(defn- player-eye (p:&MapObject l:&pm/Level):Eye
+  (let (pos (p 'pos) dir (p 'dir)
+        x (f32-to-i32 (* (pos 'x) 65536.0))
+        y (f32-to-i32 (* (pos 'y) 65536.0))
+        ; Radians to binary angle: 2^31 per half turn.
+        bam (unsafe/cast ui32 (unsafe/cast i64 (* (as f64 (atan2f (dir 'y) (dir 'x))) 683565275.5764316)))
+        floor ((pm/sector-at l ((pm/sub-sector-at l (pm/point-in-sub-sector l x y)) 'sector)) 'floor-height))
+    (return (Eye x y (+ floor VIEWHEIGHT) bam 0 -1))))
+
 (defn- draw-level (g:&Game):(Fallible void)
   (when-some (l (g 'level))
-    (when-some (c (g 'camera))
-      (let (ll l cc c)
-        (render-view (ref g 'view) &ll &cc (ref (ref g 'assets) 'textures) (ref g 'screen)))))
+    (if ((ref g 'cl) 'iron-render)
+      (when-some (c (g 'camera))
+        (let (ll l cc c)
+          (render-view (ref g 'view) &ll &cc (ref (ref g 'assets) 'textures) (ref g 'screen))))
+      (when-some (w (g 'world))
+        (let (ll l a (ref g 'assets)
+              sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats) (ref a 'colormaps)
+                        (ref a 'sprites) (ref w 'sector-things) (ref g 'screen))
+              e (player-eye (player &ll) (ref w 'level)))
+          (try (render-player-view (ref g 'renderer) &sc &e))))))
   (return (ok)))
 
 (defn game-tic (g:&Game):(Fallible void)
