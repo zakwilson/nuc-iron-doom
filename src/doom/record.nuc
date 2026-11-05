@@ -1,0 +1,52 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; Iron Doom has one parser module per map lump, each slicing fixed offsets out
+; of a chunk by hand. `defrecord` generates the struct, its on-disk size and
+; its reader from one field list, so a record's layout is written once.
+
+(ns doom.record)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use nucleus.node)
+(import-use doom.bytes)
+
+(defn read-field (dst:&i16 b:&Bytes o:&usize):void
+  (set! @dst (le-i16 b @o))
+  (set! @o (+ @o 2)))
+
+(defn read-field (dst:&Name b:&Bytes o:&usize):void
+  (set! @dst (name-at b @o))
+  (set! @o (+ @o 8)))
+
+(defprotocol Record
+  (record-size (x:&Self):usize)
+  (read-record (out:&Self b:&Bytes off:usize):void))
+
+; Each field is (name type) with type i16 or Name, in on-disk order.
+(defmacro defrecord (rec :rest fields)
+  (let (size:i64 0)
+    (dotimes (i (ast-len fields))
+      (set! size (+ size (if (= (ast-at (ast-at fields i) 1) 'Name) 8 2))))
+    ; List-form parameters: `out:&~rec` is one atom the template can't reach (ISSUE-002).
+    `(do (defstruct ~rec ~@fields)
+         (defn record-size ((x (ref ~rec))):usize ~(node-int size))
+         (defn read-record ((out (ref ~rec)) b:&Bytes off:usize):void
+           (let (o off)
+             (macmap ((f) `(read-field (ref out '~(ast-at f 0)) b &o)) ~fields)))
+         (extend ~rec Record))))
+
+; Every whole record in `b`; a trailing partial one is ignored, as chunks_exact does.
+(defn read-records (b:&Bytes :where (Record T)):(Vector T)
+  (let (v (make (Vector T))
+        tmp:&T (alloca T)
+        n (/ (count b) (record-size tmp))
+        i:usize 0)
+    (while (< i n)
+      (read-record tmp b (* i (record-size tmp)))
+      (conj &v @tmp)
+      (inc! i))
+    (return v)))

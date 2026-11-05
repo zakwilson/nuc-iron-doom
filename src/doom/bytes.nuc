@@ -1,0 +1,87 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; Little-endian reads over WAD bytes, and the 8-byte lump name. Iron Doom
+; trims each name into an owned String and compares them case-insensitively;
+; here a name is its eight bytes, upper-cased and NUL-padded, packed in a ui64,
+; so comparing or hashing one is a single integer operation.
+
+(ns doom.bytes)
+
+(import-use nucleus.slice)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use nucleus.hash)
+(import-use nucleus.numeric)
+(import-use nucleus.math)
+
+(deftype Bytes (Slice ui8))
+
+(defn byte-at (b:&Bytes i:usize):i32
+  (return (as i32 @(b i))))
+
+(defn le-i16 (b:&Bytes off:usize):i16
+  (return (unsafe/cast i16 (bit-or (byte-at b off) (bit-shl (byte-at b (+ off 1)) 8)))))
+
+(defn le-ui16 (b:&Bytes off:usize):i32
+  (return (bit-or (byte-at b off) (bit-shl (byte-at b (+ off 1)) 8))))
+
+(defn le-i32 (b:&Bytes off:usize):i32
+  (return (bit-or (bit-or (byte-at b off) (bit-shl (byte-at b (+ off 1)) 8))
+                  (bit-or (bit-shl (byte-at b (+ off 2)) 16) (bit-shl (byte-at b (+ off 3)) 24)))))
+
+; The `n` bytes at `off`; dies on a range past the end, as a Rust slice panics.
+(defn sub-bytes (b:&Bytes off:usize n:usize):Bytes
+  (when (> (+ off n) (count b))
+    (slice-bounds (as-checked i64 (+ off n)) (count b)))
+  (return (slice-of (unsafe/cast (ptr ui8) (unsafe/ptr+ (b 'data) (as-checked i64 off))) n)))
+
+(defn rest-bytes (b:&Bytes off:usize):Bytes
+  (return (sub-bytes b off (- (count b) (min off (count b))))))
+
+(defstruct Name v:ui64)
+
+(defn- upper (c:ui64):ui64
+  (return (if (and (>= c 97) (<= c 122)) (- c 32) c)))
+
+; A name ends at its first NUL, as vanilla's strncmp does; Iron Doom trims only
+; NULs, which reads the same for every name a real WAD holds.
+(defn name-from (p:&ui8 n:usize):Name
+  (let (v:ui64 0 i:usize 0 go:bool true)
+    (while (and go (< i (min n 8)))
+      (let (c:ui64 (as ui64 @(unsafe/cast &ui8 (unsafe/ptr+ p (as-checked i64 i)))))
+        (if (= c 0)
+            (set! go false)
+            (do (set! v (bit-or v (bit-shl (upper c) (* 8 (as ui64 i)))))
+                (inc! i)))))
+    (return (Name v))))
+
+(defn name-at (b:&Bytes off:usize):Name
+  (let (s (sub-bytes b off 8))
+    (return (name-from (unsafe/cast &ui8 (s 'data)) 8))))
+
+(defn name (s:StrView):Name
+  (return (name-from (unsafe/cast &ui8 (s 'data)) (s 'len))))
+
+(defn name (s:CStr):Name
+  (return (name (strview-from-cstr s))))
+
+(defn name-byte (n:Name i:usize):ui8
+  (return (unsafe/cast ui8 (bit-and (bit-shr (n 'v) (* 8 (as ui64 i))) 255))))
+
+(extend Name Eq)
+(defn = (a:Name b:Name):bool (return (= (a 'v) (b 'v))))
+(defn != (a:Name b:Name):bool (return (!= (a 'v) (b 'v))))
+
+(extend Name Hash)
+(defn hash (self:&Name):usize
+  (let (v:usize (unsafe/cast usize (self 'v)))
+    (return (hash &v))))
+
+(extend Name ToStr)
+(defn to-str (self:Name out:&String):!void
+  (dotimes (i:usize 8)
+    (let (c (name-byte self i))
+      (when (!= c 0) (string-push-char out (as Char (as ui32 c))))))
+  (return (ok)))
