@@ -1,0 +1,9 @@
+; ISSUE-032: `as` refuses a narrowing and names only `unsafe/cast`, the
+; unchecked escape, though `as-checked` is the checked conversion meant for an
+; index known to fit.
+; fixed-when: output-contains as-checked
+; Actual: "as: lossy conversion from i32 to usize -- use unsafe/cast". The
+; probe passes once the message mentions as-checked.
+
+(defn index-of (x:i32):usize (return (as usize x)))
+(defn main ():i32 (return (as-checked i32 (index-of 3))))

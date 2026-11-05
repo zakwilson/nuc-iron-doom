@@ -1,0 +1,17 @@
+; ISSUE-029: overloads can't be told apart by a pointer's nullability, so a
+; derived writer can't give `?&T` and `&T` fields different code.
+; fixed-when: output-contains 1 2
+; Actual: "duplicate definition of 'f' — the same parameter types are already
+; defined". The registry treats ?&Q and &Q as one type (docs/generics.md says
+; so for conformances), so the second overload is refused.
+
+(import-use "stdio.h")
+
+(defstruct Q a:i32)
+(defn f (x:?&Q):i32 (return 1))
+(defn f (x:&Q):i32 (return 2))
+
+(defn main ():i32
+  (let (q (Q 0) n:?&Q none)
+    (printf "%d %d\n" (f n) (f &q))
+    (return 0)))

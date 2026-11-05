@@ -1,0 +1,313 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom r_things.c, r_segs.c); this port is GPLv3,
+; see COPYING.
+;
+; Sprites and masked middle textures: things are projected as the BSP walk
+; reaches their sectors, then drawn back to front once the walls and planes
+; are down, each clipped by the drawsegs in front of it.
+
+(ns doom.render.things)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.math)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.fixed)
+(import-use doom.info)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.defs)
+(import-use doom.render.state)
+(import-use doom.render.draw)
+(import-use doom.render.sprites)
+(import-use doom.render.segs)
+
+(defn clear-sprites (r:&Renderer sc:&Scene):void
+  (clear! (ref r 'vis-sprites))
+  (set! (r 'valid-count) (+ (r 'valid-count) 1))
+  (let (n (count (ref (sc 'level) 'sectors)))
+    (when (!= (count (ref r 'sector-valid)) n)
+      (clear! (ref r 'sector-valid))
+      (dotimes (i:usize n) (conj (ref r 'sector-valid) 0)))))
+
+; R_ProjectSprite.
+(defn- project-sprite (r:&Renderer sc:&Scene m:&Mobj):void
+  (let (tr-x (wrap-sub (m 'x) (r 'view-x))
+        tr-y (wrap-sub (m 'y) (r 'view-y))
+        tz (wrap-sub (fixed-mul tr-x (r 'view-cos)) (- 0 (fixed-mul tr-y (r 'view-sin)))))
+    ; Behind the view plane.
+    (when (< tz MINZ) (return))
+    (let (xscale (fixed-div (r 'projection) tz)
+          tx (- 0 (wrap-add (fixed-mul tr-y (r 'view-cos)) (- 0 (fixed-mul tr-x (r 'view-sin))))))
+      ; Too far off the side.
+      (when (> (iabs tx) (bit-shl tz 2)) (return))
+      (let (def (sprite-def (sc 'sprites) (m 'sprite))
+            fi (bit-and (m 'frame) FF-FRAMEMASK))
+        (when (>= (as-checked usize fi) (count (ref def 'frames))) (return))
+        (let (fs (view (ref def 'frames)) f (&fs (as-checked usize fi))
+              rot:i64 (if (= (f 'rotate) 1)
+                        (as i64 (bit-shr (+ (- (point-to-angle r (m 'x) (m 'y)) (m 'angle))
+                                            (* (/ ANG45 2) 9))
+                                         29))
+                        0)
+              lump (aref (f 'patch) rot)
+              flip (aref (f 'flip) rot)
+              sp (sprite-patch (sc 'sprites) lump)
+              tx1 (wrap-sub tx (sp 'offset))
+              x1 (bit-shr (wrap-add (r 'center-x-frac) (fixed-mul tx1 xscale)) FRACBITS))
+          (when (> x1 (r 'view-width)) (return))
+          (let (x2 (- (bit-shr (wrap-add (r 'center-x-frac) (fixed-mul (wrap-add tx1 (sp 'width)) xscale)) FRACBITS) 1))
+            (when (< x2 0) (return))
+            ; The 129th sprite goes to vanilla's overflowsprite, never drawn.
+            (when (>= (count (ref r 'vis-sprites)) MAXVISSPRITES) (return))
+            (let (gzt (wrap-add (m 'z) (sp 'top-offset))
+                  vx1 (if (< x1 0) 0 x1)
+                  vx2 (if (>= x2 (r 'view-width)) (- (r 'view-width) 1) x2)
+                  iscale (fixed-div FRACUNIT xscale)
+                  xiscale (if flip (- 0 iscale) iscale)
+                  start (wrap-add (if flip (- (sp 'width) 1) 0)
+                                  (if (> vx1 x1) (wrap-mul xiscale (- vx1 x1)) 0))
+                  colormap (cond (!= (bit-and (m 'flags) MF-SHADOW) 0) -1
+                                 (>= (r 'fixed-colormap) 0) (r 'fixed-colormap)
+                                 (!= (bit-and (m 'frame) FF-FULLBRIGHT) 0) 0
+                                 true (scale-light r (r 'sprite-lights)
+                                                   (min (bit-shr xscale LIGHTSCALESHIFT) (- MAXLIGHTSCALE 1)))))
+              (conj (ref r 'vis-sprites)
+                    (VisSprite vx1 vx2 (m 'x) (m 'y) (m 'z) gzt start xscale xiscale
+                               (wrap-sub gzt (r 'view-z)) lump colormap (m 'flags))))))))))
+
+; R_AddSprites: the things in a sector, once per frame however many of its
+; subsectors are drawn.
+(defn add-sprites (r:&Renderer sc:&Scene sector:usize):void
+  (when (= ((ref r 'sector-valid) sector) (r 'valid-count)) (return))
+  (set (ref r 'sector-valid) sector (r 'valid-count))
+  (let (sec (sector-at (sc 'level) sector)
+        n (+ (bit-shr (sec 'light-level) LIGHTSEGSHIFT) (r 'extra-light)))
+    (set! (r 'sprite-lights) (cond (< n 0) 0 (>= n LIGHTLEVELS) (- LIGHTLEVELS 1) true n))
+    (let (t ((sc 'things) sector))
+      (while-some (m t)
+        (project-sprite r sc m)
+        (set! t (m 'snext))))))
+
+; How a masked column is coloured: through a colormap, a player translation
+; as well, or the fuzz.
+(defstruct Paint colormap:i32 translation:i32)
+
+(defn- draw-run (r:&Renderer sc:&Scene p:&Paint src:&ColSource x:i32 yl:i32 yh:i32
+                 texture-mid:Fixed iscale:Fixed):void
+  (cond (< (p 'colormap) 0) (draw-fuzz-column r (sc 'screen) (sc 'colormaps) x yl yh)
+        (> (p 'translation) 0)
+        (let (tv (view (ref r 'translations))
+              tr (slice-of (unsafe/ptr+ (unsafe/cast &ui8 (tv 'data)) (as i64 (* 256 (- (p 'translation) 1)))) 256))
+          (draw-translated-column r (sc 'screen) (sc 'colormaps) x yl yh texture-mid iscale src (p 'colormap) &tr))
+        true (draw-column r (sc 'screen) (sc 'colormaps) x yl yh texture-mid iscale src (p 'colormap))))
+
+; Where a masked column lands: its texture-mid, scale, iscale and the top of
+; the texture on the screen, and the rows it is clipped to.
+(defstruct MaskedCol x:i32 texture-mid:Fixed scale:Fixed iscale:Fixed top-screen:Fixed
+  floor-clip:i32 ceiling-clip:i32)
+
+; One post of R_DrawMaskedColumn: `len` rows, `top-delta` rows down.
+(defn- draw-post (r:&Renderer sc:&Scene p:&Paint mc:&MaskedCol src:&ColSource top-delta:i32 len:i32):void
+  (let (top (wrap-add (mc 'top-screen) (wrap-mul (mc 'scale) top-delta))
+        bottom (wrap-add top (wrap-mul (mc 'scale) len))
+        yl (bit-shr (wrap-add top (- FRACUNIT 1)) FRACBITS)
+        yh (bit-shr (wrap-sub bottom 1) FRACBITS))
+    (when (>= yh (mc 'floor-clip)) (set! yh (- (mc 'floor-clip) 1)))
+    (when (<= yl (mc 'ceiling-clip)) (set! yl (+ (mc 'ceiling-clip) 1)))
+    (when (<= yl yh)
+      (draw-run r sc p src (mc 'x) yl yh (wrap-sub (mc 'texture-mid) (bit-shl top-delta FRACBITS)) (mc 'iscale)))))
+
+; R_DrawMaskedColumn: each post of a patch column.
+(defn- draw-masked-column (r:&Renderer sc:&Scene p:&Paint mc:&MaskedCol c:&Column):void
+  (let (posts (view (ref c 'posts)))
+    (dotimes (i:usize (count &posts))
+      (let (post (&posts i) d (post 'data) src (ColSource d 0 1 (count &d)))
+        (draw-post r sc p mc &src (unsafe/cast i32 (post 'top-delta)) (as-checked i32 (count &d)))))))
+
+; R_DrawVisSprite.
+(defn- draw-vis-sprite (r:&Renderer sc:&Scene v:&VisSprite):void
+  (let (sp (sprite-patch (sc 'sprites) (v 'patch))
+        pt (ref sp 'patch)
+        paint (Paint (v 'colormap)
+                     (bit-shr (bit-and (v 'mobj-flags) MF-TRANSLATION) MF-TRANSSHIFT))
+        iscale (iabs (v 'x-iscale))
+        top-screen (wrap-sub (r 'center-y-frac) (fixed-mul (v 'texture-mid) (v 'scale)))
+        frac (v 'start-frac)
+        x (v 'x1))
+    (while (<= x (v 'x2))
+      ; Vanilla's range check is compiled out; a stray column is skipped.
+      (let (tc (bit-shr frac FRACBITS))
+        (when (and (>= tc 0) (< (as-checked usize tc) (pt 'width)))
+          (let (mc (MaskedCol x (v 'texture-mid) (v 'scale) iscale top-screen
+                              (as i32 ((ref r 'clip-bot) (as usize x)))
+                              (as i32 ((ref r 'clip-top) (as usize x)))))
+            (draw-masked-column r sc &paint &mc (patch-column pt (as-checked usize tc))))))
+      (set! frac (wrap-add frac (v 'x-iscale)))
+      (inc! x))))
+
+; R_RenderMaskedSegRange: a drawseg's middle texture over columns x1..x2.
+; Each column is drawn once: its entry is set to SHRT_MAX after.
+(defn- render-masked-seg-range (r:&Renderer sc:&Scene ds:&DrawSeg x1:i32 x2:i32):void
+  (let (l (sc 'level) s (seg-at l (ds 'cur-line))
+        front (sector-at l (s 'front-sector))
+        back (sector-at l (unwrap-or (s 'back-sector) (s 'front-sector)))
+        side (side-at l (s 'side))
+        line (line-at l (s 'line))
+        tex (as-checked usize (translated-texture sc (side 'mid-texture)))
+        lights (seg-light r l s front)
+        scale (wrap-add (ds 'scale1) (wrap-mul (- x1 (ds 'x1)) (ds 'scale-step)))
+        mid (wrap-add (if (!= (bit-and (line 'flags) ML-DONTPEGBOTTOM) 0)
+                        (wrap-sub (wrap-add (max (front 'floor-height) (back 'floor-height))
+                                            (texture-height (sc 'textures) tex))
+                                  (r 'view-z))
+                        (wrap-sub (min (front 'ceiling-height) (back 'ceiling-height)) (r 'view-z)))
+                      (side 'row-offset))
+        wt (texture-at (sc 'textures) tex)
+        masked (view (ref wt 'masked))
+        x x1)
+    (while (<= x x2)
+      (let (tc (clip-at r (ds 'masked-texture-col) x))
+        (when (!= tc SHRT-MAX)
+          (let (paint (Paint (if (>= (r 'fixed-colormap) 0)
+                               (r 'fixed-colormap)
+                               (scale-light r lights (min (bit-shr scale LIGHTSCALESHIFT) (- MAXLIGHTSCALE 1))))
+                             0)
+                top-screen (wrap-sub (r 'center-y-frac) (fixed-mul mid scale))
+                iscale (unsafe/cast i32 (/ 0xffffffff (unsafe/cast ui32 scale)))
+                composite (texture-column (sc 'textures) tex tc)
+                mc (MaskedCol x mid scale iscale top-screen
+                              (clip-at r (ds 'spr-bottom-clip) x) (clip-at r (ds 'spr-top-clip) x)))
+            (match @(&masked (composite 'start))
+              ((some c) (draw-masked-column r sc &paint &mc &c))
+              ; Overlapping patches: vanilla reads the composite's pixels as
+              ; post headers. Drawing it as one opaque post keeps it sane.
+              ((none) (draw-post r sc &paint &mc &composite 0 (as-checked i32 (composite 'len)))))
+            (set-clip-at r (ds 'masked-texture-col) x SHRT-MAX))))
+      (set! scale (wrap-add scale (ds 'scale-step)))
+      (inc! x))))
+
+; R_PointOnSegSide.
+(defn- point-on-seg-side (l:&Level x:Fixed y:Fixed s:&Seg):bool
+  (let (v1 (vertex-at l (s 'v1)) v2 (vertex-at l (s 'v2))
+        lx (v1 'x) ly (v1 'y)
+        ldx (wrap-sub (v2 'x) lx) ldy (wrap-sub (v2 'y) ly))
+    (when (= ldx 0) (return (if (<= x lx) (> ldy 0) (< ldy 0))))
+    (when (= ldy 0) (return (if (<= y ly) (< ldx 0) (> ldx 0))))
+    (let (dx (wrap-sub x lx) dy (wrap-sub y ly))
+      (when (!= (bit-and (bit-xor (bit-xor ldy ldx) (bit-xor dx dy)) FIXED-MIN) 0)
+        (return (!= (bit-and (bit-xor ldy dx) FIXED-MIN) 0)))
+      (return (>= (fixed-mul dy (bit-shr ldx FRACBITS)) (fixed-mul (bit-shr ldy FRACBITS) dx))))))
+
+; R_DrawSprite: clip by every drawseg in front of the sprite, nearest last.
+(defn- draw-sprite (r:&Renderer sc:&Scene v:&VisSprite):void
+  (let (bot (ref r 'clip-bot) top (ref r 'clip-top) x (v 'x1))
+    (while (<= x (v 'x2))
+      (set bot (as usize x) (as i16 -2))
+      (set top (as usize x) (as i16 -2))
+      (inc! x))
+    (let (i (count (ref r 'draw-segs)))
+      (while (> i 0)
+        (set! i (- i 1))
+        (let (ds (draw-seg-at r i))
+          (when (not (or (> (ds 'x1) (v 'x2)) (< (ds 'x2) (v 'x1))
+                         (and (= (ds 'silhouette) 0) (clip-ref-none? (ds 'masked-texture-col)))))
+            (let (r1 (max (ds 'x1) (v 'x1)) r2 (min (ds 'x2) (v 'x2))
+                  low (min (ds 'scale1) (ds 'scale2)) high (max (ds 'scale1) (ds 'scale2)))
+              (if (or (< high (v 'scale))
+                      (and (< low (v 'scale))
+                           (not (point-on-seg-side (sc 'level) (v 'gx) (v 'gy) (seg-at (sc 'level) (ds 'cur-line))))))
+                ; The seg is behind the sprite: its middle texture goes first.
+                (when (not (clip-ref-none? (ds 'masked-texture-col)))
+                  (render-masked-seg-range r sc ds r1 r2))
+                (let (sil (ds 'silhouette) x r1)
+                  (when (>= (v 'gz) (ds 'bsil-height)) (set! sil (bit-and sil (bit-not SIL-BOTTOM))))
+                  (when (<= (v 'gzt) (ds 'tsil-height)) (set! sil (bit-and sil (bit-not SIL-TOP))))
+                  (while (<= x r2)
+                    (when (and (!= (bit-and sil SIL-BOTTOM) 0) (= (bot (as usize x)) -2))
+                      (set bot (as usize x) (unsafe/cast i16 (clip-at r (ds 'spr-bottom-clip) x))))
+                    (when (and (!= (bit-and sil SIL-TOP) 0) (= (top (as usize x)) -2))
+                      (set top (as usize x) (unsafe/cast i16 (clip-at r (ds 'spr-top-clip) x))))
+                    (inc! x))))))))))
+  (let (bot (ref r 'clip-bot) top (ref r 'clip-top) x (v 'x1))
+    (while (<= x (v 'x2))
+      (when (= (bot (as usize x)) -2) (set bot (as usize x) (unsafe/cast i16 (r 'view-height))))
+      (when (= (top (as usize x)) -2) (set top (as usize x) (as i16 -1)))
+      (inc! x)))
+  (draw-vis-sprite r sc v))
+
+; R_DrawMasked: the sprites far to near, then the middle textures no sprite
+; drew.
+(defn draw-masked (r:&Renderer sc:&Scene):void
+  ; R_SortVisSprites picks the smallest scale left each time, earliest first
+  ; on a tie: a stable sort.
+  (let (vs (view (ref r 'vis-sprites)) n (count &vs) i:usize 1)
+    (while (< i n)
+      (let (cur @(&vs i) j i)
+        (while (and (> j 0) (> ((&vs (- j 1)) 'scale) (cur 'scale)))
+          (set! @(&vs j) @(&vs (- j 1)))
+          (set! j (- j 1)))
+        (set! @(&vs j) cur))
+      (inc! i))
+    (dotimes (k:usize n) (draw-sprite r sc (&vs k))))
+  (let (i (count (ref r 'draw-segs)))
+    (while (> i 0)
+      (set! i (- i 1))
+      (let (ds (draw-seg-at r i))
+        (when (not (clip-ref-none? (ds 'masked-texture-col)))
+          (render-masked-seg-range r sc ds (ds 'x1) (ds 'x2)))))))
+
+(defconst BASEYCENTER 100)
+
+; R_DrawPSprite: a weapon sprite, unclipped but for the view's edges.
+(defn- draw-psprite (r:&Renderer sc:&Scene p:&Player psp:&PspDef):void
+  (let (st (state-at (psp 'state))
+        def (sprite-def (sc 'sprites) (st 'sprite))
+        fs (view (ref def 'frames))
+        f (&fs (as-checked usize (bit-and (st 'frame) FF-FRAMEMASK)))
+        lump (aref (f 'patch) 0)
+        flip (aref (f 'flip) 0)
+        sp (sprite-patch (sc 'sprites) lump)
+        tx (wrap-sub (wrap-sub (psp 'sx) (* (/ SCREENWIDTH 2) FRACUNIT)) (sp 'offset))
+        x1 (bit-shr (wrap-add (r 'center-x-frac) (fixed-mul tx (r 'pspritescale))) FRACBITS))
+    (when (> x1 (r 'view-width)) (return))
+    (let (x2 (- (bit-shr (wrap-add (r 'center-x-frac) (fixed-mul (wrap-add tx (sp 'width)) (r 'pspritescale)))
+                         FRACBITS)
+                1))
+      (when (< x2 0) (return))
+      (let (vx1 (if (< x1 0) 0 x1)
+            vx2 (if (>= x2 (r 'view-width)) (- (r 'view-width) 1) x2)
+            xiscale (if flip (- 0 (r 'pspriteiscale)) (r 'pspriteiscale))
+            start (wrap-add (if flip (- (sp 'width) 1) 0)
+                            (if (> vx1 x1) (wrap-mul xiscale (- vx1 x1)) 0))
+            invis (aref (p 'powers) (as i64 PW-INVISIBILITY))
+            colormap (cond (or (> invis (* 4 32)) (!= (bit-and invis 8) 0)) -1
+                           (>= (r 'fixed-colormap) 0) (r 'fixed-colormap)
+                           (!= (bit-and (st 'frame) FF-FULLBRIGHT) 0) 0
+                           true (scale-light r (r 'sprite-lights) (- MAXLIGHTSCALE 1)))
+            v (VisSprite vx1 vx2 0 0 0 0 start (r 'pspritescale) xiscale
+                         (wrap-sub (+ (bit-shl BASEYCENTER FRACBITS) (/ FRACUNIT 2))
+                                   (wrap-sub (psp 'sy) (sp 'top-offset)))
+                         lump colormap 0))
+        ; mfloorclip and mceilingclip are the whole view.
+        (let (bot (ref r 'clip-bot) top (ref r 'clip-top) x vx1)
+          (while (<= x vx2)
+            (set bot (as usize x) (unsafe/cast i16 (r 'view-height)))
+            (set top (as usize x) (as i16 -1))
+            (inc! x)))
+        (draw-vis-sprite r sc &v)))))
+
+; R_DrawPlayerSprites: the weapon and its flash, lit by the player's sector.
+(defn draw-player-sprites (r:&Renderer sc:&Scene p:&Player):void
+  (let (l (sc 'level) mo (unwrap (p 'mo))
+        sector (sector-at l ((sub-sector-at l (mo 'sub-sector)) 'sector))
+        n (+ (bit-shr (sector 'light-level) LIGHTSEGSHIFT) (r 'extra-light)))
+    (set! (r 'sprite-lights) (cond (< n 0) 0 (>= n LIGHTLEVELS) (- LIGHTLEVELS 1) true n))
+    (dotimes (i:usize 2)
+      (let (psp (ref (aref (p 'psprites) (as i64 i))))
+        (when (!= (psp 'state) 0) (draw-psprite r sc p psp))))))

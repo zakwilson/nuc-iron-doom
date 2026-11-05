@@ -1,0 +1,55 @@
+(ns tests.sound)
+
+; S_StartSound's decision in the playsim: volume, separation and the
+; M_Random pitch draw, or nothing for a sound out of earshot.
+
+(import-use nucleus.test)
+(import-use nucleus.strview)
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.assets)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.session)
+
+(deftest sounds-decided-in-the-playsim
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (let (s (try (session-new &a (game-mode &a))))
+       (try (session-init-new s &a SK-MEDIUM 1 1))
+       (let (w (session-world s) p (player-at w 0) evs (ref w 'sounds)
+             r0 ((ref w 'random) 'rnd))
+         (clear! evs)
+         ; The listener's own sound: full volume, centred, one M_Random draw.
+         (start-sound w (p 'mo) SFX-PISTOL)
+         (try (check (= (count evs) 1) "the player's sound plays"))
+         (let (v (view evs) ev (&v 0))
+           (try (check (and (= (ev 'volume) 64) (= (ev 'sep) 128)) "full volume, centred"))
+           (try (check (= ((ref w 'random) 'rnd) (+ r0 1)) "one M_Random draw")))
+         ; The item pickup keeps its pitch, so draws nothing.
+         (start-sound w (p 'mo) SFX-ITEMUP)
+         (try (check (= ((ref w 'random) 'rnd) (+ r0 1)) "itemup doesn't draw"))
+         ; A sector more than 1200 units off: neither played nor drawn for.
+         (let (far:?usize none l (ref w 'level) mo (unwrap (p 'mo)) secs (view (ref l 'sectors)))
+           (dotimes (i:usize (count &secs))
+             (let (sec (&secs i)
+                   d (+ (iabs-of (- (sec 'sound-x) (mo 'x))) (iabs-of (- (sec 'sound-y) (mo 'y)))))
+               (when (and (none? far) (> d (* 2400 65536))) (set! far (some i)))))
+           (when-some (fs far)
+             (start-sector-sound w fs SFX-DOROPN)
+             (try (check (= (count evs) 2) "a far sector's door is out of earshot"))
+             (try (check (= ((ref w 'random) 'rnd) (+ r0 1)) "and draws nothing"))))
+         ; Volume 0: a sound from nowhere still draws; chgun is silenced first.
+         (set! ((ref w 'rules) 'sfx-volume) 0)
+         (start-sound w none SFX-SWTCHN)
+         (try (check (= ((ref w 'random) 'rnd) (+ r0 2)) "a sound from nowhere draws at volume 0"))
+         (start-sound w none SFX-CHGUN)
+         (try (check (= ((ref w 'random) 'rnd) (+ r0 2)) "chgun at volume 0 doesn't")))))))
+
+(defn- iabs-of (v:i32):i64 (return (if (< v 0) (- 0 (as i64 v)) (as i64 v))))

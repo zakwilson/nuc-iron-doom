@@ -1,0 +1,332 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; The 3D view (Iron Doom crates/world-view). Subsectors are drawn nearest
+; first; each segment is projected to a run of screen columns, cut against the
+; columns solid walls already cover, and drawn column by column. Floors and
+; ceilings aren't drawn, so they stay black.
+;
+; Iron Doom passes subsectors, segments and fragments between Bevy systems as
+; events. Clipping only touches the occlusion list and drawing only the
+; vertical clip, so here each fragment is drawn as soon as it is cut.
+
+(ns doom.render)
+
+(import-use "math.h")
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use doom.util)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.vec2)
+(import-use doom.level)
+(import-use doom.camera)
+
+(defconst VIEW-WIDTH 320)
+(defconst VIEW-HEIGHT 200)
+; The eye is 41 units above the floor at z = 0.
+(defconst VIEW-Z 41.0)
+(defconst CENTER-Y 100)
+
+(defconst ML-DONTPEGTOP 8)
+(defconst ML-DONTPEGBOTTOM 16)
+
+; A run of screen columns, first and last.
+(defstruct Fragment start:usize end:usize)
+
+(defstruct View
+  ; The column runs solid walls cover, left to right, with gaps between.
+  occlusion:(Vector Fragment)
+  ; Per column, the lowest row a ceiling covers and the highest a floor does.
+  ceiling-clip:(Vector i32)
+  floor-clip:(Vector i32)
+  ; Scratch: the subsector order and one segment's visible fragments.
+  order:(Vector usize)
+  pieces:(Vector Fragment))
+
+(defn view-new ():View
+  (let (v (View (make (Vector Fragment)) (make (Vector i32)) (make (Vector i32))
+                (make (Vector usize)) (make (Vector Fragment))))
+    (dotimes (i:usize VIEW-WIDTH)
+      (conj (ref v 'ceiling-clip) -1)
+      (conj (ref v 'floor-clip) VIEW-HEIGHT))
+    (return v)))
+
+(defn- view-reset (v:&View):void
+  (clear! (ref v 'occlusion))
+  (dotimes (i:usize VIEW-WIDTH)
+    (set (ref v 'ceiling-clip) i -1)
+    (set (ref v 'floor-clip) i VIEW-HEIGHT)))
+
+; --- depth clipping (world-view/src/depth_clipping*) -----------------------------
+
+(defn- occ (v:&View i:usize):Fragment (return ((ref v 'occlusion) i)))
+
+; Iron Doom compares the end with 320, past the last column, so its early-out
+; never fires. 319 is the column it means; covering the screen either way, the
+; clip would return nothing, so the frames are the same.
+(defn- fully-occluded? (v:&View):bool
+  (return (and (= (count (ref v 'occlusion)) 1)
+               (= ((occ v 0) 'start) 0)
+               (= ((occ v 0) 'end) (- VIEW-WIDTH 1)))))
+
+; The first covered run that touches or passes the fragment's start.
+(defn- find-adjacent (v:&View f:Fragment):?usize
+  (dotimes (i:usize (count (ref v 'occlusion)))
+    (when (>= (+ ((occ v i) 'end) 1) (f 'start)) (return (some i))))
+  (return none))
+
+(defn- push-piece (v:&View start:usize end:usize):void
+  (conj (ref v 'pieces) (Fragment start end)))
+
+; The part left of the covered run at `adj`. A solid wall also covers it.
+(defn- clip-right (v:&View f:Fragment adj:usize solid:bool):void
+  (let (a (occ v adj))
+    (when (>= (f 'start) (a 'start)) (return))
+    (when (< (f 'end) (- (a 'start) 1))
+      (when solid (insert (ref v 'occlusion) adj f))
+      (push-piece v (f 'start) (f 'end))
+      (return))
+    (push-piece v (f 'start) (- (a 'start) 1))
+    (when solid (set (ref v 'occlusion) adj (Fragment (f 'start) (a 'end))))))
+
+(defn- remove-runs (v:&View from:usize to:usize):void
+  (let (k from)
+    (while (<= k to)
+      (remove-at (ref v 'occlusion) from)
+      (inc! k))))
+
+; The gaps between covered runs from `adj` rightwards, and what lies past the
+; last run it reaches. A solid wall merges the runs it spans into one.
+(defn- clip-left (v:&View f:Fragment adj:usize solid:bool):void
+  (let (a (occ v adj))
+    (when (<= (f 'end) (a 'end)) (return))
+    (let (n (count (ref v 'occlusion)) next adj i adj going true)
+      (while (and going (< (+ i 1) n))
+        (let (cur (occ v i) nx (occ v (+ i 1)))
+          (if (< (f 'end) (- (nx 'start) 1))
+            (set! going false)
+            (do (set! next (+ i 1))
+                (push-piece v (+ (cur 'end) 1) (- (nx 'start) 1))
+                (when (<= (f 'end) (nx 'end))
+                  (when solid
+                    (set (ref v 'occlusion) adj (Fragment (a 'start) (nx 'end)))
+                    (when (!= next adj) (remove-runs v (+ adj 1) next)))
+                  (return))
+                (inc! i)))))
+      (push-piece v (+ ((occ v next) 'end) 1) (f 'end))
+      (when solid
+        (set (ref v 'occlusion) adj (Fragment (a 'start) (f 'end)))
+        (when (!= next adj) (remove-runs v (+ adj 1) next))))))
+
+; The visible pieces of columns x1..x2 go to `pieces`. A solid segment (a
+; wall, or a closed door) adds them to the covered runs.
+(defn- clip (v:&View x1:usize x2:usize solid:bool):void
+  (clear! (ref v 'pieces))
+  (when (fully-occluded? v) (return))
+  (when (or (< x2 x1) (>= x1 VIEW-WIDTH) (>= x2 VIEW-WIDTH)) (return))
+  (let (f (Fragment x1 x2))
+    (if-some (adj (find-adjacent v f))
+      (do (clip-right v f adj solid)
+          (clip-left v f adj solid))
+      (do (when solid (conj (ref v 'occlusion) f))
+          (push-piece v x1 x2)))))
+
+; --- drawing ----------------------------------------------------------------------
+
+; The vertical position of a texture's top row, relative to the eye.
+(defstruct TexRef tex:usize mid:f32)
+
+(defstruct DrawInfo
+  x1:usize x2:usize v1:Vec2 v2:Vec2
+  world-top:f32 world-bottom:f32 world-high:f32 world-low:f32
+  top:f32 top-step:f32 bottom:f32 bottom-step:f32
+  pix-high:f32 pix-high-step:f32 pix-low:f32 pix-low-step:f32
+  scale1:f32 scale-step:f32 scale2:f32
+  base-offset:f32
+  mark-ceiling:bool mark-floor:bool
+  mid-tex:?TexRef top-tex:?TexRef bottom-tex:?TexRef)
+
+(defn- draw-col (screen:&Buffer i:usize tex-col:usize yl:i32 yh:i32 tex:&WallTexture
+                 tex-mid:f32 inv-scale:f32):void
+  (let (px (ref tex 'pixels) h (height px) y yl)
+    (while (<= y yh)
+      (let (dy (- y CENTER-Y)
+            frac:f32 (+ tex-mid (* (unsafe/cast f32 dy) inv-scale))
+            ty (% (f32-to-usize (truncf frac)) h))
+        (set screen i (as usize y) (px tex-col ty)))
+      (inc! y))))
+
+; Iron Doom unwraps F_SKY1's index here, so a WAD without it panics; none
+; matches no ceiling instead.
+(defn- sky-ceiling? (l:&Level s:&Sector):bool
+  (if-some (k (l 'sky-flat)) (return (= (s 'ceiling-tex) k)) (return false)))
+
+(defn- set-world-bounds (d:&DrawInfo l:&Level front:&Sector back-i:?usize):void
+  (set! (d 'world-top) (- (front 'ceiling-height) VIEW-Z))
+  (set! (d 'world-bottom) (- (front 'floor-height) VIEW-Z))
+  (match back-i
+    ((none) (set! (d 'mark-ceiling) true) (set! (d 'mark-floor) true))
+    ((some bi)
+     (let (back (sector-at l bi))
+       (set! (d 'world-high) (- (back 'ceiling-height) VIEW-Z))
+       (set! (d 'world-low) (- (back 'floor-height) VIEW-Z))
+       ; Two skies side by side: no upper wall, so outdoor areas can change height.
+       (when (and (sky-ceiling? l front) (sky-ceiling? l back)) (set! (d 'world-top) (d 'world-high)))
+       (set! (d 'mark-floor) (or (!= (d 'world-low) (d 'world-bottom))
+                                 (!= (back 'floor-tex) (front 'floor-tex))
+                                 (!= (back 'light-level) (front 'light-level))))
+       (set! (d 'mark-ceiling) (or (!= (d 'world-high) (d 'world-top))
+                                   (!= (back 'ceiling-tex) (front 'ceiling-tex))
+                                   (!= (back 'light-level) (front 'light-level))))
+       ; A closed door.
+       (when (or (<= (back 'ceiling-height) (front 'floor-height))
+                 (>= (back 'floor-height) (front 'ceiling-height)))
+         (set! (d 'mark-ceiling) true)
+         (set! (d 'mark-floor) true))
+       ; A plane on the far side of the eye can't be seen.
+       (when (>= (front 'floor-height) VIEW-Z) (set! (d 'mark-floor) false))
+       (when (and (<= (front 'ceiling-height) VIEW-Z) (not (sky-ceiling? l front)))
+         (set! (d 'mark-ceiling) false))))))
+
+(defn- set-projection (d:&DrawInfo):void
+  (set! (d 'top) (- 100.0 (* (d 'world-top) (d 'scale1))))
+  (set! (d 'top-step) (- 0.0 (* (d 'scale-step) (d 'world-top))))
+  (set! (d 'bottom) (- 100.0 (* (d 'world-bottom) (d 'scale1))))
+  (set! (d 'bottom-step) (- 0.0 (* (d 'scale-step) (d 'world-bottom))))
+  (when (< (d 'world-high) (d 'world-top))
+    (set! (d 'pix-high) (- 100.0 (* (d 'world-high) (d 'scale1))))
+    (set! (d 'pix-high-step) (- 0.0 (* (d 'scale-step) (d 'world-high)))))
+  (when (> (d 'world-low) (d 'world-bottom))
+    (set! (d 'pix-low) (- 100.0 (* (d 'world-low) (d 'scale1))))
+    (set! (d 'pix-low-step) (- 0.0 (* (d 'scale-step) (d 'world-low))))))
+
+(defn- tex-height (tx:&WallTextures i:usize):f32
+  (return (unsafe/cast f32 (height (ref (texture-at tx i) 'pixels)))))
+
+(defn- set-tex (d:&DrawInfo l:&Level tx:&WallTextures line:&Line side:&Side front:&Sector back-i:?usize):void
+  (let (flags (as i32 (line 'flags)))
+    (match back-i
+      ((none)
+       (let (t (side 'middle-texture)
+             mid (if (!= (bit-and flags ML-DONTPEGBOTTOM) 0)
+                   (- (+ (front 'floor-height) (tex-height tx t)) VIEW-Z)
+                   (d 'world-top)))
+         (set! (d 'mid-tex) (some (TexRef t (+ mid (side 'y-offset)))))))
+      ((some bi)
+       (let (back (sector-at l bi))
+         (when (< (d 'world-high) (d 'world-top))
+           (let (t (side 'top-texture)
+                 mid (if (!= (bit-and flags ML-DONTPEGTOP) 0)
+                       (d 'world-top)
+                       (- (+ (back 'ceiling-height) (tex-height tx t)) VIEW-Z)))
+             (set! (d 'top-tex) (some (TexRef t (+ mid (side 'y-offset)))))))
+         (when (> (d 'world-low) (d 'world-bottom))
+           (let (t (side 'lower-texture)
+                 mid (if (!= (bit-and flags ML-DONTPEGBOTTOM) 0) (d 'world-top) (d 'world-low)))
+             (set! (d 'bottom-tex) (some (TexRef t (+ mid (side 'y-offset))))))))))))
+
+(defn- draw-info (l:&Level c:&Camera tx:&WallTextures s:&Segment f:Fragment):DrawInfo
+  (let (d (DrawInfo (f 'start) (f 'end) (viewport-to-world c s (f 'start)) (viewport-to-world c s (f 'end))
+                    0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0
+                    false false none none none)
+        side (side-at l (s 'side))
+        front (sector-at l (s 'front-sector)))
+    (set! (d 'scale1) (find-scale c (d 'v1)))
+    (set! (d 'scale2) (find-scale c (d 'v2)))
+    (when (< (d 'x1) (d 'x2))
+      (set! (d 'scale-step) (/ (- (d 'scale2) (d 'scale1)) (unsafe/cast f32 (- (d 'x2) (d 'x1))))))
+    (set-world-bounds &d l front (s 'back-sector))
+    (set-projection &d)
+    (set! (d 'base-offset)
+          (+ (+ (side 'x-offset) (s 'offset)) (length (- (d 'v1) (world-to-camera c (s 'v1))))))
+    (set-tex &d l tx (line-at l (s 'line)) side front (s 'back-sector))
+    (return d)))
+
+(defn- draw-fragment (v:&View l:&Level c:&Camera tx:&WallTextures s:&Segment f:Fragment screen:&Buffer):void
+  (let (d (draw-info l c tx s f)
+        dx (unsafe/cast f32 (- (d 'x2) (d 'x1)))
+        len (length (- (d 'v2) (d 'v1)))
+        ceil-clip (ref v 'ceiling-clip)
+        floor-clip (ref v 'floor-clip)
+        i (d 'x1))
+    (while (<= i (d 'x2))
+      (let (yl (f32-to-i32 (ceilf (d 'top)))
+            yh (f32-to-i32 (floorf (d 'bottom))))
+        (when (< yl (+ (ceil-clip i) 1)) (set! yl (+ (ceil-clip i) 1)))
+        (when (>= yh (floor-clip i)) (set! yh (- (floor-clip i) 1)))
+        (let (r:f32 (/ (unsafe/cast f32 (- i (d 'x1))) dx)
+              t (/ (* r ((d 'v1) 'y)) (+ (* r ((d 'v1) 'y)) (* (- 1.0 r) ((d 'v2) 'y))))
+              offset (+ (d 'base-offset) (* len t))
+              inv-scale (/ 1.0 (d 'scale1)))
+          (set! (d 'scale1) (+ (d 'scale1) (d 'scale-step)))
+          (set! (d 'top) (+ (d 'top) (d 'top-step)))
+          (set! (d 'bottom) (+ (d 'bottom) (d 'bottom-step)))
+          (if-some (m (d 'mid-tex))
+            (let (tex (texture-at tx (m 'tex)))
+              (draw-col screen i (% (f32-to-usize offset) (width (ref tex 'pixels))) yl yh tex (m 'mid) inv-scale))
+            (do
+              (if-some (tt (d 'top-tex))
+                (let (h (f32-to-i32 (floorf (d 'pix-high))))
+                  (set! (d 'pix-high) (+ (d 'pix-high) (d 'pix-high-step)))
+                  (when (<= (floor-clip i) h) (set! h (- (floor-clip i) 1)))
+                  (if (<= yl h)
+                    (let (tex (texture-at tx (tt 'tex)))
+                      (draw-col screen i (% (f32-to-usize offset) (width (ref tex 'pixels))) yl h tex (tt 'mid) inv-scale)
+                      (set ceil-clip i h))
+                    (set ceil-clip i (- yl 1))))
+                (when (d 'mark-ceiling) (set ceil-clip i (- yl 1))))
+              (if-some (bt (d 'bottom-tex))
+                (let (lo (f32-to-i32 (ceilf (d 'pix-low))))
+                  (set! (d 'pix-low) (+ (d 'pix-low) (d 'pix-low-step)))
+                  (when (<= lo (ceil-clip i)) (set! lo (+ (ceil-clip i) 1)))
+                  (if (<= lo yh)
+                    (let (tex (texture-at tx (bt 'tex)))
+                      (draw-col screen i (% (f32-to-usize offset) (width (ref tex 'pixels))) lo yh tex (bt 'mid) inv-scale)
+                      (set floor-clip i lo))
+                    (set floor-clip i (+ yh 1))))
+                (when (d 'mark-floor) (set floor-clip i (+ yh 1)))))))
+        (inc! i)))))
+
+(defn- draw-pieces (v:&View l:&Level c:&Camera tx:&WallTextures s:&Segment screen:&Buffer):void
+  (let (ps (view (ref v 'pieces)))
+    (dotimes (p:usize (count &ps))
+      (draw-fragment v l c tx s @(&ps p) screen))))
+
+; How a segment cuts the view: none when nothing about it can be seen.
+(defunion ClipKind (solid) (window) (invisible))
+
+(defn- clip-kind (l:&Level s:&Segment):ClipKind
+  (if-some (bi (s 'back-sector))
+    (let (front (sector-at l (s 'front-sector)) back (sector-at l bi))
+      (cond (or (<= (back 'ceiling-height) (front 'floor-height))
+                (>= (back 'floor-height) (front 'ceiling-height)))
+            (return (ClipKind-solid))
+            (or (!= (back 'ceiling-height) (front 'ceiling-height))
+                (!= (back 'floor-height) (front 'floor-height)))
+            (return (ClipKind-window))
+            (and (= (back 'ceiling-tex) (front 'ceiling-tex))
+                 (= (back 'floor-tex) (front 'floor-tex))
+                 (= (back 'light-level) (front 'light-level))
+                 (= ((side-at l (s 'side)) 'middle-texture) 0))
+            (return (ClipKind-invisible))
+            true (return (ClipKind-window))))
+    (return (ClipKind-solid))))
+
+(defn render-view (v:&View l:&Level c:&Camera tx:&WallTextures screen:&Buffer):void
+  (fill screen (as ui8 0))
+  (view-reset v)
+  (sub-sectors-from l (c 'position) (ref v 'order))
+  (let (order (view (ref v 'order)))
+    (dotimes (k:usize (count &order))
+      (let (ss (sub-sector-at l @(&order k)) j:usize 0)
+        (while (and (< j (ss 'num-segs)) (not (fully-occluded? v)))
+          (let (s (segment-at l (+ (ss 'first-seg) j)) x1:usize 0 x2:usize 0)
+            (when (world-to-viewport c s &x1 &x2)
+              (match (clip-kind l s)
+                ((invisible) 0)
+                ((solid) (clip v x1 x2 true) (draw-pieces v l c tx s screen))
+                ((window) (clip v x1 x2 false) (draw-pieces v l c tx s screen)))))
+          (inc! j))))))

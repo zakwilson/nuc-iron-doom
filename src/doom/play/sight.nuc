@@ -1,0 +1,118 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_sight.c); this port is GPLv3, see COPYING.
+;
+; Line of sight: the REJECT table first, then a walk of the BSP along the
+; line between the two, narrowing the visible slopes at each opening.
+
+(ns doom.play.sight)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.fixed)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+
+; P_DivlineSide: 0 front, 1 back, 2 on the line.
+(defn- divline-side (x:Fixed y:Fixed n:&Divline):i32
+  (when (= (n 'dx) 0)
+    (when (= x (n 'x)) (return 2))
+    (return (if (<= x (n 'x)) (if (> (n 'dy) 0) 1 0) (if (< (n 'dy) 0) 1 0))))
+  (when (= (n 'dy) 0)
+    ; Vanilla compares x with the line's y here.
+    (when (= x (n 'y)) (return 2))
+    (return (if (<= y (n 'y)) (if (< (n 'dx) 0) 1 0) (if (> (n 'dx) 0) 1 0))))
+  (let (dx (wrap-sub x (n 'x)) dy (wrap-sub y (n 'y))
+        left (wrap-mul (bit-shr (n 'dy) FRACBITS) (bit-shr dx FRACBITS))
+        right (wrap-mul (bit-shr dy FRACBITS) (bit-shr (n 'dx) FRACBITS)))
+    (return (cond (< right left) 0 (= left right) 2 true 1))))
+
+; P_InterceptVector2.
+(defn- intercept-vector2 (v2:&Divline v1:&Divline):Fixed
+  (let (den (wrap-sub (fixed-mul (bit-shr (v1 'dy) 8) (v2 'dx))
+                      (fixed-mul (bit-shr (v1 'dx) 8) (v2 'dy))))
+    (when (= den 0) (return 0))
+    (return (fixed-div (wrap-add (fixed-mul (bit-shr (wrap-sub (v1 'x) (v2 'x)) 8) (v1 'dy))
+                                 (fixed-mul (bit-shr (wrap-sub (v2 'y) (v1 'y)) 8) (v1 'dx)))
+                       den))))
+
+; P_CrossSubsector: whether sight passes every seg of a subsector it crosses.
+(defn- cross-subsector (w:&World num:usize):bool
+  (let (l (ref w 'level) sc (ref w 'scratch) sub (sub-sector-at l num)
+        st (ref sc 'strace) k:usize 0)
+    (while (< k (sub 'num-lines))
+      (let (seg (seg-at l (+ (sub 'first-line) k))
+            li (seg 'line)
+            line (line-at l li)
+            vc (ref w 'line-valid))
+        (when (!= (vc li) (w 'valid-count))
+          (set vc li (w 'valid-count))
+          (let (v1 (vertex-at l (line 'v1)) v2 (vertex-at l (line 'v2)))
+            (when (!= (divline-side (v1 'x) (v1 'y) st) (divline-side (v2 'x) (v2 'y) st))
+              (let (divl (Divline (v1 'x) (v1 'y) (wrap-sub (v2 'x) (v1 'x)) (wrap-sub (v2 'y) (v1 'y))))
+                (when (!= (divline-side (st 'x) (st 'y) &divl) (divline-side (sc 't2x) (sc 't2y) &divl))
+                  ; An "impassible glass" line has no back sector.
+                  (when (none? (line 'back-sector)) (return false))
+                  (when (= (bit-and (line 'flags) ML-TWOSIDED) 0) (return false))
+                  (let (front (sector-at l (seg 'front-sector))
+                        back (sector-at l (unwrap-or (seg 'back-sector) 0)))
+                    (when (not (and (= (front 'floor-height) (back 'floor-height))
+                                    (= (front 'ceiling-height) (back 'ceiling-height))))
+                      (let (opentop (min (front 'ceiling-height) (back 'ceiling-height))
+                            openbottom (max (front 'floor-height) (back 'floor-height)))
+                        ; A closed door.
+                        (when (>= openbottom opentop) (return false))
+                        (let (frac (intercept-vector2 st &divl))
+                          (when (!= (front 'floor-height) (back 'floor-height))
+                            (let (slope (fixed-div (wrap-sub openbottom (sc 'sight-z-start)) frac))
+                              (when (> slope (sc 'bottom-slope)) (set! (sc 'bottom-slope) slope))))
+                          (when (!= (front 'ceiling-height) (back 'ceiling-height))
+                            (let (slope (fixed-div (wrap-sub opentop (sc 'sight-z-start)) frac))
+                              (when (< slope (sc 'top-slope)) (set! (sc 'top-slope) slope))))
+                          (when (<= (sc 'top-slope) (sc 'bottom-slope)) (return false)))))))))))
+        (inc! k)))
+    (return true)))
+
+(defn- node-divline (n:&Node):Divline (return (Divline (n 'x) (n 'y) (n 'dx) (n 'dy))))
+
+; P_CrossBSPNode.
+(defn- cross-bsp-node (w:&World bspnum:i32):bool
+  (when (!= (bit-and bspnum NF-SUBSECTOR) 0)
+    (return (cross-subsector w (if (= bspnum -1) 0 (as-checked usize (bit-and bspnum (bit-not NF-SUBSECTOR)))))))
+  (let (l (ref w 'level) sc (ref w 'scratch)
+        n (node-at l (as-checked usize bspnum))
+        d (node-divline n)
+        side (divline-side ((sc 'strace) 'x) ((sc 'strace) 'y) &d))
+    ; On the line crosses both sides.
+    (when (= side 2) (set! side 0))
+    (when (not (cross-bsp-node w (aref (n 'children) (as i64 side)))) (return false))
+    (when (= side (divline-side (sc 't2x) (sc 't2y) &d)) (return true))
+    (return (cross-bsp-node w (aref (n 'children) (as i64 (bit-xor side 1)))))))
+
+(defn- sector-index (w:&World m:&Mobj):usize
+  (return ((sub-sector-at (ref w 'level) (m 'sub-sector)) 'sector)))
+
+; P_CheckSight: whether t1 can see any part of t2.
+(defn check-sight (w:&World t1:&Mobj t2:&Mobj):(Fallible bool)
+  (let (l (ref w 'level) sc (ref w 'scratch)
+        s1 (sector-index w t1) s2 (sector-index w t2)
+        pnum (+ (* s1 (count (ref l 'sectors))) s2)
+        reject (ref l 'reject)
+        byte (if (< (bit-shr pnum 3) (count reject)) (as i32 @(reject (bit-shr pnum 3))) 0))
+    ; REJECT says they can't possibly see each other.
+    (when (!= (bit-and byte (bit-shl 1 (unsafe/cast i32 (bit-and pnum 7)))) 0) (return (ok false)))
+    (set! (w 'valid-count) (+ (w 'valid-count) 1))
+    (set! (sc 'sight-z-start) (wrap-sub (wrap-add (t1 'z) (t1 'height)) (bit-shr (t1 'height) 2)))
+    (set! (sc 'top-slope) (wrap-sub (wrap-add (t2 'z) (t2 'height)) (sc 'sight-z-start)))
+    (set! (sc 'bottom-slope) (wrap-sub (t2 'z) (sc 'sight-z-start)))
+    (set! (sc 'strace) (Divline (t1 'x) (t1 'y) (wrap-sub (t2 'x) (t1 'x)) (wrap-sub (t2 'y) (t1 'y))))
+    (set! (sc 't2x) (t2 'x))
+    (set! (sc 't2y) (t2 'y))
+    (let (n (count (ref l 'nodes)))
+      (return (ok (cross-bsp-node w (if (= n 0) -1 (as-checked i32 (- n 1)))))))))

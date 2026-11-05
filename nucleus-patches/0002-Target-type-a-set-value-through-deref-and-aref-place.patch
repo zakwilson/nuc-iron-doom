@@ -1,0 +1,128 @@
+From ac052938b61d367253d353d81ab4ac077b4178e4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 01:54:00 +0000
+Subject: [PATCH] Target-type a set! value through deref and aref places
+ (nuc-iron-doom ISSUE-009)
+
+(set! @p (some 4)) with p:&?i32 died with "some: value must be non-null",
+and (set! @p none) with a type mismatch, though a field place and a named
+local build the arm against the place's type. The deref and aref set!
+paths now emit their value through emit-place-value, which arms the want
+channel and applies union-target-rewrite as the other two paths do.
+
+Test: doom-place-target-types-maybe.
+Gate: 1675 pass, the same 4 suite-build AVR failures; bootstrap PASS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8hzrZakM3KWb32SpqKh
+---
+ design/progress.md   | 15 +++++++++++++++
+ docs/types.md        |  2 +-
+ src/nucleusc.nuc     | 14 ++++++++++++--
+ tests/suite-doom.nuc | 18 ++++++++++++++++++
+ 4 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/design/progress.md b/design/progress.md
+index 875f706..d28a89b 100644
+--- a/design/progress.md
++++ b/design/progress.md
+@@ -5553,3 +5553,18 @@ Test: `doom-macro-struct-as-field-type` in `tests/suite-doom.nuc`,
+ 
+ Gate: 1672 pass, the same 4 suite-build AVR failures. Bootstrap PASS; the
+ compiler's own IR is unchanged.
++
++## DOOM-port fix: `set!` through `deref` and `aref` target-types its value (2026-11-05)
++
++nuc-iron-doom ISSUE-009. `(set! @p (some 4))` with `p:&?i32` died with
++`some: value must be non-null`, and `(set! @p none)` with a type mismatch,
++though a field place and a named local build the arm against the place's
++type. The two `set!` paths over `deref` and `aref` emitted the value bare.
++
++- `emit-place-value` arms the want channel and applies
++  `union-target-rewrite` against the place's element type, as the field and
++  binding paths do; `emit-ptr-set` and the `aref` place both call it.
++
++Test: `doom-place-target-types-maybe` in `tests/suite-doom.nuc`.
++
++Gate: 1675 pass, the same 4 suite-build AVR failures. Bootstrap PASS.
+diff --git a/docs/types.md b/docs/types.md
+index c87cb16..66eb768 100644
+--- a/docs/types.md
++++ b/docs/types.md
+@@ -378,7 +378,7 @@ are the same niche); for a
+ **value** operand (`?i64`, `?SomeStruct`) it stamps the two-arm `{tag, T}` value
+ union from the prelude template. One spelling, two layouts. The value `(Maybe T)` is
+ built with a union literal (`((Maybe i64) some 5)`, `(?i64 some 5)`) / target typing (bare `none` / `(some v)` resolve against a
+-`(Maybe T)` return, typed binding, union-literal field or parameter) and eliminated with `match`
++`(Maybe T)` return, typed binding, union-literal field, parameter, or `set!` place) and eliminated with `match`
+ (`((some v) …)` / `(none …)`), or with `if-some`/`when-some`/`unwrap-or`, which
+ abbreviate that `match`. The pointer relabels (`some`/`none`/`as-ref` where no
+ value `(Maybe T)` is wanted, and `unwrap`) stay pointer-only. `?!T` ≡ `(Maybe (Result T Err))` is the value-Maybe-over-Result
+diff --git a/src/nucleusc.nuc b/src/nucleusc.nuc
+index 1e3dfce..338331d 100644
+--- a/src/nucleusc.nuc
++++ b/src/nucleusc.nuc
+@@ -7844,7 +7844,7 @@
+           (die-at (cc 'line) "set!: (aref a i) place: index must be integer"))
+         (let (idxp:StrView (gep-index-ir idx))
+           (let (elem:?&Type ((p 'type) 'elem)
+-                v:&Val (maybe-box-into-slot (emit-node-at cc 3 scope) elem scope (cc 'line))
++                v:&Val (maybe-box-into-slot (emit-place-value cc 3 elem scope) elem scope (cc 'line))
+                 coerced:ptr (coerce-int-val v elem (cc 'line)))
+             (when (= coerced null)
+               (die-at (cc 'line) "set!: (aref a i) place: value type mismatch"))
+@@ -8323,6 +8323,16 @@
+         (emit-load tmp (type-to-ir elem) (p 'val) elem)
+         (return (alloc-val elem tmp))))))
+ 
++; The value stored by `set!` into a place of type `ty`, emitted as the field and
++; binding places emit theirs: the want channel armed with `ty`, and a bare
++; `(some v)`/`none`/`(ok v)`/`(err e)` built against it (nuc-iron-doom ISSUE-009).
++(defn emit-place-value (call:&Node i:i32 ty:?&Type scope:&Scope):&Val
++  (let (save-want:ptr g-want-type)
++    (set! g-want-type ty)
++    (let (vv:&Val (emit-node-as call i (union-target-rewrite (node-at call i) ty) scope))
++      (set! g-want-type save-want)
++      (return vv))))
++
+ (defn emit-ptr-set (call:&Node scope:&Scope):&Val
+   (let (cc:&Node call)
+     (when (!= (node-len cc) 3) (die-at (cc 'line) "set!: (deref p) place expects a value"))
+@@ -8332,7 +8342,7 @@
+         (die-at (cc 'line) "set!: (deref p) place: operand must be typed pointer"))
+       (require-derefable (p 'type) (cc 'line) "set!")
+       (let (elem:?&Type ((p 'type) 'elem)
+-            v:&Val (maybe-box-into-slot (emit-node-at cc 2 scope) elem scope (cc 'line))
++            v:&Val (maybe-box-into-slot (emit-place-value cc 2 elem scope) elem scope (cc 'line))
+             coerced:ptr (coerce-int-val v elem (cc 'line)))
+         (when (= coerced null)
+           (die-at (cc 'line) "set!: (deref p) place: value type mismatch"))
+diff --git a/tests/suite-doom.nuc b/tests/suite-doom.nuc
+index 5d693bc..3f58c7d 100644
+--- a/tests/suite-doom.nuc
++++ b/tests/suite-doom.nuc
+@@ -707,3 +707,21 @@ missing key :sens for #user/Opt"))
+         ov:StrView (string-as-view &out))
+     (try (check-eq (strview-trim-end &ov) "7 42"))
+     (drop &out)))
++
++; nuc-iron-doom ISSUE-009: a deref or aref place target-types (some v) and none.
++(deftest doom-place-target-types-maybe
++  (let (out:String (try (build-run-source "(import-use \"stdio.h\")
++(defn main ():i32
++  (let (m:?i32 none p:&?i32 &m a:&?i32 (alloca ?i32 2))
++    (set! @p (some 4))
++    (set! (aref a 0) none)
++    (set! (aref a 1) (some 5))
++    (printf \"%d %d\" (unwrap-or m 0) (unwrap-or (aref a 1) 0))
++    (set! @p none)
++    (set! (aref a 1) none)
++    (printf \" %d %d\\n\" (unwrap-or m 0) (unwrap-or (aref a 1) 0)))
++  0)
++"))
++        ov:StrView (string-as-view &out))
++    (try (check-eq (strview-trim-end &ov) "4 5 0 0"))
++    (drop &out)))
+-- 
+2.43.0
+

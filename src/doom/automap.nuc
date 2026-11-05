@@ -1,0 +1,569 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom am_map.c); this port is GPLv3, see COPYING.
+;
+; The automap. Its state outlives levels and games, as am_map.c's statics
+; do; the game layer closes it where vanilla calls AM_Stop.
+
+(ns doom.automap)
+
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.wad)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.input)
+(import-use doom.cheats)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+
+(defconst REDS 176)
+(defconst REDRANGE 16)
+(defconst GRAYS 96)
+(defconst BROWNS 64)
+(defconst YELLOWS 231)
+(defconst GREENS 112)
+(defconst WHITE 209)
+(defconst GRIDCOLORS 104)
+(defconst XHAIRCOLORS GRAYS)
+
+(defconst AM-NUMMARKPOINTS 10)
+(defconst F-PANINC 4)
+; (int)(1.02*FRACUNIT), (int)(FRACUNIT/1.02), (fixed_t)(.2*FRACUNIT) and
+; (int)(0.7*FRACUNIT).
+(defconst M-ZOOMIN 66846)
+(defconst M-ZOOMOUT 64250)
+(defconst INITSCALEMTOF 13107)
+(defconst INITSCALE-DIV 45875)
+(defconst INT-MAX 2147483647)
+
+(defstruct MLine ax:Fixed ay:Fixed bx:Fixed by:Fixed)
+
+; am_map.c's line drawings, worked out from its expressions in C's integer
+; arithmetic: R is 8*PLAYERRADIUS/7.
+(defvar PLAYER-ARROW:(array MLine 7) (array MLine
+  (MLine -1048576 0 1198372 0)
+  (MLine 1198372 0 599186 299593)
+  (MLine 1198372 0 599186 -299593)
+  (MLine -1048576 0 -1348168 299593)
+  (MLine -1048576 0 -1348168 -299593)
+  (MLine -748983 0 -1048576 299593)
+  (MLine -748983 0 -1048576 -299593)))
+
+(defvar CHEAT-PLAYER-ARROW:(array MLine 16) (array MLine
+  (MLine -1048576 0 1198372 0)
+  (MLine 1198372 0 599186 199728)
+  (MLine 1198372 0 599186 -199728)
+  (MLine -1048576 0 -1348168 199728)
+  (MLine -1048576 0 -1348168 -199728)
+  (MLine -748983 0 -1048576 199728)
+  (MLine -748983 0 -1048576 -199728)
+  (MLine -599186 0 -599186 -199728)
+  (MLine -599186 -199728 -399458 -199728)
+  (MLine -399458 -199728 -399458 299593)
+  (MLine -199728 0 -199728 -199728)
+  (MLine -199728 -199728 0 -199728)
+  (MLine 0 -199728 0 299593)
+  (MLine 199728 299593 199728 -171196)
+  (MLine 199728 -171196 237177 -208645)
+  (MLine 237177 -208645 319565 -171196)))
+
+(defvar THIN-TRIANGLE-GUY:(array MLine 3) (array MLine
+  (MLine -32768 -45875 65536 0)
+  (MLine 65536 0 -32768 45875)
+  (MLine -32768 45875 -32768 -45875)))
+
+(defvar THEIR-COLORS:(array i32 4) (array i32 GREENS GRAYS BROWNS REDS))
+
+(defstruct Automap
+  active:bool stopped:bool
+  ; iddt's 0, 1 (all lines) or 2 (things too).
+  cheating:i32 grid:bool follow:bool big:bool
+  ; The window on the screen: the view above the status bar.
+  f-w:i32 f-h:i32
+  ; The window on the map: lower left, upper right and size.
+  m-x:Fixed m-y:Fixed m-x2:Fixed m-y2:Fixed m-w:Fixed m-h:Fixed
+  min-x:Fixed min-y:Fixed max-x:Fixed max-y:Fixed
+  min-scale:Fixed max-scale:Fixed
+  old-x:Fixed old-y:Fixed old-w:Fixed old-h:Fixed
+  ; Where the followed player was, INT-MAX to recentre.
+  old-loc-x:Fixed old-loc-y:Fixed
+  scale-mtof:Fixed scale-ftom:Fixed
+  pan-x:Fixed pan-y:Fixed mtof-zoom:Fixed ftom-zoom:Fixed
+  marks:(array Fixed 20) mark-num:i32
+  last-level:i32 last-episode:i32
+  ; The player the arrow shows.
+  plr:usize
+  amap:CheatSeq
+  marknums:(Vector Patch)
+  ; The "Marked Spot" message, which the player's message points into.
+  mark-text:String)
+
+(defn automap-new ():Automap
+  (return (Automap false true 0 false true false 320 168
+                   0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 INT-MAX 0
+                   INITSCALEMTOF 0 0 0 65536 65536
+                   (array Fixed -1 0 -1 0 -1 0 -1 0 -1 0 -1 0 -1 0 -1 0 -1 0 -1 0) 0
+                   -1 -1 0 (cheat-seq "iddt" 0) (make (Vector Patch)) (make String))))
+
+(defn- ftom (am:&Automap x:i32):Fixed (return (fixed-mul (bit-shl x FRACBITS) (am 'scale-ftom))))
+(defn- mtof (am:&Automap x:Fixed):i32 (return (bit-shr (fixed-mul x (am 'scale-mtof)) FRACBITS)))
+(defn- cxmtof (am:&Automap x:Fixed):i32 (return (mtof am (- x (am 'm-x)))))
+(defn- cymtof (am:&Automap y:Fixed):i32 (return (- (am 'f-h) (mtof am (- y (am 'm-y))))))
+
+(defn- set-corner (am:&Automap):void
+  (set! (am 'm-x2) (+ (am 'm-x) (am 'm-w)))
+  (set! (am 'm-y2) (+ (am 'm-y) (am 'm-h))))
+
+; AM_activateNewScale: about the window's centre.
+(defn- activate-new-scale (am:&Automap):void
+  (set! (am 'm-x) (+ (am 'm-x) (/ (am 'm-w) 2)))
+  (set! (am 'm-y) (+ (am 'm-y) (/ (am 'm-h) 2)))
+  (set! (am 'm-w) (ftom am (am 'f-w)))
+  (set! (am 'm-h) (ftom am (am 'f-h)))
+  (set! (am 'm-x) (- (am 'm-x) (/ (am 'm-w) 2)))
+  (set! (am 'm-y) (- (am 'm-y) (/ (am 'm-h) 2)))
+  (set-corner am))
+
+(defn- save-scale-and-loc (am:&Automap):void
+  (set! (am 'old-x) (am 'm-x))
+  (set! (am 'old-y) (am 'm-y))
+  (set! (am 'old-w) (am 'm-w))
+  (set! (am 'old-h) (am 'm-h)))
+
+(defn- plr-mo (am:&Automap w:&World):&Mobj
+  (return (unwrap ((player-at w (am 'plr)) 'mo))))
+
+(defn- restore-scale-and-loc (am:&Automap w:&World):void
+  (set! (am 'm-w) (am 'old-w))
+  (set! (am 'm-h) (am 'old-h))
+  (if (not (am 'follow))
+    (do (set! (am 'm-x) (am 'old-x))
+        (set! (am 'm-y) (am 'old-y)))
+    (let (mo (plr-mo am w))
+      (set! (am 'm-x) (- (mo 'x) (/ (am 'm-w) 2)))
+      (set! (am 'm-y) (- (mo 'y) (/ (am 'm-h) 2)))))
+  (set-corner am)
+  (set! (am 'scale-mtof) (fixed-div (bit-shl (am 'f-w) FRACBITS) (am 'm-w)))
+  (set! (am 'scale-ftom) (fixed-div FRACUNIT (am 'scale-mtof))))
+
+(defn- add-mark (am:&Automap):void
+  (let (i (as i64 (* 2 (am 'mark-num))))
+    (set! (aref (am 'marks) i) (+ (am 'm-x) (/ (am 'm-w) 2)))
+    (set! (aref (am 'marks) (+ i 1)) (+ (am 'm-y) (/ (am 'm-h) 2))))
+  (set! (am 'mark-num) (% (+ (am 'mark-num) 1) AM-NUMMARKPOINTS)))
+
+; AM_findMinMaxBoundaries, else-ifs and all: the first vertex never sets a maximum.
+(defn- find-min-max-boundaries (am:&Automap l:&Level):void
+  (set! (am 'min-x) INT-MAX)
+  (set! (am 'min-y) INT-MAX)
+  (set! (am 'max-x) (- 0 INT-MAX))
+  (set! (am 'max-y) (- 0 INT-MAX))
+  (let (vs (view (ref l 'vertexes)))
+    (dotimes (i:usize (count &vs))
+      (let (v (&vs i))
+        (cond (< (v 'x) (am 'min-x)) (set! (am 'min-x) (v 'x))
+              (> (v 'x) (am 'max-x)) (set! (am 'max-x) (v 'x))
+              true 0)
+        (cond (< (v 'y) (am 'min-y)) (set! (am 'min-y) (v 'y))
+              (> (v 'y) (am 'max-y)) (set! (am 'max-y) (v 'y))
+              true 0))))
+  (let (a (fixed-div (bit-shl (am 'f-w) FRACBITS) (- (am 'max-x) (am 'min-x)))
+        b (fixed-div (bit-shl (am 'f-h) FRACBITS) (- (am 'max-y) (am 'min-y))))
+    (set! (am 'min-scale) (if (< a b) a b))
+    (set! (am 'max-scale) (fixed-div (bit-shl (am 'f-h) FRACBITS) (* 2 PLAYERRADIUS)))))
+
+(defn- change-window-loc (am:&Automap):void
+  (when (or (!= (am 'pan-x) 0) (!= (am 'pan-y) 0))
+    (set! (am 'follow) false)
+    (set! (am 'old-loc-x) INT-MAX))
+  (set! (am 'm-x) (+ (am 'm-x) (am 'pan-x)))
+  (set! (am 'm-y) (+ (am 'm-y) (am 'pan-y)))
+  (cond (> (+ (am 'm-x) (/ (am 'm-w) 2)) (am 'max-x)) (set! (am 'm-x) (- (am 'max-x) (/ (am 'm-w) 2)))
+        (< (+ (am 'm-x) (/ (am 'm-w) 2)) (am 'min-x)) (set! (am 'm-x) (- (am 'min-x) (/ (am 'm-w) 2)))
+        true 0)
+  (cond (> (+ (am 'm-y) (/ (am 'm-h) 2)) (am 'max-y)) (set! (am 'm-y) (- (am 'max-y) (/ (am 'm-h) 2)))
+        (< (+ (am 'm-y) (/ (am 'm-h) 2)) (am 'min-y)) (set! (am 'm-y) (- (am 'min-y) (/ (am 'm-h) 2)))
+        true 0)
+  (set-corner am))
+
+(defn- init-variables (am:&Automap w:&World):void
+  (set! (am 'active) true)
+  (set! (am 'old-loc-x) INT-MAX)
+  (set! (am 'pan-x) 0)
+  (set! (am 'pan-y) 0)
+  (set! (am 'ftom-zoom) FRACUNIT)
+  (set! (am 'mtof-zoom) FRACUNIT)
+  (set! (am 'm-w) (ftom am (am 'f-w)))
+  (set! (am 'm-h) (ftom am (am 'f-h)))
+  (let (cp (as-checked usize ((ref w 'rules) 'console-player)) in-game (ref w 'player-in-game))
+    (set! (am 'plr) 0)
+    (if (in-game cp)
+      (set! (am 'plr) cp)
+      (let (done false)
+        (dotimes (i:usize MAXPLAYERS)
+          (when (and (not done) (in-game i)) (set! (am 'plr) i) (set! done true))))))
+  (let (mo (plr-mo am w))
+    (set! (am 'm-x) (- (mo 'x) (/ (am 'm-w) 2)))
+    (set! (am 'm-y) (- (mo 'y) (/ (am 'm-h) 2))))
+  (change-window-loc am)
+  (save-scale-and-loc am))
+
+(defn- clear-marks (am:&Automap):void
+  (dotimes (i:i64 AM-NUMMARKPOINTS) (set! (aref (am 'marks) (* 2 i)) -1))
+  (set! (am 'mark-num) 0))
+
+(defn- level-init (am:&Automap l:&Level):void
+  (set! (am 'f-w) 320)
+  (set! (am 'f-h) 168)
+  (clear-marks am)
+  (find-min-max-boundaries am l)
+  (set! (am 'scale-mtof) (fixed-div (am 'min-scale) INITSCALE-DIV))
+  (when (> (am 'scale-mtof) (am 'max-scale)) (set! (am 'scale-mtof) (am 'min-scale)))
+  (set! (am 'scale-ftom) (fixed-div FRACUNIT (am 'scale-mtof))))
+
+; AM_Stop.
+(defn automap-stop (am:&Automap):void
+  (set! (am 'active) false)
+  (set! (am 'stopped) true))
+
+; AM_Start, with AM_loadPics's mark numbers loaded once.
+(defn- start (am:&Automap w:&World wad:&Wad):(Fallible void)
+  (when (not (am 'stopped)) (automap-stop am))
+  (set! (am 'stopped) false)
+  (let (r (ref w 'rules))
+    (when (or (!= (am 'last-level) (r 'map)) (!= (am 'last-episode) (r 'episode)))
+      (level-init am (ref w 'level))
+      (set! (am 'last-level) (r 'map))
+      (set! (am 'last-episode) (r 'episode))))
+  (init-variables am w)
+  (when (= (count (ref am 'marknums)) 0)
+    (dotimes (i:i32 10)
+      (let (n (str "AMMNUM" i))
+        (conj (ref am 'marknums) (try (lump-patch wad (string-as-view &n)))))))
+  (return (ok)))
+
+(defn- min-out-window-scale (am:&Automap):void
+  (set! (am 'scale-mtof) (am 'min-scale))
+  (set! (am 'scale-ftom) (fixed-div FRACUNIT (am 'scale-mtof)))
+  (activate-new-scale am))
+
+(defn- max-out-window-scale (am:&Automap):void
+  (set! (am 'scale-mtof) (am 'max-scale))
+  (set! (am 'scale-ftom) (fixed-div FRACUNIT (am 'scale-mtof)))
+  (activate-new-scale am))
+
+(defn- message (am:&Automap w:&World text:CStr):void
+  (set! ((player-at w (am 'plr)) 'message) (some text)))
+
+; A pan key: while following the player, it is the player's to move with.
+(defn- pan (am:&Automap x:Fixed y:Fixed):bool
+  (when (am 'follow) (return false))
+  (when (!= x 0) (set! (am 'pan-x) x))
+  (when (!= y 0) (set! (am 'pan-y) y))
+  (return true))
+
+(defn- keydown (am:&Automap w:&World key:i32):bool
+  (let (step (ftom am F-PANINC))
+    (cond (= key KEY-RIGHTARROW) (return (pan am step 0))
+          (= key KEY-LEFTARROW) (return (pan am (- 0 step) 0))
+          (= key KEY-UPARROW) (return (pan am 0 step))
+          (= key KEY-DOWNARROW) (return (pan am 0 (- 0 step)))
+          (= key 45) (do (set! (am 'mtof-zoom) M-ZOOMOUT) (set! (am 'ftom-zoom) M-ZOOMIN))
+          (= key 61) (do (set! (am 'mtof-zoom) M-ZOOMIN) (set! (am 'ftom-zoom) M-ZOOMOUT))
+          (= key KEY-TAB) (do (set! (am 'big) false) (automap-stop am))
+          (= key 48) (do (set! (am 'big) (not (am 'big)))
+                         (if (am 'big)
+                           (do (save-scale-and-loc am) (min-out-window-scale am))
+                           (restore-scale-and-loc am w)))
+          (= key 102) (do (set! (am 'follow) (not (am 'follow)))
+                          (set! (am 'old-loc-x) INT-MAX)
+                          (message am w (if (am 'follow) "Follow Mode ON" "Follow Mode OFF")))
+          (= key 103) (do (set! (am 'grid) (not (am 'grid)))
+                          (message am w (if (am 'grid) "Grid ON" "Grid OFF")))
+          (= key 109) (let (s (ref am 'mark-text))
+                        (clear! s)
+                        (str-into s "Marked Spot " (am 'mark-num))
+                        (message am w (string-as-cstr s))
+                        (add-mark am))
+          (= key 99) (do (clear-marks am) (message am w "All Marks Cleared"))
+          true (return false)))
+  (return true))
+
+; AM_Responder: true when the automap takes the key.
+(defn automap-responder (am:&Automap w:&World wad:&Wad ev:&Event):(Fallible bool)
+  (when (not (am 'active))
+    (when (and (= (ev 'type) EV-KEYDOWN) (= (ev 'key) KEY-TAB))
+      (try (start am w wad))
+      (return (ok true)))
+    (return (ok false)))
+  (when (= (ev 'type) EV-KEYDOWN)
+    (let (rc (keydown am w (ev 'key)))
+      ; v1.9 refuses iddt in deathmatch.
+      (when (and (= ((ref w 'rules) 'deathmatch) 0) (cheat-check (ref am 'amap) (ev 'ch)))
+        (set! rc false)
+        (set! (am 'cheating) (% (+ (am 'cheating) 1) 3)))
+      (return (ok rc))))
+  (when (= (ev 'type) EV-KEYUP)
+    (let (key (ev 'key))
+      (cond (or (= key KEY-RIGHTARROW) (= key KEY-LEFTARROW))
+            (when (not (am 'follow)) (set! (am 'pan-x) 0))
+            (or (= key KEY-UPARROW) (= key KEY-DOWNARROW))
+            (when (not (am 'follow)) (set! (am 'pan-y) 0))
+            (or (= key 45) (= key 61))
+            (do (set! (am 'mtof-zoom) FRACUNIT) (set! (am 'ftom-zoom) FRACUNIT))
+            true 0)))
+  (return (ok false)))
+
+; Whether the arrow keys are the automap's: build-ticcmd leaves them alone.
+(defn automap-panning? (am:&Automap):bool
+  (return (and (am 'active) (not (am 'follow)))))
+
+(defn- change-window-scale (am:&Automap):void
+  (set! (am 'scale-mtof) (fixed-mul (am 'scale-mtof) (am 'mtof-zoom)))
+  (set! (am 'scale-ftom) (fixed-div FRACUNIT (am 'scale-mtof)))
+  (cond (< (am 'scale-mtof) (am 'min-scale)) (min-out-window-scale am)
+        (> (am 'scale-mtof) (am 'max-scale)) (max-out-window-scale am)
+        true (activate-new-scale am)))
+
+(defn- follow-player (am:&Automap w:&World):void
+  (let (mo (plr-mo am w))
+    (when (or (!= (am 'old-loc-x) (mo 'x)) (!= (am 'old-loc-y) (mo 'y)))
+      (set! (am 'm-x) (- (ftom am (mtof am (mo 'x))) (/ (am 'm-w) 2)))
+      (set! (am 'm-y) (- (ftom am (mtof am (mo 'y))) (/ (am 'm-h) 2)))
+      (set-corner am)
+      (set! (am 'old-loc-x) (mo 'x))
+      (set! (am 'old-loc-y) (mo 'y)))))
+
+; AM_Ticker. Vanilla's light-level strobe is commented out, so lightlev stays 0.
+(defn automap-ticker (am:&Automap w:&World):void
+  (when (not (am 'active)) (return))
+  (when (am 'follow) (follow-player am w))
+  (when (!= (am 'ftom-zoom) FRACUNIT) (change-window-scale am))
+  (when (or (!= (am 'pan-x) 0) (!= (am 'pan-y) 0)) (change-window-loc am)))
+
+; --- drawing -------------------------------------------------------------------
+
+(defconst LEFT 1)
+(defconst RIGHT 2)
+(defconst BOTTOM 4)
+(defconst TOP 8)
+
+(defstruct FLine ax:i32 ay:i32 bx:i32 by:i32)
+
+(defn- outcode (am:&Automap x:i32 y:i32):i32
+  (let (oc 0)
+    (cond (< y 0) (set! oc TOP) (>= y (am 'f-h)) (set! oc BOTTOM) true 0)
+    (cond (< x 0) (set! oc (bit-or oc LEFT)) (>= x (am 'f-w)) (set! oc (bit-or oc RIGHT)) true 0)
+    (return oc)))
+
+; AM_clipMline: Cohen-Sutherland. The products wrap where vanilla's would.
+(defn- clip (am:&Automap ml:&MLine fl:&FLine):bool
+  (let (oc1 0 oc2 0)
+    (cond (> (ml 'ay) (am 'm-y2)) (set! oc1 TOP) (< (ml 'ay) (am 'm-y)) (set! oc1 BOTTOM) true 0)
+    (cond (> (ml 'by) (am 'm-y2)) (set! oc2 TOP) (< (ml 'by) (am 'm-y)) (set! oc2 BOTTOM) true 0)
+    (when (!= (bit-and oc1 oc2) 0) (return false))
+    (cond (< (ml 'ax) (am 'm-x)) (set! oc1 (bit-or oc1 LEFT))
+          (> (ml 'ax) (am 'm-x2)) (set! oc1 (bit-or oc1 RIGHT)) true 0)
+    (cond (< (ml 'bx) (am 'm-x)) (set! oc2 (bit-or oc2 LEFT))
+          (> (ml 'bx) (am 'm-x2)) (set! oc2 (bit-or oc2 RIGHT)) true 0)
+    (when (!= (bit-and oc1 oc2) 0) (return false))
+    (set! (fl 'ax) (cxmtof am (ml 'ax)))
+    (set! (fl 'ay) (cymtof am (ml 'ay)))
+    (set! (fl 'bx) (cxmtof am (ml 'bx)))
+    (set! (fl 'by) (cymtof am (ml 'by)))
+    (set! oc1 (outcode am (fl 'ax) (fl 'ay)))
+    (set! oc2 (outcode am (fl 'bx) (fl 'by)))
+    (when (!= (bit-and oc1 oc2) 0) (return false))
+    (while (!= (bit-or oc1 oc2) 0)
+      (let (outside (if (!= oc1 0) oc1 oc2) tx 0 ty 0
+            fw (am 'f-w) fh (am 'f-h))
+        (cond (!= (bit-and outside TOP) 0)
+              (let (dy (- (fl 'ay) (fl 'by)) dx (- (fl 'bx) (fl 'ax)))
+                (set! tx (+ (fl 'ax) (/ (wrap-mul dx (fl 'ay)) dy)))
+                (set! ty 0))
+              (!= (bit-and outside BOTTOM) 0)
+              (let (dy (- (fl 'ay) (fl 'by)) dx (- (fl 'bx) (fl 'ax)))
+                (set! tx (+ (fl 'ax) (/ (wrap-mul dx (- (fl 'ay) fh)) dy)))
+                (set! ty (- fh 1)))
+              (!= (bit-and outside RIGHT) 0)
+              (let (dy (- (fl 'by) (fl 'ay)) dx (- (fl 'bx) (fl 'ax)))
+                (set! ty (+ (fl 'ay) (/ (wrap-mul dy (- (- fw 1) (fl 'ax))) dx)))
+                (set! tx (- fw 1)))
+              (!= (bit-and outside LEFT) 0)
+              (let (dy (- (fl 'by) (fl 'ay)) dx (- (fl 'bx) (fl 'ax)))
+                (set! ty (+ (fl 'ay) (/ (wrap-mul dy (- 0 (fl 'ax))) dx)))
+                (set! tx 0))
+              true 0)
+        (if (= outside oc1)
+          (do (set! (fl 'ax) tx) (set! (fl 'ay) ty)
+              (set! oc1 (outcode am tx ty)))
+          (do (set! (fl 'bx) tx) (set! (fl 'by) ty)
+              (set! oc2 (outcode am tx ty))))
+        (when (!= (bit-and oc1 oc2) 0) (return false))))
+    (return true)))
+
+(defn- iabs2 (v:i32):i32 (return (* 2 (if (< v 0) (- 0 v) v))))
+
+; AM_drawFline: Bresenham. A line still off the window is dropped, as
+; vanilla's debugging check does.
+(defn- draw-fline (am:&Automap buf:&Buffer fl:&FLine color:ui8):void
+  (let (fw (am 'f-w) fh (am 'f-h))
+    (when (or (< (fl 'ax) 0) (>= (fl 'ax) fw) (< (fl 'ay) 0) (>= (fl 'ay) fh)
+              (< (fl 'bx) 0) (>= (fl 'bx) fw) (< (fl 'by) 0) (>= (fl 'by) fh))
+      (return)))
+  (let (dx (- (fl 'bx) (fl 'ax)) ax (iabs2 dx) sx (if (< dx 0) -1 1)
+        dy (- (fl 'by) (fl 'ay)) ay (iabs2 dy) sy (if (< dy 0) -1 1)
+        x (fl 'ax) y (fl 'ay))
+    (if (> ax ay)
+      (let (d (- ay (/ ax 2)))
+        (while true
+          (set buf (as-checked usize x) (as-checked usize y) color)
+          (when (= x (fl 'bx)) (return))
+          (when (>= d 0) (set! y (+ y sy)) (set! d (- d ax)))
+          (set! x (+ x sx))
+          (set! d (+ d ay))))
+      (let (d (- ax (/ ay 2)))
+        (while true
+          (set buf (as-checked usize x) (as-checked usize y) color)
+          (when (= y (fl 'by)) (return))
+          (when (>= d 0) (set! x (+ x sx)) (set! d (- d ay)))
+          (set! y (+ y sy))
+          (set! d (+ d ax)))))))
+
+(defn- draw-mline (am:&Automap buf:&Buffer ml:&MLine color:i32):void
+  (let (fl (FLine 0 0 0 0))
+    (when (clip am ml &fl) (draw-fline am buf &fl (unsafe/cast ui8 color)))))
+
+; AM_drawGrid: the blockmap's cells.
+(defn- draw-grid (am:&Automap l:&Level buf:&Buffer color:i32):void
+  (let (unit (bit-shl MAPBLOCKUNITS FRACBITS)
+        start (am 'm-x) end (+ (am 'm-x) (am 'm-w))
+        ml (MLine 0 (am 'm-y) 0 (+ (am 'm-y) (am 'm-h))))
+    (when (!= (% (- start (l 'bmap-org-x)) unit) 0)
+      (set! start (- (+ start unit) (% (- start (l 'bmap-org-x)) unit))))
+    (let (x start)
+      (while (< x end)
+        (set! (ml 'ax) x)
+        (set! (ml 'bx) x)
+        (draw-mline am buf &ml color)
+        (set! x (+ x unit))))
+    (set! start (am 'm-y))
+    (set! end (+ (am 'm-y) (am 'm-h)))
+    (when (!= (% (- start (l 'bmap-org-y)) unit) 0)
+      (set! start (- (+ start unit) (% (- start (l 'bmap-org-y)) unit))))
+    (set! (ml 'ax) (am 'm-x))
+    (set! (ml 'bx) (+ (am 'm-x) (am 'm-w)))
+    (let (y start)
+      (while (< y end)
+        (set! (ml 'ay) y)
+        (set! (ml 'by) y)
+        (draw-mline am buf &ml color)
+        (set! y (+ y unit))))))
+
+; AM_drawWalls: the lines seen, coloured by what changes across them.
+(defn- draw-walls (am:&Automap w:&World buf:&Buffer):void
+  (let (l (ref w 'level) lines (view (ref l 'lines)) cheating (!= (am 'cheating) 0)
+        allmap (!= (aref ((player-at w (am 'plr)) 'powers) (as i64 PW-ALLMAP)) 0))
+    (dotimes (i:usize (count &lines))
+      (let (ln (&lines i) v1 (vertex-at l (ln 'v1)) v2 (vertex-at l (ln 'v2))
+            ml (MLine (v1 'x) (v1 'y) (v2 'x) (v2 'y))
+            flags (ln 'flags))
+        (cond (or cheating (!= (bit-and flags ML-MAPPED) 0))
+              (when (or cheating (= (bit-and flags ML-DONTDRAW) 0))
+                (match (ln 'back-sector)
+                  ((none) (draw-mline am buf &ml REDS))
+                  ((some bi)
+                   (let (back (sector-at l bi) front (sector-at l (match (ln 'front-sector) ((some f) f) ((none) 0))))
+                     (cond (= (ln 'special) 39) (draw-mline am buf &ml (+ REDS (/ REDRANGE 2)))
+                           (!= (bit-and flags ML-SECRET) 0) (draw-mline am buf &ml REDS)
+                           (!= (back 'floor-height) (front 'floor-height)) (draw-mline am buf &ml BROWNS)
+                           (!= (back 'ceiling-height) (front 'ceiling-height)) (draw-mline am buf &ml YELLOWS)
+                           cheating (draw-mline am buf &ml GRAYS)
+                           true 0)))))
+              allmap
+              (when (= (bit-and flags ML-DONTDRAW) 0) (draw-mline am buf &ml (+ GRAYS 3)))
+              true 0)))))
+
+(defn- rotate (x:&Fixed y:&Fixed a:Angle):void
+  (let (i (fine-index a)
+        tx (- (fixed-mul @x (finecosine i)) (fixed-mul @y (finesine i))))
+    (set! @y (+ (fixed-mul @x (finesine i)) (fixed-mul @y (finecosine i))))
+    (set! @x tx)))
+
+(defn- draw-line-character (am:&Automap buf:&Buffer guy:(Slice MLine) scale:Fixed angle:Angle
+                            color:i32 x:Fixed y:Fixed):void
+  (dotimes (i:usize (count &guy))
+    (let (g (&guy i) ax (g 'ax) ay (g 'ay) bx (g 'bx) by (g 'by))
+      (when (!= scale 0)
+        (set! ax (fixed-mul scale ax)) (set! ay (fixed-mul scale ay))
+        (set! bx (fixed-mul scale bx)) (set! by (fixed-mul scale by)))
+      (when (!= angle 0)
+        (rotate &ax &ay angle)
+        (rotate &bx &by angle))
+      (let (ml (MLine (+ ax x) (+ ay y) (+ bx x) (+ by y)))
+        (draw-mline am buf &ml color)))))
+
+(defn- player-arrow ():(Slice MLine) (return (slice-of PLAYER-ARROW 7)))
+
+(defn- draw-players (am:&Automap w:&World buf:&Buffer):void
+  (let (r (ref w 'rules))
+    (when (not (r 'netgame))
+      (let (mo (plr-mo am w))
+        (draw-line-character am buf
+                             (if (!= (am 'cheating) 0) (slice-of CHEAT-PLAYER-ARROW 16) (player-arrow))
+                             0 (mo 'angle) WHITE (mo 'x) (mo 'y)))
+      (return))
+    (dotimes (i:usize MAXPLAYERS)
+      (let (p (player-at w i))
+        (when (and (or (= (r 'deathmatch) 0) (= i (am 'plr))) ((ref w 'player-in-game) i))
+          (let (mo (unwrap (p 'mo))
+                color (if (!= (aref (p 'powers) (as i64 PW-INVISIBILITY)) 0) 246
+                        (aref THEIR-COLORS (as i64 i))))
+            (draw-line-character am buf (player-arrow) 0 (mo 'angle) color (mo 'x) (mo 'y))))))))
+
+(defn- draw-things (am:&Automap w:&World buf:&Buffer):void
+  (let (heads (view (ref w 'sector-things)))
+    (dotimes (i:usize (count &heads))
+      (let (t @(&heads i))
+        (while-some (m t)
+          (draw-line-character am buf (slice-of THIN-TRIANGLE-GUY 3) (bit-shl 16 FRACBITS)
+                               (m 'angle) GREENS (m 'x) (m 'y))
+          (set! t (m 'snext)))))))
+
+; AM_drawMarks: vanilla takes each number as 5x6, whatever its patch says.
+(defn- draw-marks (am:&Automap buf:&Buffer):(Fallible void)
+  (let (nums (view (ref am 'marknums)))
+    (dotimes (i:i64 AM-NUMMARKPOINTS)
+      (let (mx (aref (am 'marks) (* 2 i)))
+        (when (!= mx -1)
+          (let (fx (cxmtof am mx) fy (cymtof am (aref (am 'marks) (+ (* 2 i) 1))))
+            (when (and (>= fx 0) (<= fx (- (am 'f-w) 5)) (>= fy 0) (<= fy (- (am 'f-h) 6)))
+              (try (draw-patch buf (as-checked usize fx) (as-checked usize fy)
+                               (&nums (as-checked usize i))))))))))
+  (return (ok)))
+
+; AM_Drawer, over the view's part of the screen.
+(defn automap-drawer (am:&Automap w:&World buf:&Buffer):(Fallible void)
+  (when (not (am 'active)) (return (ok)))
+  (dotimes (y:usize (as-checked usize (am 'f-h)))
+    (dotimes (x:usize (as-checked usize (am 'f-w)))
+      (set buf x y (as ui8 0))))
+  (when (am 'grid) (draw-grid am (ref w 'level) buf GRIDCOLORS))
+  (draw-walls am w buf)
+  (draw-players am w buf)
+  (when (= (am 'cheating) 2) (draw-things am w buf))
+  ; AM_drawCrosshair: fb[(f_w*(f_h+1))/2].
+  (let (c (/ (* (am 'f-w) (+ (am 'f-h) 1)) 2))
+    (set buf (as-checked usize (% c (am 'f-w))) (as-checked usize (/ c (am 'f-w))) (as ui8 XHAIRCOLORS)))
+  (try (draw-marks am buf))
+  (return (ok)))

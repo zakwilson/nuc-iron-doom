@@ -1,0 +1,65 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; The screen melt between scenes (Iron Doom crates/screen-melt; Chocolate Doom
+; f_wipe.c). Columns move in pairs, each pair after its own random delay.
+
+(ns doom.melt)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use doom.util)
+(import-use doom.buffer)
+(import-use doom.rand)
+
+(defconst MELT-HEIGHT 200)
+
+; `position` splits the column: above it, the new screen; from it down, the old
+; screen shifted down by `position`.
+(defstruct MeltColumn num:usize position:usize wait:ui8 done:bool)
+
+(defstruct Melt start:Buffer end:Buffer columns:(Vector MeltColumn))
+
+(defn melt-new (start:Buffer end:Buffer r:&Rand):Melt
+  (let (cols (make (Vector MeltColumn)))
+    (next-u8 r)
+    (let (wait (% (next-u8 r) 16))
+      (conj &cols (MeltColumn 0 0 wait false))
+      (conj &cols (MeltColumn 1 0 wait false))
+      (let (i:usize 2)
+        (while (< i 320)
+          ; -1, 0 or 1.
+          (let (step (- 1 (% (next-i32 r) 3)))
+            (set! wait (cond (and (< step 0) (= wait 0)) 0
+                             true (unsafe/cast ui8 (+ (as i32 wait) step))))
+            ; Limit the difference between neighbouring pairs.
+            (when (> wait 15) (set! wait 15)))
+          (conj &cols (MeltColumn i 0 wait false))
+          (conj &cols (MeltColumn (+ i 1) 0 wait false))
+          (set! i (+ i 2)))))
+    (return (Melt start end cols))))
+
+; One tic. True when no column moved, which ends the melt. Iron Doom's test,
+; kept: vanilla also counts a column still waiting as unfinished.
+(defn melt-tic (m:&Melt screen:&Buffer):bool
+  (let (cols (view (ref m 'columns)) done true)
+    (dotimes (k:usize (count &cols))
+      (let (c (&cols k))
+        (when (not (c 'done))
+          (if (> (c 'wait) 0)
+            (set! (c 'wait) (- (c 'wait) 1))
+            (let (pos (c 'position)
+                  dy (if (< pos 16) (+ pos 1) 8))
+              (when (>= (+ pos dy) MELT-HEIGHT) (set! dy (- MELT-HEIGHT pos)))
+              (set! (c 'position) (+ pos dy))
+              (set! done false)
+              (let (np (c 'position) x (c 'num) y pos)
+                (while (< y MELT-HEIGHT)
+                  (set screen x y (if (< y np)
+                                    ((ref m 'end) x y)
+                                    ((ref m 'start) x (- y np))))
+                  (inc! y)))
+              (when (= (c 'position) MELT-HEIGHT) (set! (c 'done) true)))))))
+    (return done)))

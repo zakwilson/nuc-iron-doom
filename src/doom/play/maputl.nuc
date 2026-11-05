@@ -1,0 +1,266 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_maputl.c); this port is GPLv3, see COPYING.
+;
+; Map geometry for the playsim: which side of a line a point or box is on,
+; line openings, the blockmap iterators and path traversal. Vanilla's
+; arithmetic, wraparound included.
+
+(ns doom.play.maputl)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.math)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+
+; Iterator callbacks: false stops the iteration.
+(deftype LineFn ((fn bool) (&World usize)))
+(deftype ThingFn ((fn bool) (&World &Mobj)))
+(deftype TraverseFn ((fn bool) (&World &Intercept)))
+
+; P_AproxDistance.
+(defn aprox-distance (dx:Fixed dy:Fixed):Fixed
+  (let (ax (iabs dx) ay (iabs dy))
+    (return (if (< ax ay)
+              (wrap-sub (wrap-add ax ay) (bit-shr ax 1))
+              (wrap-sub (wrap-add ax ay) (bit-shr ay 1))))))
+
+; P_PointOnLineSide: 0 front, 1 back.
+(defn point-on-line-side (l:&Level x:Fixed y:Fixed ld:&Line):i32
+  (let (v1 (vertex-at l (ld 'v1)))
+    (when (= (ld 'dx) 0)
+      (return (if (<= x (v1 'x)) (if (> (ld 'dy) 0) 1 0) (if (< (ld 'dy) 0) 1 0))))
+    (when (= (ld 'dy) 0)
+      (return (if (<= y (v1 'y)) (if (< (ld 'dx) 0) 1 0) (if (> (ld 'dx) 0) 1 0))))
+    (let (dx (wrap-sub x (v1 'x)) dy (wrap-sub y (v1 'y))
+          left (fixed-mul (bit-shr (ld 'dy) FRACBITS) dx)
+          right (fixed-mul dy (bit-shr (ld 'dx) FRACBITS)))
+      (return (if (< right left) 0 1)))))
+
+; P_BoxOnLineSide: 0 or 1 when the whole box is on that side, -1 when the
+; line crosses it.
+(defn box-on-line-side (l:&Level b:&BBox ld:&Line):i32
+  (let (v1 (vertex-at l (ld 'v1)) p1 0 p2 0 st (ld 'slope-type))
+    (cond (= st ST-HORIZONTAL)
+          (do (set! p1 (if (> (b 'top) (v1 'y)) 1 0))
+              (set! p2 (if (> (b 'bottom) (v1 'y)) 1 0))
+              (when (< (ld 'dx) 0) (set! p1 (bit-xor p1 1)) (set! p2 (bit-xor p2 1))))
+          (= st ST-VERTICAL)
+          (do (set! p1 (if (< (b 'right) (v1 'x)) 1 0))
+              (set! p2 (if (< (b 'left) (v1 'x)) 1 0))
+              (when (< (ld 'dy) 0) (set! p1 (bit-xor p1 1)) (set! p2 (bit-xor p2 1))))
+          (= st ST-POSITIVE)
+          (do (set! p1 (point-on-line-side l (b 'left) (b 'top) ld))
+              (set! p2 (point-on-line-side l (b 'right) (b 'bottom) ld)))
+          true
+          (do (set! p1 (point-on-line-side l (b 'right) (b 'top) ld))
+              (set! p2 (point-on-line-side l (b 'left) (b 'bottom) ld))))
+    (return (if (= p1 p2) p1 -1))))
+
+; P_PointOnDivlineSide.
+(defn point-on-divline-side (x:Fixed y:Fixed d:&Divline):i32
+  (when (= (d 'dx) 0)
+    (return (if (<= x (d 'x)) (if (> (d 'dy) 0) 1 0) (if (< (d 'dy) 0) 1 0))))
+  (when (= (d 'dy) 0)
+    (return (if (<= y (d 'y)) (if (< (d 'dx) 0) 1 0) (if (> (d 'dx) 0) 1 0))))
+  (let (dx (wrap-sub x (d 'x)) dy (wrap-sub y (d 'y)))
+    ; Opposite signs settle it without a multiply.
+    (when (!= (bit-and (bit-xor (bit-xor (d 'dy) (d 'dx)) (bit-xor dx dy)) FIXED-MIN) 0)
+      (return (if (!= (bit-and (bit-xor (d 'dy) dx) FIXED-MIN) 0) 1 0)))
+    (let (left (fixed-mul (bit-shr (d 'dy) 8) (bit-shr dx 8))
+          right (fixed-mul (bit-shr dy 8) (bit-shr (d 'dx) 8)))
+      (return (if (< right left) 0 1)))))
+
+; P_MakeDivline.
+(defn make-divline (l:&Level ld:&Line):Divline
+  (let (v1 (vertex-at l (ld 'v1)))
+    (return (Divline (v1 'x) (v1 'y) (ld 'dx) (ld 'dy)))))
+
+; P_InterceptVector: how far along v2 it crosses v1, as a fraction of v2.
+(defn intercept-vector (v2:&Divline v1:&Divline):Fixed
+  (let (den (wrap-sub (fixed-mul (bit-shr (v1 'dy) 8) (v2 'dx))
+                      (fixed-mul (bit-shr (v1 'dx) 8) (v2 'dy))))
+    (when (= den 0) (return 0))
+    (let (num (wrap-add (fixed-mul (bit-shr (wrap-sub (v1 'x) (v2 'x)) 8) (v1 'dy))
+                        (fixed-mul (bit-shr (wrap-sub (v2 'y) (v1 'y)) 8) (v1 'dx))))
+      (return (fixed-div num den)))))
+
+; P_LineOpening: the gap a two-sided line leaves, into the scratch opening.
+(defn line-opening (w:&World ld:&Line):void
+  (let (o (ref (ref w 'scratch) 'opening))
+    (when (= (aref (ld 'side-num) 1) -1)
+      (set! (o 'range) 0)
+      (return))
+    (let (l (ref w 'level)
+          front (sector-at l (unwrap-or (ld 'front-sector) 0))
+          back (sector-at l (unwrap-or (ld 'back-sector) 0)))
+      (set! (o 'top) (min (front 'ceiling-height) (back 'ceiling-height)))
+      (if (> (front 'floor-height) (back 'floor-height))
+        (do (set! (o 'bottom) (front 'floor-height))
+            (set! (o 'low-floor) (back 'floor-height)))
+        (do (set! (o 'bottom) (back 'floor-height))
+            (set! (o 'low-floor) (front 'floor-height))))
+      (set! (o 'range) (wrap-sub (o 'top) (o 'bottom))))))
+
+(defn opening (w:&World):&Opening (return (ref (ref w 'scratch) 'opening)))
+
+; The blockmap cell coordinate of a map coordinate.
+(defn block-x (w:&World x:Fixed):i32
+  (return (bit-shr (wrap-sub x ((ref w 'level) 'bmap-org-x)) MAPBLOCKSHIFT)))
+(defn block-y (w:&World y:Fixed):i32
+  (return (bit-shr (wrap-sub y ((ref w 'level) 'bmap-org-y)) MAPBLOCKSHIFT)))
+
+; P_BlockLinesIterator: each line in a cell not yet seen this validcount.
+; Every cell's list starts with a 0, so line 0 is in all of them.
+(defn block-lines-iterator (w:&World x:i32 y:i32 f:LineFn):bool
+  (let (l (ref w 'level))
+    (when (or (< x 0) (< y 0) (>= x (l 'bmap-width)) (>= y (l 'bmap-height)))
+      (return true))
+    (let (bm (ref l 'blockmap)
+          i:usize (as-checked usize (as i32 (bm (as-checked usize (+ 4 (* y (l 'bmap-width)) x)))))
+          vc (ref w 'line-valid))
+      (while (!= (bm i) -1)
+        (let (ld (as-checked usize (as i32 (bm i))))
+          (when (!= (vc ld) (w 'valid-count))
+            (set vc ld (w 'valid-count))
+            (when (not (f w ld)) (return false))))
+        (inc! i))
+      (return true))))
+
+; P_BlockThingsIterator.
+(defn block-things-iterator (w:&World x:i32 y:i32 f:ThingFn):bool
+  (let (l (ref w 'level))
+    (when (or (< x 0) (< y 0) (>= x (l 'bmap-width)) (>= y (l 'bmap-height)))
+      (return true))
+    (let (t ((ref w 'block-links) (as-checked usize (+ (* y (l 'bmap-width)) x))))
+      (while-some (m t)
+        (when (not (f w m)) (return false))
+        (set! t (m 'bnext))))
+    (return true)))
+
+(defn- add-intercept (w:&World frac:Fixed of:InterceptOf):void
+  (conj (ref (ref w 'scratch) 'intercepts) (Intercept frac of)))
+
+; PIT_AddLineIntercepts. (Chocolate Doom's intercepts overrun emulation is
+; left out: the list grows instead.)
+(defn- add-line-intercepts (w:&World li:usize):bool
+  (let (l (ref w 'level) ld (line-at l li) sc (ref w 'scratch) tr (ref sc 'trace)
+        v1 (vertex-at l (ld 'v1)) v2 (vertex-at l (ld 'v2))
+        far (or (> (tr 'dx) (* FRACUNIT 16)) (> (tr 'dy) (* FRACUNIT 16))
+                (< (tr 'dx) (* FRACUNIT -16)) (< (tr 'dy) (* FRACUNIT -16)))
+        s1 (if far (point-on-divline-side (v1 'x) (v1 'y) tr)
+                   (point-on-line-side l (tr 'x) (tr 'y) ld))
+        s2 (if far (point-on-divline-side (v2 'x) (v2 'y) tr)
+                   (point-on-line-side l (wrap-add (tr 'x) (tr 'dx)) (wrap-add (tr 'y) (tr 'dy)) ld)))
+    (when (= s1 s2) (return true))
+    (let (dl (make-divline l ld) frac (intercept-vector tr &dl))
+      (when (< frac 0) (return true))
+      (when (and (sc 'early-out) (< frac FRACUNIT) (none? (ld 'back-sector)))
+        (return false))
+      (add-intercept w frac (InterceptOf-line li))
+      (return true))))
+
+; PIT_AddThingIntercepts: across the thing's box corner to corner.
+(defn- add-thing-intercepts (w:&World t:&Mobj):bool
+  (let (tr (ref (ref w 'scratch) 'trace)
+        positive (> (bit-xor (tr 'dx) (tr 'dy)) 0)
+        r (t 'radius)
+        x1 (wrap-sub (t 'x) r) x2 (wrap-add (t 'x) r)
+        y1 (if positive (wrap-add (t 'y) r) (wrap-sub (t 'y) r))
+        y2 (if positive (wrap-sub (t 'y) r) (wrap-add (t 'y) r))
+        s1 (point-on-divline-side x1 y1 tr)
+        s2 (point-on-divline-side x2 y2 tr))
+    (when (= s1 s2) (return true))
+    (let (dl (Divline x1 y1 (wrap-sub x2 x1) (wrap-sub y2 y1))
+          frac (intercept-vector tr &dl))
+      (when (< frac 0) (return true))
+      (add-intercept w frac (InterceptOf-thing t))
+      (return true))))
+
+; P_TraverseIntercepts: nearest first, up to maxfrac. Each pass takes the
+; first smallest; a visited one is set to INT_MAX.
+(defn- traverse-intercepts (w:&World f:TraverseFn maxfrac:Fixed):bool
+  (let (n (count (ref (ref w 'scratch) 'intercepts)) left n)
+    (while (> left 0)
+      (set! left (- left 1))
+      (let (iv (view (ref (ref w 'scratch) 'intercepts)) dist:Fixed FIXED-MAX best:usize 0)
+        ; Vanilla scans to the array's current end each pass.
+        (dotimes (k:usize (count &iv))
+          (when (< ((&iv k) 'frac) dist)
+            (set! dist ((&iv k) 'frac))
+            (set! best k)))
+        (when (> dist maxfrac) (return true))
+        (when (not (f w (&iv best))) (return false))
+        ; The callback may have started another traversal; vanilla's
+        ; write lands in the shared array either way.
+        (let (iv2 (view (ref (ref w 'scratch) 'intercepts)))
+          (when (< best (count &iv2))
+            (set! ((&iv2 best) 'frac) FIXED-MAX)))))
+    (return true)))
+
+; P_PathTraverse: the lines and things crossing x1,y1 to x2,y2, in order.
+(defn path-traverse (w:&World x1:Fixed y1:Fixed x2:Fixed y2:Fixed flags:i32 f:TraverseFn):bool
+  (let (sc (ref w 'scratch) l (ref w 'level)
+        ox (l 'bmap-org-x) oy (l 'bmap-org-y))
+    (set! (sc 'early-out) (!= (bit-and flags PT-EARLYOUT) 0))
+    (set! (w 'valid-count) (+ (w 'valid-count) 1))
+    (clear! (ref sc 'intercepts))
+    ; Don't start exactly on a block line.
+    (when (= (bit-and (wrap-sub x1 ox) (- MAPBLOCKSIZE 1)) 0) (set! x1 (wrap-add x1 FRACUNIT)))
+    (when (= (bit-and (wrap-sub y1 oy) (- MAPBLOCKSIZE 1)) 0) (set! y1 (wrap-add y1 FRACUNIT)))
+    (set! (sc 'trace) (Divline x1 y1 (wrap-sub x2 x1) (wrap-sub y2 y1)))
+    (set! x1 (wrap-sub x1 ox))
+    (set! y1 (wrap-sub y1 oy))
+    (set! x2 (wrap-sub x2 ox))
+    (set! y2 (wrap-sub y2 oy))
+    (let (xt1 (bit-shr x1 MAPBLOCKSHIFT) yt1 (bit-shr y1 MAPBLOCKSHIFT)
+          xt2 (bit-shr x2 MAPBLOCKSHIFT) yt2 (bit-shr y2 MAPBLOCKSHIFT)
+          mapxstep 0 mapystep 0 partial 0 xstep 0 ystep 0)
+      (cond (> xt2 xt1)
+            (do (set! mapxstep 1)
+                (set! partial (- FRACUNIT (bit-and (bit-shr x1 MAPBTOFRAC) (- FRACUNIT 1))))
+                (set! ystep (fixed-div (wrap-sub y2 y1) (iabs (wrap-sub x2 x1)))))
+            (< xt2 xt1)
+            (do (set! mapxstep -1)
+                (set! partial (bit-and (bit-shr x1 MAPBTOFRAC) (- FRACUNIT 1)))
+                (set! ystep (fixed-div (wrap-sub y2 y1) (iabs (wrap-sub x2 x1)))))
+            true
+            (do (set! mapxstep 0)
+                (set! partial FRACUNIT)
+                (set! ystep (* 256 FRACUNIT))))
+      (let (yintercept (wrap-add (bit-shr y1 MAPBTOFRAC) (fixed-mul partial ystep)))
+        (cond (> yt2 yt1)
+              (do (set! mapystep 1)
+                  (set! partial (- FRACUNIT (bit-and (bit-shr y1 MAPBTOFRAC) (- FRACUNIT 1))))
+                  (set! xstep (fixed-div (wrap-sub x2 x1) (iabs (wrap-sub y2 y1)))))
+              (< yt2 yt1)
+              (do (set! mapystep -1)
+                  (set! partial (bit-and (bit-shr y1 MAPBTOFRAC) (- FRACUNIT 1)))
+                  (set! xstep (fixed-div (wrap-sub x2 x1) (iabs (wrap-sub y2 y1)))))
+              true
+              (do (set! mapystep 0)
+                  (set! partial FRACUNIT)
+                  (set! xstep (* 256 FRACUNIT))))
+        (let (xintercept (wrap-add (bit-shr x1 MAPBTOFRAC) (fixed-mul partial xstep))
+              mapx xt1 mapy yt1 n 0 done false)
+          ; The count keeps a rounding error from stepping past the end.
+          (while (and (not done) (< n 64))
+            (when (!= (bit-and flags PT-ADDLINES) 0)
+              (when (not (block-lines-iterator w mapx mapy add-line-intercepts)) (return false)))
+            (when (!= (bit-and flags PT-ADDTHINGS) 0)
+              (when (not (block-things-iterator w mapx mapy add-thing-intercepts)) (return false)))
+            (if (and (= mapx xt2) (= mapy yt2))
+              (set! done true)
+              (cond (= (bit-shr yintercept FRACBITS) mapy)
+                    (do (set! yintercept (wrap-add yintercept ystep))
+                        (set! mapx (+ mapx mapxstep)))
+                    (= (bit-shr xintercept FRACBITS) mapx)
+                    (do (set! xintercept (wrap-add xintercept xstep))
+                        (set! mapy (+ mapy mapystep)))))
+            (inc! n))
+          (return (traverse-intercepts w f FRACUNIT)))))))

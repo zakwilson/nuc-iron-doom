@@ -1,0 +1,320 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom r_main.c, r_plane.c, r_bsp.c, r_segs.c,
+; r_sky.c); this port is GPLv3, see COPYING.
+;
+; The renderer's state. Vanilla keeps it in globals shared by r_*.c; here it is
+; one `Renderer`, passed to each stage, built once for a view size and reset
+; each frame.
+
+(ns doom.render.state)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.fixed)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.render.sprites)
+
+(defconst SCREENWIDTH 320)
+(defconst SCREENHEIGHT 200)
+
+(defconst LIGHTLEVELS 16)
+(defconst LIGHTSEGSHIFT 4)
+(defconst MAXLIGHTSCALE 48)
+(defconst LIGHTSCALESHIFT 12)
+(defconst MAXLIGHTZ 128)
+(defconst LIGHTZSHIFT 20)
+(defconst NUMCOLORMAPS 32)
+(defconst DISTMAP 2)
+; FINEANGLES/4 * 90/90: the field of view, 90 degrees.
+(defconst FIELDOFVIEW 2048)
+
+(defconst MAXVISPLANES 128)
+(defconst MAXDRAWSEGS 256)
+(defconst MAXOPENINGS 20480)
+(defconst MAXSEGS 161)
+(defconst ANGLETOSKYSHIFT 22)
+
+(defconst SIL-NONE 0)
+(defconst SIL-BOTTOM 1)
+(defconst SIL-TOP 2)
+(defconst SIL-BOTH 3)
+
+(defconst SHRT-MAX 32767)
+(defconst MAXVISSPRITES 128)
+; Sprites nearer than this are behind the view plane.
+(defconst MINZ (* 4 65536))
+
+; A run of screen columns walls already cover.
+(defstruct ClipRange first:i32 last:i32)
+
+; Where a drawseg's per-column clip values live. Vanilla points into
+; `openings` with an offset so that column x is `p[x]`, or at the two fixed
+; arrays.
+(defunion ClipRef
+  (none)
+  (screen-height)
+  (neg-one)
+  (openings base:i64))
+
+(defstruct DrawSeg
+  cur-line:usize x1:i32 x2:i32
+  scale1:Fixed scale2:Fixed scale-step:Fixed
+  silhouette:i32 bsil-height:Fixed tsil-height:Fixed
+  spr-top-clip:ClipRef spr-bottom-clip:ClipRef masked-texture-col:ClipRef)
+
+; A thing projected onto the screen (vissprite_t). `colormap` is -1 for the
+; spectre's fuzz.
+(defstruct VisSprite
+  x1:i32 x2:i32 gx:Fixed gy:Fixed gz:Fixed gzt:Fixed
+  start-frac:Fixed scale:Fixed x-iscale:Fixed texture-mid:Fixed
+  patch:i32 colormap:i32 mobj-flags:i32)
+
+; A floor or ceiling area: one height, flat and light, and per column the rows
+; it spans. Rows are bytes, 0xff unset, with a pad column each side.
+(defstruct Visplane
+  height:Fixed pic:i32 light-level:i32 min-x:i32 max-x:i32
+  top:(Vector ui8) bottom:(Vector ui8))
+
+(defstruct Renderer
+  ; View size (R_ExecuteSetViewSize).
+  view-width:i32 view-height:i32
+  center-x:i32 center-y:i32 center-x-frac:Fixed center-y-frac:Fixed
+  projection:Fixed
+  ; Where the view starts on the screen.
+  view-window-x:i32 view-window-y:i32
+  ; This frame's eye (R_SetupFrame).
+  view-x:Fixed view-y:Fixed view-z:Fixed view-angle:Angle
+  view-sin:Fixed view-cos:Fixed
+  extra-light:i32
+  ; A colormap forced on everything (invulnerability, light amp), or -1.
+  fixed-colormap:i32
+  ; Tables.
+  view-angle-to-x:(Vector i32)
+  x-to-view-angle:(Vector Angle)
+  clip-angle:Angle
+  y-slope:(Vector Fixed)
+  dist-scale:(Vector Fixed)
+  ; Colormap numbers by light level and scale or distance.
+  scale-light:(Vector i32)
+  z-light:(Vector i32)
+  pspritescale:Fixed pspriteiscale:Fixed
+  ; The BSP walk's clip list and the seg it is on.
+  solid-segs:(Vector ClipRange)
+  new-end:usize
+  cur-line:usize front-sector:usize back-sector:?usize
+  rw-angle1:Angle
+  draw-segs:(Vector DrawSeg)
+  ; Planes.
+  visplanes:(Vector Visplane)
+  last-visplane:usize
+  floor-plane:?usize ceiling-plane:?usize
+  openings:(Vector i16)
+  last-opening:i64
+  floor-clip:(Vector i16)
+  ceiling-clip:(Vector i16)
+  span-start:(Vector i32)
+  plane-height:Fixed
+  plane-z-light:i32
+  cached-height:(Vector Fixed)
+  cached-distance:(Vector Fixed)
+  cached-xstep:(Vector Fixed)
+  cached-ystep:(Vector Fixed)
+  base-xscale:Fixed base-yscale:Fixed
+  ; The sky (r_sky).
+  sky-texture:usize
+  sky-texture-mid:Fixed
+  ; R_DrawFuzzColumn's place in its offset table.
+  fuzz-pos:usize
+  ; Sprites (r_things.c): this frame's, the light row of the sector being
+  ; added, and which sectors have been added (validcount).
+  vis-sprites:(Vector VisSprite)
+  sprite-lights:i32
+  sector-valid:(Vector i32) valid-count:i32
+  ; R_DrawSprite's clip rows; -2 is unset.
+  clip-bot:(Vector i16) clip-top:(Vector i16)
+  ; Players 2 to 4's colours: three 256-byte maps of the green ramp.
+  translations:(Vector ui8))
+
+(defn- vec-of (n:i32 v:T):(Vector T)
+  (let (out (make (Vector T)))
+    (dotimes (i:i32 n) (conj &out v))
+    (return out)))
+
+; R_InitTranslationTables: the green ramp 0x70-0x7f becomes grey, brown
+; or red.
+(defn- translation-tables ():(Vector ui8)
+  (let (t (vec-of (* 3 256) (as ui8 0)))
+    (dotimes (i:i32 256)
+      (let (green (and (>= i 0x70) (<= i 0x7f)) lo (bit-and i 0xf))
+        (set &t (as usize i) (unsafe/cast ui8 (if green (+ 0x60 lo) i)))
+        (set &t (as usize (+ i 256)) (unsafe/cast ui8 (if green (+ 0x40 lo) i)))
+        (set &t (as usize (+ i 512)) (unsafe/cast ui8 (if green (+ 0x20 lo) i)))))
+    (return t)))
+
+(defn visplane-new ():Visplane
+  (return (Visplane 0 0 0 0 0 (vec-of (+ SCREENWIDTH 2) (as ui8 0xff))
+                    (vec-of (+ SCREENWIDTH 2) (as ui8 0)))))
+
+; R_InitTextureMapping: which column each view angle lands on, and back.
+(defn- init-texture-mapping (r:&Renderer):void
+  (let (focal (fixed-div (r 'center-x-frac) (finetangent (+ (/ FINEANGLES 4) (/ FIELDOFVIEW 2))))
+        vw (r 'view-width)
+        a2x (ref r 'view-angle-to-x))
+    (dotimes (i:usize (/ FINEANGLES 2))
+      (let (tn (finetangent i)
+            t (cond (> tn (* FRACUNIT 2)) -1
+                    (< tn (* FRACUNIT -2)) (+ vw 1)
+                    true (let (t0 (bit-shr (+ (- (r 'center-x-frac) (fixed-mul tn focal)) FRACUNIT -1) FRACBITS))
+                           (cond (< t0 -1) -1 (> t0 (+ vw 1)) (+ vw 1) true t0))))
+        (set a2x i t)))
+    ; The first angle whose column is at or left of x.
+    (dotimes (x:usize (as usize (+ vw 1)))
+      (let (i:usize 0)
+        (while (> (a2x i) (unsafe/cast i32 x)) (inc! i))
+        (set (ref r 'x-to-view-angle) x (- (bit-shl (unsafe/cast ui32 i) ANGLETOFINESHIFT) ANG90))))
+    (dotimes (i:usize (/ FINEANGLES 2))
+      (cond (= (a2x i) -1) (set a2x i 0)
+            (= (a2x i) (+ vw 1)) (set a2x i vw)))
+    (set! (r 'clip-angle) ((ref r 'x-to-view-angle) 0))))
+
+; R_InitLightTables: the colormap for a light level at each distance.
+(defn- init-light-tables (r:&Renderer):void
+  (dotimes (i:i32 LIGHTLEVELS)
+    (let (startmap (/ (* (* (- LIGHTLEVELS 1 i) 2) NUMCOLORMAPS) LIGHTLEVELS))
+      (dotimes (j:i32 MAXLIGHTZ)
+        (let (scale (bit-shr (fixed-div (* (/ SCREENWIDTH 2) FRACUNIT) (bit-shl (+ j 1) LIGHTZSHIFT))
+                             LIGHTSCALESHIFT)
+              level (- startmap (/ scale DISTMAP)))
+          (set (ref r 'z-light) (as usize (+ (* i MAXLIGHTZ) j))
+               (cond (< level 0) 0 (>= level NUMCOLORMAPS) (- NUMCOLORMAPS 1) true level)))))))
+
+; R_ExecuteSetViewSize for `blocks` (3 to 11; 11 is the full screen) at full
+; detail.
+(defn set-view-size (r:&Renderer blocks:i32):void
+  (let (sw (if (= blocks 11) SCREENWIDTH (* blocks 32))
+        vh (if (= blocks 11) SCREENHEIGHT (bit-and (/ (* blocks 168) 10) (bit-not 7))))
+    (set! (r 'view-width) sw)
+    (set! (r 'view-height) vh)
+    (set! (r 'center-y) (/ vh 2))
+    (set! (r 'center-x) (/ sw 2))
+    (set! (r 'center-x-frac) (bit-shl (r 'center-x) FRACBITS))
+    (set! (r 'center-y-frac) (bit-shl (r 'center-y) FRACBITS))
+    (set! (r 'projection) (r 'center-x-frac))
+    ; R_InitBuffer: the view is centred, above the 32-row status bar.
+    (set! (r 'view-window-x) (bit-shr (- SCREENWIDTH sw) 1))
+    (set! (r 'view-window-y) (if (= sw SCREENWIDTH) 0 (bit-shr (- (- SCREENHEIGHT 32) vh) 1)))
+    (init-texture-mapping r)
+    (set! (r 'pspritescale) (/ (* FRACUNIT sw) SCREENWIDTH))
+    (set! (r 'pspriteiscale) (/ (* FRACUNIT SCREENWIDTH) sw))
+    (dotimes (i:i32 vh)
+      (let (dy (iabs (+ (bit-shl (- i (/ vh 2)) FRACBITS) (/ FRACUNIT 2))))
+        (set (ref r 'y-slope) (as usize i) (fixed-div (* (/ sw 2) FRACUNIT) dy))))
+    (dotimes (i:i32 sw)
+      (let (cosadj (iabs (angle-cos ((ref r 'x-to-view-angle) (as usize i)))))
+        (set (ref r 'dist-scale) (as usize i) (fixed-div FRACUNIT cosadj))))
+    (dotimes (i:i32 LIGHTLEVELS)
+      (let (startmap (/ (* (* (- LIGHTLEVELS 1 i) 2) NUMCOLORMAPS) LIGHTLEVELS))
+        (dotimes (j:i32 MAXLIGHTSCALE)
+          (let (level (- startmap (/ (/ (* j SCREENWIDTH) sw) DISTMAP)))
+            (set (ref r 'scale-light) (as usize (+ (* i MAXLIGHTSCALE) j))
+                 (cond (< level 0) 0 (>= level NUMCOLORMAPS) (- NUMCOLORMAPS 1) true level))))))))
+
+(defn renderer-new (blocks:i32):Renderer
+  (let (no-range:ClipRange (ClipRange 0 0) ; ISSUE-019
+        r (Renderer 0 0 0 0 0 0 0 0 0
+                    0 0 0 0 0 0 0 -1
+                    (vec-of (/ FINEANGLES 2) 0) (vec-of (+ SCREENWIDTH 1) (as ui32 0)) 0
+                    (vec-of SCREENHEIGHT 0) (vec-of SCREENWIDTH 0)
+                    (vec-of (* LIGHTLEVELS MAXLIGHTSCALE) 0) (vec-of (* LIGHTLEVELS MAXLIGHTZ) 0)
+                    0 0
+                    (vec-of MAXSEGS no-range) 0 0 0 none 0
+                    (make (Vector DrawSeg))
+                    (make (Vector Visplane)) 0 none none
+                    (vec-of MAXOPENINGS (as i16 0)) 0
+                    (vec-of SCREENWIDTH (as i16 0)) (vec-of SCREENWIDTH (as i16 0))
+                    (vec-of SCREENHEIGHT 0) 0 0
+                    (vec-of SCREENHEIGHT 0) (vec-of SCREENHEIGHT 0)
+                    (vec-of SCREENHEIGHT 0) (vec-of SCREENHEIGHT 0)
+                    0 0 0 (* (/ SCREENHEIGHT 2) FRACUNIT) 0
+                    (make (Vector VisSprite)) 0 (make (Vector i32)) 0
+                    (vec-of SCREENWIDTH (as i16 0)) (vec-of SCREENWIDTH (as i16 0))
+                    (translation-tables)))
+    (dotimes (i:usize MAXVISPLANES) (conj (ref r 'visplanes) (visplane-new)))
+    (set-view-size &r blocks)
+    (init-light-tables &r)
+    (return r)))
+
+; What a frame is drawn from and into.
+(defstruct Scene
+  level:&Level
+  textures:&WallTextures
+  flats:&Flats
+  ; The playsim's animation: what each texture and flat number draws as now.
+  tex-trans:&(Vector i32)
+  flat-trans:&(Vector i32)
+  ; The COLORMAP lump: 34 maps of 256 bytes.
+  colormaps:&Bytes
+  sprites:&Sprites
+  ; Each sector's things, as the playsim links them.
+  things:&(Vector ?&Mobj)
+  screen:&Buffer)
+
+(defn translated-texture (sc:&Scene i:i32):i32 (return ((sc 'tex-trans) (as-checked usize i))))
+(defn translated-flat (sc:&Scene i:i32):i32 (return ((sc 'flat-trans) (as-checked usize i))))
+
+; --- small accessors --------------------------------------------------------------
+
+(defn x-to-view-angle (r:&Renderer x:i32):Angle (return ((ref r 'x-to-view-angle) (as usize x))))
+(defn view-angle-to-x (r:&Renderer i:usize):i32 (return ((ref r 'view-angle-to-x) i)))
+
+; A colormap number by light row (level) and column (scale or distance).
+(defn scale-light (r:&Renderer level:i32 i:i32):i32
+  (return ((ref r 'scale-light) (as usize (+ (* level MAXLIGHTSCALE) i)))))
+(defn z-light (r:&Renderer level:i32 i:i32):i32
+  (return ((ref r 'z-light) (as usize (+ (* level MAXLIGHTZ) i)))))
+
+(defn visplane-at (r:&Renderer i:usize):&Visplane
+  (let (s (view (ref r 'visplanes))) (return (&s i))))
+
+; Visplane rows, by screen column (the pads are -1 and view-width).
+(defn plane-top (p:&Visplane x:i32):i32 (return (as i32 ((ref p 'top) (as usize (+ x 1))))))
+(defn plane-bottom (p:&Visplane x:i32):i32 (return (as i32 ((ref p 'bottom) (as usize (+ x 1))))))
+(defn set-plane-top (p:&Visplane x:i32 v:i32):void
+  (set (ref p 'top) (as usize (+ x 1)) (unsafe/cast ui8 v)))
+(defn set-plane-bottom (p:&Visplane x:i32 v:i32):void
+  (set (ref p 'bottom) (as usize (+ x 1)) (unsafe/cast ui8 v)))
+
+(defn draw-seg-at (r:&Renderer i:usize):&DrawSeg
+  (let (s (view (ref r 'draw-segs))) (return (&s i))))
+
+(defn floor-clip (r:&Renderer x:i32):i32 (return (as i32 ((ref r 'floor-clip) (as usize x)))))
+(defn ceiling-clip (r:&Renderer x:i32):i32 (return (as i32 ((ref r 'ceiling-clip) (as usize x)))))
+(defn set-floor-clip (r:&Renderer x:i32 v:i32):void
+  (set (ref r 'floor-clip) (as usize x) (unsafe/cast i16 v)))
+(defn set-ceiling-clip (r:&Renderer x:i32 v:i32):void
+  (set (ref r 'ceiling-clip) (as usize x) (unsafe/cast i16 v)))
+
+; A drawseg's clip value at column x.
+(defn clip-at (r:&Renderer c:ClipRef x:i32):i32
+  (match c
+    ((none) (return 0))
+    ((screen-height) (return (r 'view-height)))
+    ((neg-one) (return -1))
+    ((openings base) (return (as i32 ((ref r 'openings) (as usize (+ base (as i64 x)))))))))
+
+(defn set-clip-at (r:&Renderer c:ClipRef x:i32 v:i32):void
+  (match c
+    ((openings base) (set (ref r 'openings) (as usize (+ base (as i64 x))) (unsafe/cast i16 v)))
+    ((none) 0) ((screen-height) 0) ((neg-one) 0)))
+
+(defn clip-ref-none? (c:ClipRef):bool
+  (match c ((none) (return true)) ((screen-height) (return false))
+            ((neg-one) (return false)) ((openings b) (return false))))

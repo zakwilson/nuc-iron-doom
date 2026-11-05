@@ -1,0 +1,280 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom s_sound.c, i_sdlsound.c); this port is GPLv3,
+; see COPYING.
+;
+; The sound channels and SDL_mixer. The playsim decides each sound
+; (doom.play.world's start-sound); this half picks its channel, plays it, and
+; once a frame moves positioned sounds with their origins (S_UpdateSounds).
+; With no audio device every channel frees itself at the next update, as
+; vanilla's does when I_SoundIsPlaying says no.
+
+(ns doom.mixer)
+
+(import-use "SDL2/SDL.h")
+(import-use "SDL2/SDL_mixer.h")
+(import-use "stdio.h")
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.fixed)
+(import-use doom.wad)
+(import-use doom.info)
+(import-use doom.sounds)
+(import-use doom.mus2mid)
+(import-use doom.play.map)
+(import-use doom.play.world)
+
+; snd_channels, and i_sdlsound.c's mixing channels.
+(defconst SND-CHANNELS 8)
+(defconst NUM-CHANNELS 16)
+(defconst SAMPLE-RATE 44100)
+
+(defstruct Channel sfx:i32 origin:?&Mobj sector:?usize)
+
+(defstruct Point x:Fixed y:Fixed)
+
+(defstruct Mixer
+  ; The device opened, and the rate it runs at.
+  open:bool freq:i32
+  channels:(Vector Channel)
+  ; Each sound effect's Mix_Chunk once loaded; null before, or for a lump
+  ; that isn't there or isn't a DMX sound.
+  chunks:(Vector ptr) loaded:(Vector bool)
+  ; S_ChangeMusic's mus_playing (0 for none), the Mix_Music playing it, the
+  ; MIDI bytes it reads from, mus2mid's carried state, and whether paused.
+  music-playing:i32 music:ptr music-data:(Vector ui8) m2m:Mus2Mid music-paused:bool)
+
+(defn- channel-at (mx:&Mixer i:usize):&Channel
+  (let (v (view (ref mx 'channels))) (return (&v i))))
+
+; I_SDL_InitSound. A device that won't open leaves the game silent.
+(defn mixer-new ():Mixer
+  (let (mx (Mixer false SAMPLE-RATE (make (Vector Channel)) (make (Vector ptr)) (make (Vector bool))
+                  0 null (make (Vector ui8)) (mus2mid-new) false))
+    (dotimes (i:usize SND-CHANNELS) (conj (ref mx 'channels) (Channel 0 none none)))
+    (dotimes (i:usize NUMSFX) (conj (ref mx 'chunks) null) (conj (ref mx 'loaded) false))
+    (if (< (SDL_InitSubSystem SDL_INIT_AUDIO) 0)
+      (printf "I_SDL_InitSound: Couldn't initialize SDL audio\n")
+      (if (< (Mix_OpenAudioDevice SAMPLE-RATE AUDIO_S16SYS 2 1024 null SDL_AUDIO_ALLOW_FREQUENCY_CHANGE) 0)
+        (printf "Error initialising SDL_mixer\n")
+        (let (freq (alloca i32) fmt (alloca ui16) chans (alloca i32))
+          (Mix_QuerySpec freq fmt chans)
+          (set! (mx 'freq) @freq)
+          (Mix_AllocateChannels NUM-CHANNELS)
+          (set! (mx 'open) true))))
+    (return mx)))
+
+; A DMX sound lump (format 3, a rate, a length counting 16 pad bytes at each
+; end, then unsigned 8-bit mono) as 16-bit stereo at the mixer's rate: the
+; nearest sample, then a low-pass filter, as ExpandSoundData_SDL does where
+; SDL can't convert. Floats are fine here: none of this reaches the playsim.
+(defn- expand (mx:&Mixer lump:&Bytes):ptr
+  (let (n (count lump))
+    (when (or (< n 8) (!= (le-ui16 lump 0) 3)) (return null))
+    (let (rate (le-ui16 lump 2) len (le-i32 lump 4))
+      (when (or (> len (- (unsafe/cast i32 n) 8)) (<= len 48) (= rate 0)) (return null))
+      (let (data (sub-bytes lump 24 (as-checked usize (- len 32)))
+            length (unsafe/cast i64 (- len 32))
+            freq (as i64 (mx 'freq))
+            out-len (/ (* length freq) (as i64 rate))
+            ratio (/ (bit-shl length 8) out-len)
+            bytes (as-checked usize (* out-len 4))
+            buf (unsafe/cast &i16 (SDL_malloc bytes)))
+        (dotimes (i:i64 out-len)
+          (let (src (as-checked usize (bit-shr (* i ratio) 8))
+                b (byte-at &data src)
+                sample (unsafe/cast i16 (- (bit-or b (bit-shl b 8)) 32768)))
+            (set! (aref buf (* i 2)) sample)
+            (set! (aref buf (+ (* i 2) 1)) sample)))
+        (let (dt (/ 1.0 (unsafe/cast f32 freq))
+              rc (/ 1.0 (* 3.14 (unsafe/cast f32 rate)))
+              alpha (/ dt (+ rc dt))
+              i:i64 2)
+          (while (< i (* out-len 2))
+            (set! (aref buf i)
+                  (unsafe/cast i16 (+ (* alpha (unsafe/cast f32 (aref buf i)))
+                                      (* (- 1.0 alpha) (unsafe/cast f32 (aref buf (- i 2)))))))
+            (set! i (+ i 1))))
+        (return (Mix_QuickLoad_RAW (unsafe/cast &ui8 buf) (unsafe/cast ui32 bytes)))))))
+
+; The chunk for a sound effect, loaded the first time. chgun plays the pistol's.
+(defn- chunk-for (mx:&Mixer wad:&Wad sfx:i32):ptr
+  (let (id (if (= sfx SFX-CHGUN) SFX-PISTOL sfx) i (as-checked usize id))
+    (when (not ((ref mx 'loaded) i))
+      (set (ref mx 'loaded) i true)
+      (let (nm (str "DS" (aref SFX-NAMES (as i64 id))))
+        (match (lump-named wad (name (string-as-view &nm)))
+          ((ok l) (set (ref mx 'chunks) i (expand mx (ref l 'data))))
+          ((err e) 0))))
+    (return ((ref mx 'chunks) i))))
+
+(defn- playing? (mx:&Mixer i:usize):bool
+  (return (and (mx 'open) (!= (Mix_Playing (as-checked i32 i)) 0))))
+
+; S_StopChannel.
+(defn- stop-channel (mx:&Mixer i:usize):void
+  (let (c (channel-at mx i))
+    (when (!= (c 'sfx) 0)
+      (when (playing? mx i) (Mix_HaltChannel (as-checked i32 i)))
+      (set! (c 'sfx) 0)
+      (set! (c 'origin) none)
+      (set! (c 'sector) none))))
+
+(defn- same-origin? (c:&Channel origin:?&Mobj sector:?usize):bool
+  (match sector
+    ((some s) (return (match (c 'sector) ((some cs) (= cs s)) ((none) false))))
+    ((none)
+     (when (some? (c 'sector)) (return false))
+     (match origin
+       ((some m) (return (match (c 'origin) ((some co) (same? co m)) ((none) false))))
+       ((none) (return (none? (c 'origin))))))))
+
+; S_StopSound: the first channel the origin holds. A null origin matches the
+; first sound from nowhere, as vanilla's pointer compare does.
+(defn- stop-origin (mx:&Mixer origin:?&Mobj sector:?usize):void
+  (dotimes (i:usize SND-CHANNELS)
+    (let (c (channel-at mx i))
+      (when (and (!= (c 'sfx) 0) (same-origin? c origin sector))
+        (stop-channel mx i)
+        (return)))))
+
+; S_GetChannel: a free channel, or the origin's own, or one of no higher
+; priority (a lower number) to kick out.
+(defn- get-channel (mx:&Mixer origin:?&Mobj sector:?usize sfx:i32):i32
+  (let (cnum:usize SND-CHANNELS i:usize 0 positioned (or (some? origin) (some? sector)))
+    (while (and (< i SND-CHANNELS) (= cnum SND-CHANNELS))
+      (let (c (channel-at mx i))
+        (cond (= (c 'sfx) 0) (set! cnum i)
+              (and positioned (same-origin? c origin sector)) (do (stop-channel mx i) (set! cnum i))
+              true 0))
+      (set! i (+ i 1)))
+    (when (= cnum SND-CHANNELS)
+      (set! i 0)
+      (while (and (< i SND-CHANNELS) (= cnum SND-CHANNELS))
+        (when (>= (aref SFX-PRIORITY (as i64 ((channel-at mx i) 'sfx))) (aref SFX-PRIORITY (as i64 sfx)))
+          (set! cnum i))
+        (set! i (+ i 1)))
+      (when (= cnum SND-CHANNELS) (return -1))
+      (stop-channel mx cnum))
+    (let (c (channel-at mx cnum))
+      (set! (c 'sfx) sfx)
+      (set! (c 'origin) origin)
+      (set! (c 'sector) sector))
+    (return (as-checked i32 cnum))))
+
+; I_SDL_UpdateSoundParams: the volume goes in through the panning.
+(defn- set-params (mx:&Mixer cnum:i32 volume:i32 sep:i32):void
+  (when (not (mx 'open)) (return))
+  (let (left (max 0 (min 255 (/ (* (- 254 sep) volume) 127)))
+        right (max 0 (min 255 (/ (* sep volume) 127))))
+    (Mix_SetPanning cnum (unsafe/cast ui8 left) (unsafe/cast ui8 right))))
+
+; The rest of S_StartSound, from the decision the playsim made.
+(defn mixer-start (mx:&Mixer wad:&Wad ev:&SoundEvent):void
+  (stop-origin mx (ev 'origin) (ev 'sector))
+  (let (cnum (get-channel mx (ev 'origin) (ev 'sector) (ev 'sfx)))
+    (when (< cnum 0) (return))
+    (when (mx 'open)
+      (let (chunk (chunk-for mx wad (ev 'sfx)))
+        (when (!= chunk null)
+          (Mix_PlayChannelTimed cnum (unsafe/cast (ptr Mix_Chunk) chunk) 0 -1)
+          (set-params mx cnum (ev 'volume) (ev 'sep)))))))
+
+; A tic's sounds from the world's queue, in order.
+(defn mixer-events (mx:&Mixer wad:&Wad w:&World):void
+  (let (evs (view (ref w 'sounds)))
+    (dotimes (i:usize (count &evs))
+      (let (ev (&evs i))
+        (if (ev 'stop)
+          (stop-origin mx (ev 'origin) none)
+          (mixer-start mx wad ev))))))
+
+; S_Start's first half: every channel stopped for a new level.
+(defn mixer-stop-all (mx:&Mixer):void
+  (dotimes (i:usize SND-CHANNELS) (stop-channel mx i)))
+
+; S_UpdateSounds: finished channels freed; positioned ones followed, and
+; stopped once out of earshot.
+(defn mixer-update (mx:&Mixer w:?&World):void
+  (dotimes (i:usize SND-CHANNELS)
+    (let (c (channel-at mx i))
+      (when (!= (c 'sfx) 0)
+        (if (not (playing? mx i))
+          (stop-channel mx i)
+          (when-some (wd w)
+            (let (volume ((ref wd 'rules) 'sfx-volume))
+              (if (and (= (c 'sfx) SFX-CHGUN) (< volume 1))
+                (stop-channel mx i)
+                (when-some (l (listener wd))
+                  (let (pos:?Point
+                        (match (c 'sector)
+                          ((some s) (let (sec (sector-at (ref wd 'level) s))
+                                      (some (Point (sec 'sound-x) (sec 'sound-y)))))
+                          ((none) (match (c 'origin)
+                                    ((some m) (if (same? m l) none (some (Point (m 'x) (m 'y)))))
+                                    ((none) none)))))
+                    (when-some (xy pos)
+                      (match (sound-params wd l (xy 'x) (xy 'y) volume)
+                        ((some sp) (set-params mx (as-checked i32 i) (sp 'volume) (sp 'sep)))
+                        ((none) (stop-channel mx i))))))))))))))
+
+; --- music ----------------------------------------------------------------------
+
+(defn- stop-music (mx:&Mixer):void
+  (when (!= (mx 'music) null)
+    (Mix_HaltMusic)
+    (Mix_FreeMusic (unsafe/cast (ptr Mix_Music) (mx 'music)))
+    (set! (mx 'music) null))
+  (set! (mx 'music-playing) 0))
+
+; S_ChangeMusic. The same song again carries on; a MUS lump goes through
+; mus2mid. A missing lump (v1.9's idmus asks Doom 1 for Doom II's songs) or a
+; MIDI that SDL_mixer can't play leaves the music off.
+(defn mixer-change-music (mx:&Mixer wad:&Wad n:i32 loop:bool):void
+  (when (or (<= n 0) (>= n NUMMUSIC)) (return))
+  (when (= (mx 'music-playing) n) (return))
+  (stop-music mx)
+  (set! (mx 'music-playing) n)
+  (when (not (mx 'open)) (return))
+  (let (nm (str "D_" (aref MUSIC-NAMES (as i64 n))))
+    (match (lump-named wad (name (string-as-view &nm)))
+      ((err e) 0)
+      ((ok l)
+       (let (data (ref l 'data)
+             mus (and (>= (count data) 4) (= (byte-at data 0) 0x4d) (= (byte-at data 1) 0x55)
+                      (= (byte-at data 2) 0x53) (= (byte-at data 3) 0x1a)))
+         (set! (mx 'music-data) (make (Vector ui8)))
+         (if mus
+           (match (mus2mid (ref mx 'm2m) data)
+             ((some mid) (set! (mx 'music-data) mid))
+             ((none) 0))
+           (dotimes (i:usize (count data)) (conj (ref mx 'music-data) (unsafe/cast ui8 (byte-at data i)))))
+         (let (md (view (ref mx 'music-data)))
+           (when (> (count &md) 0)
+             (let (rw (SDL_RWFromConstMem (unsafe/cast ptr (&md 0)) (as-checked i32 (count &md)))
+                   m (Mix_LoadMUS_RW rw 1))
+               (when (!= (unsafe/cast ptr m) null)
+                 (set! (mx 'music) (unsafe/cast ptr m))
+                 (Mix_PlayMusic m (if loop -1 1))
+                 (when (mx 'music-paused) (Mix_PauseMusic)))))))))))
+
+; S_SetMusicVolume, from the menu's 0-15: I_SDL_SetMusicVolume scales
+; vanilla's 0-127 to SDL's 0-128.
+(defn mixer-music-volume (mx:&Mixer volume:i32):void
+  (when (mx 'open) (Mix_VolumeMusic (/ (* (* volume 8) MIX_MAX_VOLUME) 127))))
+
+; S_PauseSound and S_ResumeSound: only the music pauses.
+(defn mixer-pause-music (mx:&Mixer paused:bool):void
+  (when (!= paused (mx 'music-paused))
+    (set! (mx 'music-paused) paused)
+    (when (mx 'open)
+      (if paused (Mix_PauseMusic) (Mix_ResumeMusic)))))

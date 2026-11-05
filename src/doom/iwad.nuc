@@ -1,0 +1,120 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; Where to look for an IWAD (Iron Doom crates/wad: directory.rs, sys/unix.rs).
+; The Windows registry search is out of scope.
+
+(ns doom.iwad)
+
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.string-split)
+(import-use nucleus.file)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.util)
+
+(defn- sv (s:CStr):StrView (return (strview-from-cstr s)))
+
+(defn- join (dir:StrView file:StrView):String
+  (if (or (= (dir 'len) 0) (= (unsafe/cast i32 @(unsafe/cast &ui8 (unsafe/ptr+ (dir 'data) (as-checked i64 (- (dir 'len) 1))))) 47))
+    (return (str dir file))
+    (return (str dir "/" file))))
+
+(defn- env-or (name:CStr fallback:CStr):String
+  (if-some (v (env-var (sv name)))
+    (return (str v))
+    (return (str fallback))))
+
+; Each entry of a colon-separated list, with `suffix` appended (env::split_paths).
+(defn- add-path (dirs:&(Vector String) path:StrView suffix:CStr):void
+  (let (start:usize 0 i:usize 0 b (unsafe/cast &ui8 (path 'data)))
+    (while (<= i (path 'len))
+      (when (or (= i (path 'len)) (= @(unsafe/cast &ui8 (unsafe/ptr+ b (as-checked i64 i))) 58))
+        (let (part (strview (unsafe/cast &ui8 (unsafe/ptr+ b (as-checked i64 start))) (- i start)))
+          (conj dirs (join part (sv suffix))))
+        (set! start (+ i 1)))
+      (inc! i))))
+
+(defn iwad-dirs ():(Vector String)
+  (let (dirs (make (Vector String)))
+    ; Look in the current directory. Doom always does this.
+    (conj &dirs (str "."))
+    (match (real-path (sv "."))
+      ((ok cwd) (conj &dirs cwd))
+      ((err e) 0))
+    (when-some (d (env-var (sv "DOOMWADDIR"))) (conj &dirs (str d)))
+    (when-some (p (env-var (sv "DOOMWADPATH"))) (add-path &dirs p ""))
+    ; XDG: $XDG_DATA_HOME/games/doom, then each of $XDG_DATA_DIRS.
+    (let (home (env-or "HOME" "/")
+          data-home (match (env-var (sv "XDG_DATA_HOME"))
+                      ((some v) (str v))
+                      ((none) (str (string-as-view &home) "/.local/share")))
+          data-dirs (env-or "XDG_DATA_DIRS" "/usr/local/share:/usr/share"))
+      (conj &dirs (str (string-as-view &data-home) "/games/doom"))
+      (add-path &dirs (string-as-view &data-dirs) "games/doom")
+      (add-path &dirs (string-as-view &data-dirs) "doom")
+      (add-path &dirs (string-as-view &data-dirs) "games/doom3bfg/base/wads")
+      ; Steam installs some Windows Doom releases under Wine.
+      (let (steam (str (string-as-view &home) "/.steam/root/steamapps/common"))
+        (macmap ((sub) `(add-path &dirs (string-as-view &steam) ~sub))
+          ("Doom 2/base" "Doom 2/finaldoombase" "Master Levels of Doom/doom2"
+           "Ultimate Doom/base" "Final Doom/base" "DOOM 3 BFG Edition/base/wads"
+           "Heretic Shadow of the Serpent Riders/base" "Hexen/base"
+           "Hexen Deathkings of the Dark Citadel/base" "Strife"))))
+    (return dirs)))
+
+(defn- ascii-lower (c:ui8):ui8
+  (return (if (and (>= c 65) (<= c 90)) (+ c 32) c)))
+
+(defn- eq-ignore-case (a:StrView b:StrView):bool
+  (when (!= (a 'len) (b 'len)) (return false))
+  (dotimes (i:usize (a 'len))
+    (when (!= (ascii-lower @(unsafe/cast &ui8 (unsafe/ptr+ (a 'data) (as-checked i64 i))))
+              (ascii-lower @(unsafe/cast &ui8 (unsafe/ptr+ (b 'data) (as-checked i64 i)))))
+      (return false)))
+  (return true))
+
+(defn- base-name (p:StrView):StrView
+  (let (i (p 'len) b (unsafe/cast &ui8 (p 'data)))
+    (while (and (> i 0) (!= @(unsafe/cast &ui8 (unsafe/ptr+ b (as-checked i64 (- i 1)))) 47))
+      (dec! i))
+    (return (strview (unsafe/cast &ui8 (unsafe/ptr+ b (as-checked i64 i))) (- (p 'len) i)))))
+
+; A DOOMWADDIR or DOOMWADPATH entry may name the IWAD file itself.
+(defn- has-iwad (dir:StrView iwad:StrView):?String
+  (when (and (file-exists? dir) (eq-ignore-case (base-name dir) iwad))
+    (return (some (str dir))))
+  (let (p (join dir iwad))
+    (if (file-exists? (string-as-view &p))
+      (return (some p))
+      (return none))))
+
+; `name` may be a path, or a file name to look for in each directory.
+(defn find-iwad (dirs:&(Vector String) name:StrView):?String
+  (when (file-exists? name) (return (some (str name))))
+  (let (ds (view dirs))
+    (dotimes (i:usize (count &ds))
+      (when-some (p (has-iwad (string-as-view (&ds i)) name)) (return (some p)))))
+  (return none))
+
+(defn search-iwads (dirs:&(Vector String)):?String
+  (let (ds (view dirs))
+    (dotimes (i:usize (count &ds))
+      (macmap ((w) `(when-some (p (has-iwad (string-as-view (&ds i)) (sv ~w))) (return (some p))))
+        ("doom.wad" "doom1.wad"))))
+  (return none))
+
+(defn locate-iwad (requested:?StrView):(Fallible String)
+  (let (dirs (iwad-dirs)
+        found (match requested
+                ((some n) (find-iwad &dirs n))
+                ((none) (search-iwads &dirs))))
+    (if-some (p found)
+      (return (ok p))
+      (fail "Game mode indeterminate. No IWAD file was found. Try\n"
+            "specifying one with the '--iwad' command line parameter.\n"))))

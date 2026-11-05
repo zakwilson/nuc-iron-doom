@@ -1,0 +1,18 @@
+; ISSUE-021: a let binding typed &T accepts a T value (a Vector element, a
+; call result) and silently binds the address of a copy, so writes through
+; it are lost. `&(v 0)` written out is refused for exactly this reason.
+; fixed-when: compile-fails
+; Actual: compiles, and main returns 252 (the write to x never reaches v).
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+
+(defstruct P x:i32 y:i32)
+
+(defn main ():i32
+  (let (v (make (Vector P)))
+    (conj &v (P 1 2))
+    (let (p:&P (&v 0))
+      (set! (p 'x) 5))
+    (return (- ((&v 0) 'x) 5))))

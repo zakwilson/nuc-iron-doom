@@ -1,0 +1,22 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+
+(ns doom.util)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+
+; A Vector that has stopped growing, as a Slice, whose `invoke` hands out &T.
+; The stdlib has no such view (ISSUE-005).
+(defn view (v:&(Vector T)):(Slice T)
+  (return (slice-of (unsafe/cast (ptr T) (v 'data)) (v 'len))))
+
+; Remove and return the last element. ISSUE-014: Vector has no pop.
+(defn pop-last (v:&(Vector T)):T
+  (let (n (count v) x (v (- n 1)))
+    (truncate! v (- n 1))
+    (return x)))
+
+; Whether two references are to the same object.
+(defn same? (a:ptr b:ptr):bool
+  (return (= (unsafe/cast usize a) (unsafe/cast usize b))))

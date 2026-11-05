@@ -1,0 +1,14 @@
+; ISSUE-016: a union's IR type was its largest-aligned member, and a value
+; copied through it lost whatever another member kept in that member's padding.
+; Here V's y sits where E has padding (bytes 4..8), so (ok v) lost y.
+; fixed-when: runs
+
+(defstruct V x:f32 y:f32)
+(defstruct E code:i32 n:i64)
+
+(defn f (v:V):(Result V E) (return (ok v)))
+
+(defn main ():i32
+  (match (f (V 1.0 -2.0))
+    ((ok w) (return (if (= (w 'y) -2.0) 0 1)))
+    ((err e) (return 2))))

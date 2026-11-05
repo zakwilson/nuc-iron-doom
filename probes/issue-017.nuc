@@ -1,0 +1,11 @@
+; ISSUE-017: str and println take i32, i64, usize and ui64 but no narrower or
+; other unsigned width, and widening a ui32 or i16 reaches several of them.
+; fixed-when: runs
+; Actual: "ambiguous overload for 'to-str' under argument widening".
+
+(import-use nucleus.fmt)
+(import-use nucleus.string)
+
+(defn main ():i32
+  (let (a:ui32 7 b:i16 -3 c:ui8 5 s (str a " " b " " c))
+    (return (if (= (count (ref s 'bytes)) 6) 0 1))))

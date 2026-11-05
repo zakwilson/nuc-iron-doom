@@ -1,0 +1,109 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom r_things.c, r_data.c); this port is GPLv3,
+; see COPYING.
+;
+; Sprite definitions: for each sprite name, each frame's patch for each of
+; the eight view rotations, built from the lumps between S_START and S_END.
+; A lump named like TROOA2A8 serves rotation 2, and rotation 8 mirrored.
+
+(ns doom.render.sprites)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.graphics)
+(import-use doom.fixed)
+(import-use doom.info)
+
+; `rotate` is -1 until a lump is found, then 0 for one patch at every
+; rotation or 1 for eight. `patch` indexes the sprite patches.
+(defstruct SpriteFrame rotate:i32 patch:(array i32 8) flip:(array bool 8))
+(defstruct SpriteDef frames:(Vector SpriteFrame))
+
+; spritewidth, spriteoffset and spritetopoffset are the patch's header,
+; in fixed point.
+(defstruct SpritePatch patch:Patch width:Fixed offset:Fixed top-offset:Fixed)
+
+(defstruct Sprites patches:(Vector SpritePatch) defs:(Vector SpriteDef))
+
+(defn- empty-frame ():SpriteFrame
+  (return (SpriteFrame -1 (array i32 -1 -1 -1 -1 -1 -1 -1 -1)
+                       (array bool false false false false false false false false))))
+
+; R_InstallSpriteLump.
+(defn- install (frames:&(Vector SpriteFrame) maxframe:&i32 sprite:Name patch:i32
+                frame:i32 rotation:i32 flipped:bool):(Fallible void)
+  (when (or (< frame 0) (>= frame 29) (< rotation 0) (> rotation 8))
+    (fail "R_InstallSpriteLump: Bad frame characters in lump " patch))
+  (when (> frame @maxframe) (set! @maxframe frame))
+  ; ISSUE-021: through a Slice; a Vector element bound as &T is a copy.
+  (let (fs (view frames) f (&fs (as usize frame)))
+    (when (= rotation 0)
+      (when (= (f 'rotate) 0)
+        (fail "R_InitSprites: Sprite " sprite " frame " (+ frame 65) " has multip rot=0 lump"))
+      (when (= (f 'rotate) 1)
+        (fail "R_InitSprites: Sprite " sprite " frame " (+ frame 65) " has rotations and a rot=0 lump"))
+      (set! (f 'rotate) 0)
+      (dotimes (r:i64 8)
+        (set! (aref (f 'patch) r) patch)
+        (set! (aref (f 'flip) r) flipped))
+      (return (ok)))
+    (when (= (f 'rotate) 0)
+      (fail "R_InitSprites: Sprite " sprite " frame " (+ frame 65) " has rotations and a rot=0 lump"))
+    (set! (f 'rotate) 1)
+    (let (r (as i64 (- rotation 1)))
+      (when (!= (aref (f 'patch) r) -1)
+        (fail "R_InitSprites: Sprite " sprite " has two lumps mapped to frame " (+ frame 65) " rotation " rotation))
+      (set! (aref (f 'patch) r) patch)
+      (set! (aref (f 'flip) r) flipped)))
+  (return (ok)))
+
+; R_InitSpriteDefs over the sprite names in `info`.
+(defn sprites-load (w:&Wad):(Fallible Sprites)
+  (let (first (match (lump-index w "S_START") ((some i) (+ i 1)) ((none) (fail "No S_START lump")))
+        end (match (lump-index w "S_END") ((some i) i) ((none) (fail "No S_END lump")))
+        patches (make (Vector SpritePatch))
+        defs (make (Vector SpriteDef)))
+    (let (l first)
+      (while (< l end)
+        (let (p (try (patch-parse (ref (lump-at w l) 'data))))
+          (conj &patches (SpritePatch p (int-to-fixed (as-checked i32 (p 'width)))
+                                      (int-to-fixed (as i32 (p 'left-offset)))
+                                      (int-to-fixed (as i32 (p 'top-offset))))))
+        (inc! l)))
+    (dotimes (s:i32 NUMSPRITES)
+      (let (sn (sprite-name s) frames (make (Vector SpriteFrame)) maxframe:i32 -1 l first)
+        (dotimes (i:usize 29) (conj &frames (empty-frame)))
+        (while (< l end)
+          (let (ln ((lump-at w l) 'name) patch (as-checked i32 (- l first)))
+            (when (= (name-prefix ln 4) sn)
+              (try (install &frames &maxframe sn patch
+                            (- (as i32 (name-byte ln 4)) 65) (- (as i32 (name-byte ln 5)) 48) false))
+              (when (!= (name-byte ln 6) 0)
+                (try (install &frames &maxframe sn patch
+                              (- (as i32 (name-byte ln 6)) 65) (- (as i32 (name-byte ln 7)) 48) true)))))
+          (inc! l))
+        (truncate! &frames (as-checked usize (+ maxframe 1)))
+        (let (fs (view &frames))
+          (dotimes (f:usize (count &fs))
+            (let (fr (&fs f))
+              (when (= (fr 'rotate) -1)
+                (fail "R_InitSprites: No patches found for " sn " frame " (+ (unsafe/cast i32 f) 65)))
+              (when (= (fr 'rotate) 1)
+                (dotimes (r:i64 8)
+                  (when (= (aref (fr 'patch) r) -1)
+                    (fail "R_InitSprites: Sprite " sn " frame " (+ (unsafe/cast i32 f) 65) " is missing rotations")))))))
+        (conj &defs (SpriteDef frames))))
+    (return (ok (Sprites patches defs)))))
+
+(defn sprite-def (s:&Sprites i:i32):&SpriteDef
+  (let (v (view (ref s 'defs))) (return (&v (as-checked usize i)))))
+
+(defn sprite-patch (s:&Sprites i:i32):&SpritePatch
+  (let (v (view (ref s 'patches))) (return (&v (as-checked usize i)))))

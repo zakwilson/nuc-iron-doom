@@ -1,0 +1,50 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; A row-major 2D array over one allocation (Iron Doom crates/common).
+
+(ns doom.buffer)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use doom.util)
+
+(defstruct (Array2d T) data:(Vector T) width:usize height:usize)
+
+(deftype Buffer (Array2d ui8))
+
+(defn array2d (width:usize height:usize fill:T):(Array2d T)
+  (let (v (make (Vector T)))
+    (reserve &v (* width height))
+    (dotimes (i:usize (* width height)) (conj &v fill))
+    (return ((Array2d T) v width height))))
+
+(defn width (self:&(Array2d T)):usize (return (self 'width)))
+(defn height (self:&(Array2d T)):usize (return (self 'height)))
+
+; Reads are (a x y); writes must be (set a x y v), since `set!` takes no
+; two-key place (ISSUE-001).
+(defn invoke (self:&(Array2d T) x:usize y:usize):T
+  (return ((ref self 'data) (+ x (* y (self 'width))))))
+
+(defn set (self:&(Array2d T) x:usize y:usize v:T):void
+  (set (ref self 'data) (+ x (* y (self 'width))) v))
+
+(defn fill (self:&(Array2d T) v:T):void
+  (let (s (view (ref self 'data)))
+    (dotimes (i:usize (count &s)) (set &s i v))))
+
+(defn copy-of (src:&(Array2d T)):(Array2d T)
+  (let (d (array2d (src 'width) (src 'height) ((ref src 'data) 0)))
+    (copy-from &d src)
+    (return d)))
+
+(defn copy-from (self:&(Array2d T) src:&(Array2d T)):void
+  (let (d (view (ref self 'data)) s (view (ref src 'data)))
+    (dotimes (i:usize (count &d)) (set &d i @(&s i)))))
+
+; The cells as one row-major run, for handing to SDL.
+(defn cells (self:&(Array2d T)):(Slice T)
+  (return (view (ref self 'data))))

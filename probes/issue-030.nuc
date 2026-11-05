@@ -1,0 +1,24 @@
+; ISSUE-030: a generic stamped for `(Vector &Q)` and then for `(Vector ?&Q)`
+; reuses the first instance's inner call, and the compiler stops.
+; fixed-when: output-contains 7 none
+; Actual: "view.pnuc_Vector.qQ: internal: aggregate return of a (Slice &Q)
+; where the declared return type is %nuc_Slice.qQ". Each half alone compiles.
+
+(import-use "stdio.h")
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+
+(defstruct Q a:i32)
+
+(defn view (v:&(Vector T)):(Slice T)
+  (return (slice-of (unsafe/cast (ptr T) (v 'data)) (v 'len))))
+
+(defn main ():i32
+  (let (v (make (Vector &Q)) q (Q 7) n:?&Q none u (make (Vector ?&Q)))
+    (conj &v &q)
+    (conj &u n)
+    (let (s (view &v) e (&s 0) s2 (view &u) e2 (&s2 0))
+      (printf "%d %s\n" (@e 'a) (if (none? @e2) "none" "some"))
+      (return 0))))

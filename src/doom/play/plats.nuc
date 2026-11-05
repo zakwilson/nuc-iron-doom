@@ -1,0 +1,144 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_plats.c); this port is GPLv3, see COPYING.
+;
+; Platforms: lifts, and floors that rise and change their flat.
+
+(ns doom.play.plats)
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.spec)
+(import-use doom.play.floors)
+
+(defn- add-active-plat (w:&World p:&Plat):(Fallible void)
+  (let (a (ref w 'active-plats))
+    (dotimes (i:usize MAXPLATS)
+      (when (none? (a i))
+        (set a i (some p))
+        (return (ok)))))
+  (fail "P_AddActivePlat: no more plats!"))
+
+(defn- remove-active-plat (w:&World p:&Plat):(Fallible void)
+  (let (a (ref w 'active-plats) np:?&Plat none)
+    (dotimes (i:usize MAXPLATS)
+      (when-some (x (a i))
+        (when (same? x p)
+          (set-special-data w (p 'sector) none)
+          (remove-thinker (unwrap (p 'th)))
+          (set a i np)
+          (return (ok))))))
+  (fail "P_RemoveActivePlat: can't find plat!"))
+
+; T_PlatRaise.
+(defn t-plat-raise (w:&World p:&Plat):(Fallible void)
+  (let (s (sector-at (ref w 'level) (p 'sector)))
+    (case (p 'status)
+      PLAT-UP
+      (let (res (try (move-plane w (p 'sector) (p 'speed) (p 'high) (if (p 'crush) 1 0) 0 1)))
+        (when (and (case (p 'type) (:or RAISE-AND-CHANGE RAISE-TO-NEAREST-AND-CHANGE) true false)
+                   (= (bit-and (w 'level-time) 7) 0))
+          (start-sector-sound w (p 'sector) SFX-STNMOV))
+        (if (and (= res RES-CRUSHED) (not (p 'crush)))
+          (do (set! (p 'count) (p 'wait))
+              (set! (p 'status) PLAT-DOWN)
+              (start-sector-sound w (p 'sector) SFX-PSTART))
+          (when (= res RES-PASTDEST)
+            (set! (p 'count) (p 'wait))
+            (set! (p 'status) PLAT-WAITING)
+            (start-sector-sound w (p 'sector) SFX-PSTOP)
+            (when (case (p 'type)
+                    (:or BLAZE-DWUS DOWN-WAIT-UP-STAY RAISE-AND-CHANGE RAISE-TO-NEAREST-AND-CHANGE) true
+                    false)
+              (try (remove-active-plat w p))))))
+      PLAT-DOWN
+      (let (res (try (move-plane w (p 'sector) (p 'speed) (p 'low) 0 0 -1)))
+        (when (= res RES-PASTDEST)
+          (set! (p 'count) (p 'wait))
+          (set! (p 'status) PLAT-WAITING)
+          (start-sector-sound w (p 'sector) SFX-PSTOP)))
+      PLAT-WAITING
+      (do (set! (p 'count) (- (p 'count) 1))
+          (when (= (p 'count) 0)
+            (set! (p 'status) (if (= (s 'floor-height) (p 'low)) PLAT-UP PLAT-DOWN))
+            (start-sector-sound w (p 'sector) SFX-PSTART)))
+      0))
+  (return (ok)))
+
+; P_ActivateInStasis.
+(defn- activate-in-stasis (w:&World tag:i32):void
+  (let (a (ref w 'active-plats))
+    (dotimes (i:usize MAXPLATS)
+      (when-some (p (a i))
+        (when (and (= (p 'tag) tag) (= (p 'status) PLAT-IN-STASIS))
+          (set! (p 'status) (p 'old-status))
+          (set! ((unwrap (p 'th)) 'idle) false))))))
+
+; EV_DoPlat.
+(defn do-plat (w:&World li:usize type:i32 amount:i32):(Fallible bool)
+  (let (l (ref w 'level) line (line-at l li) rtn false)
+    (when (= type PERPETUAL-RAISE) (activate-in-stasis w (line 'tag)))
+    (let (secnum (find-sector-from-line-tag w line -1))
+      (while (>= secnum 0)
+        (let (si (as-checked usize secnum) sec (sector-at l si))
+          (when (none? (special-data w si))
+            (set! rtn true)
+            (let (p (new Plat (ref w 'arena)))
+              ; Vanilla leaves low and count as the allocator found them.
+              (set! @p (Plat none si 0 0 0 0 0 0 0 false (line 'tag) type))
+              (let (th (add-thinker w (Think-plat p)))
+                (set! (p 'th) (some th))
+                (set-special-data w si (some th)))
+              (case type
+                RAISE-TO-NEAREST-AND-CHANGE
+                (do (set! (p 'speed) (/ PLATSPEED 2))
+                    (set! (sec 'floor-pic) ((sector-at l ((side-at l (as-checked usize (aref (line 'side-num) 0))) 'sector)) 'floor-pic))
+                    (set! (p 'high) (try (find-next-highest-floor w si (sec 'floor-height))))
+                    (set! (p 'wait) 0)
+                    (set! (p 'status) PLAT-UP)
+                    (set! (sec 'special) 0)
+                    (start-sector-sound w si SFX-STNMOV))
+                RAISE-AND-CHANGE
+                (do (set! (p 'speed) (/ PLATSPEED 2))
+                    (set! (sec 'floor-pic) ((sector-at l ((side-at l (as-checked usize (aref (line 'side-num) 0))) 'sector)) 'floor-pic))
+                    (set! (p 'high) (+ (sec 'floor-height) (* amount FRACUNIT)))
+                    (set! (p 'wait) 0)
+                    (set! (p 'status) PLAT-UP)
+                    (start-sector-sound w si SFX-STNMOV))
+                (:or DOWN-WAIT-UP-STAY BLAZE-DWUS)
+                (do (set! (p 'speed) (* PLATSPEED (if (= type BLAZE-DWUS) 8 4)))
+                    (set! (p 'low) (min (find-lowest-floor-surrounding w si) (sec 'floor-height)))
+                    (set! (p 'high) (sec 'floor-height))
+                    (set! (p 'wait) (* TICRATE PLATWAIT))
+                    (set! (p 'status) PLAT-DOWN)
+                    (start-sector-sound w si SFX-PSTART))
+                PERPETUAL-RAISE
+                (do (set! (p 'speed) PLATSPEED)
+                    (set! (p 'low) (min (find-lowest-floor-surrounding w si) (sec 'floor-height)))
+                    (set! (p 'high) (max (find-highest-floor-surrounding w si) (sec 'floor-height)))
+                    (set! (p 'wait) (* TICRATE PLATWAIT))
+                    (set! (p 'status) (bit-and (p-random w) 1))
+                    (start-sector-sound w si SFX-PSTART))
+                0)
+              (try (add-active-plat w p)))))
+        (set! secnum (find-sector-from-line-tag w line secnum))))
+    (return (ok rtn))))
+
+; EV_StopPlat: tagged moving plats go into stasis.
+(defn stop-plat (w:&World li:usize):void
+  (let (tag ((line-at (ref w 'level) li) 'tag) a (ref w 'active-plats))
+    (dotimes (j:usize MAXPLATS)
+      (when-some (p (a j))
+        (when (and (!= (p 'status) PLAT-IN-STASIS) (= (p 'tag) tag))
+          (set! (p 'old-status) (p 'status))
+          (set! (p 'status) PLAT-IN-STASIS)
+          (set! ((unwrap (p 'th)) 'idle) true))))))

@@ -1,0 +1,22 @@
+(ns tests.wad)
+
+(import-use nucleus.test)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.bytes)
+(import-use doom.wad)
+
+(defn- shareware ():(Fallible Wad)
+  (return (wad-open (strview-from-cstr "/usr/share/games/doom/doom1.wad"))))
+
+(deftest wad-directory
+  (match (shareware)
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok w)
+     (try (check-eq-int (as i64 (lump-count &w)) 1264 "lump count"))
+     (try (check (= ((lump-at &w 0) 'name) (name "PLAYPAL")) "first lump"))
+     (if-some (i (lump-index &w "e1m1"))
+       (try (check-eq-int (as i64 (lump-size (lump-at &w (+ i 4)))) 1868 "E1M1 VERTEXES size"))
+       (try (check false "E1M1 found"))))))

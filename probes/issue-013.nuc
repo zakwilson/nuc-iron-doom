@@ -1,0 +1,7 @@
+; ISSUE-013: float `!=` was the ordered `fcmp one`, so NaN != NaN was false,
+; unlike C, Rust and IEEE 754.
+; fixed-when: runs
+
+(defn main ():i32
+  (let (z:f32 0.0 n (/ z z))
+    (return (if (!= n n) 0 1))))

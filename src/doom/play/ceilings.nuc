@@ -1,0 +1,137 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_ceilng.c); this port is GPLv3, see COPYING.
+;
+; Ceiling movers and crushers, which can be stopped and restarted.
+
+(ns doom.play.ceilings)
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.spec)
+(import-use doom.play.floors)
+
+; P_AddActiveCeiling: a full list silently drops it.
+(defn- add-active-ceiling (w:&World c:&Ceiling):void
+  (let (a (ref w 'active-ceilings) i:usize 0)
+    (while (< i MAXCEILINGS)
+      (when (none? (a i))
+        (set a i (some c))
+        (return))
+      (inc! i))))
+
+; P_RemoveActiveCeiling.
+(defn- remove-active-ceiling (w:&World c:&Ceiling):void
+  (let (a (ref w 'active-ceilings) i:usize 0 nc:?&Ceiling none)
+    (while (< i MAXCEILINGS)
+      (when-some (x (a i))
+        (when (same? x c)
+          (set-special-data w (c 'sector) none)
+          (remove-thinker (unwrap (c 'th)))
+          (set a i nc)
+          (return)))
+      (inc! i))))
+
+(defn- stnmov (w:&World c:&Ceiling):void
+  (when (and (= (bit-and (w 'level-time) 7) 0) (!= (c 'type) SILENT-CRUSH-AND-RAISE))
+    (start-sector-sound w (c 'sector) SFX-STNMOV)))
+
+; T_MoveCeiling.
+(defn t-move-ceiling (w:&World c:&Ceiling):(Fallible void)
+  (case (c 'direction)
+    1 (let (res (try (move-plane w (c 'sector) (c 'speed) (c 'top-height) 0 1 1)))
+        (stnmov w c)
+        (when (= res RES-PASTDEST)
+          (case (c 'type)
+            RAISE-TO-HIGHEST (remove-active-ceiling w c)
+            SILENT-CRUSH-AND-RAISE (do (start-sector-sound w (c 'sector) SFX-PSTOP)
+                                       (set! (c 'direction) -1))
+            (:or FAST-CRUSH-AND-RAISE CRUSH-AND-RAISE) (set! (c 'direction) -1)
+            0)))
+    -1 (let (res (try (move-plane w (c 'sector) (c 'speed) (c 'bottom-height)
+                                  (if (c 'crush) 1 0) 1 -1)))
+         (stnmov w c)
+         (if (= res RES-PASTDEST)
+           (case (c 'type)
+             SILENT-CRUSH-AND-RAISE (do (start-sector-sound w (c 'sector) SFX-PSTOP)
+                                        (set! (c 'speed) CEILSPEED)
+                                        (set! (c 'direction) 1))
+             CRUSH-AND-RAISE (do (set! (c 'speed) CEILSPEED)
+                                 (set! (c 'direction) 1))
+             FAST-CRUSH-AND-RAISE (set! (c 'direction) 1)
+             (:or LOWER-AND-CRUSH LOWER-TO-FLOOR) (remove-active-ceiling w c)
+             0)
+           (when (= res RES-CRUSHED)
+             (when (case (c 'type) (:or SILENT-CRUSH-AND-RAISE CRUSH-AND-RAISE LOWER-AND-CRUSH) true false)
+               (set! (c 'speed) (/ CEILSPEED 8))))))
+    0)
+  (return (ok)))
+
+; P_ActivateInStasisCeiling.
+(defn- activate-in-stasis-ceiling (w:&World line:&Line):void
+  (let (a (ref w 'active-ceilings))
+    (dotimes (i:usize MAXCEILINGS)
+      (when-some (c (a i))
+        (when (and (= (c 'tag) (line 'tag)) (= (c 'direction) 0))
+          (set! (c 'direction) (c 'old-direction))
+          (set! ((unwrap (c 'th)) 'idle) false))))))
+
+; EV_DoCeiling.
+(defn do-ceiling (w:&World li:usize type:i32):(Fallible bool)
+  (let (l (ref w 'level) line (line-at l li) rtn false)
+    (when (case type (:or FAST-CRUSH-AND-RAISE SILENT-CRUSH-AND-RAISE CRUSH-AND-RAISE) true false)
+      (activate-in-stasis-ceiling w line))
+    (let (secnum (find-sector-from-line-tag w line -1))
+      (while (>= secnum 0)
+        (let (si (as-checked usize secnum) sec (sector-at l si))
+          (when (none? (special-data w si))
+            (set! rtn true)
+            (let (c (new Ceiling (ref w 'arena)))
+              (set! @c (Ceiling none type si 0 0 0 false 0 (sec 'tag) 0))
+              (let (th (add-thinker w (Think-ceiling c)))
+                (set! (c 'th) (some th))
+                (set-special-data w si (some th)))
+              (case type
+                FAST-CRUSH-AND-RAISE
+                (do (set! (c 'crush) true)
+                    (set! (c 'top-height) (sec 'ceiling-height))
+                    (set! (c 'bottom-height) (+ (sec 'floor-height) (* 8 FRACUNIT)))
+                    (set! (c 'direction) -1)
+                    (set! (c 'speed) (* CEILSPEED 2)))
+                (:or SILENT-CRUSH-AND-RAISE CRUSH-AND-RAISE LOWER-AND-CRUSH LOWER-TO-FLOOR)
+                (do (when (case type (:or SILENT-CRUSH-AND-RAISE CRUSH-AND-RAISE) true false)
+                      (set! (c 'crush) true)
+                      (set! (c 'top-height) (sec 'ceiling-height)))
+                    (set! (c 'bottom-height) (sec 'floor-height))
+                    (when (!= type LOWER-TO-FLOOR)
+                      (set! (c 'bottom-height) (+ (c 'bottom-height) (* 8 FRACUNIT))))
+                    (set! (c 'direction) -1)
+                    (set! (c 'speed) CEILSPEED))
+                RAISE-TO-HIGHEST
+                (do (set! (c 'top-height) (find-highest-ceiling-surrounding w si))
+                    (set! (c 'direction) 1)
+                    (set! (c 'speed) CEILSPEED))
+                0)
+              (add-active-ceiling w c))))
+        (set! secnum (find-sector-from-line-tag w line secnum))))
+    (return (ok rtn))))
+
+; EV_CeilingCrushStop: tagged moving ceilings go into stasis.
+(defn ceiling-crush-stop (w:&World li:usize):bool
+  (let (line (line-at (ref w 'level) li) a (ref w 'active-ceilings) rtn false)
+    (dotimes (i:usize MAXCEILINGS)
+      (when-some (c (a i))
+        (when (and (= (c 'tag) (line 'tag)) (!= (c 'direction) 0))
+          (set! (c 'old-direction) (c 'direction))
+          (set! ((unwrap (c 'th)) 'idle) true)
+          (set! (c 'direction) 0)
+          (set! rtn true))))
+    (return rtn)))

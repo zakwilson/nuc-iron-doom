@@ -1,0 +1,8 @@
+; ISSUE-003: a :where written after the return type gets an unrelated message.
+; Expected: an error saying :where belongs in the parameter list.
+; Actual: "unknown type: T" at the defn, or "in generic body: unknown function 'P'"
+; when T appears only in the return type.
+; fixed-when: output-contains parameter list
+(defprotocol Show (show (x:&Self):i32))
+(defn twice (x:&T):i32 :where (Show T) (* 2 (show x)))
+(defn main ():i32 0)

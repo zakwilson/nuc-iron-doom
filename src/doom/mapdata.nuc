@@ -1,0 +1,106 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; The map lumps as stored (Iron Doom crates/wad/src/map/*). A map's lumps
+; follow its marker in a fixed order, so each is found by its offset from it.
+
+(ns doom.mapdata)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.hashmap)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use nucleus.fmt)
+(import-use nucleus.string)
+(import-use doom.error)
+(import-use doom.bytes)
+(import-use doom.record)
+(import-use doom.wad)
+
+(defstruct MapThing x:i16 y:i16 angle:i16 thing-type:i16 options:i16)
+(defstruct MapLine v1:i16 v2:i16 flags:i16 special:i16 tag:i16 front-side:i16 back-side:i16)
+(defstruct MapSide x-offset:i16 y-offset:i16
+  top-texture:Name lower-texture:Name middle-texture:Name sector:i16)
+(defstruct MapVertex x:i16 y:i16)
+(defstruct MapSegment v1:i16 v2:i16 angle:i16 line:i16 side:i16 offset:i16)
+(defstruct MapSubSector num-segs:i16 first-seg:i16)
+(defstruct MapNode x:i16 y:i16 dx:i16 dy:i16
+  right-box-top:i16 right-box-bottom:i16 right-box-left:i16 right-box-right:i16
+  left-box-top:i16 left-box-bottom:i16 left-box-left:i16 left-box-right:i16
+  right-child:i16 left-child:i16)
+(defstruct MapSector floor-height:i16 ceiling-height:i16
+  floor-tex:Name ceiling-tex:Name light-level:i16 special:i16 tag:i16)
+
+(macmap ((r) `(derive-record ~r))
+  (MapThing MapLine MapSide MapVertex MapSegment MapSubSector MapNode MapSector))
+
+(defstruct MapBlockMap
+  origin-x:i16 origin-y:i16 width:i16 height:i16
+  offsets:(Vector i16)
+  block-lists:(Vector i16))
+
+(defstruct Map
+  things:(Vector MapThing)
+  lines:(Vector MapLine)
+  sides:(Vector MapSide)
+  vertexes:(Vector MapVertex)
+  segments:(Vector MapSegment)
+  sub-sectors:(Vector MapSubSector)
+  nodes:(Vector MapNode)
+  sectors:(Vector MapSector)
+  reject:Bytes
+  block-map:MapBlockMap
+  ; Chocolate Doom reads the blockmap as the whole lump of words.
+  blockmap-lump:Bytes)
+
+(defn- i16s (b:&Bytes):(Vector i16)
+  (let (v (make (Vector i16)) i:usize 0)
+    (while (< (+ i 1) (count b))
+      (conj &v (le-i16 b i))
+      (set! i (+ i 2)))
+    (return v)))
+
+(defn- read-block-map (b:&Bytes):MapBlockMap
+  (let (w (le-i16 b 4) h (le-i16 b 6)
+        ; Iron Doom multiplies in i16, so a blockmap past 32767 cells overflows there too.
+        size (as usize (* (as i32 w) (as i32 h)))
+        offsets (sub-bytes b 8 (* 2 size))
+        lists (rest-bytes b (+ 8 (* 2 size))))
+    (return (MapBlockMap (le-i16 b 0) (le-i16 b 2) w h (i16s &offsets) (i16s &lists)))))
+
+(defn- map-lump (w:&Wad marker:usize off:usize):(Fallible Bytes)
+  (when (>= (+ marker off) (lump-count w))
+    (fail "Missing lump #" off " for Map Lump #" marker))
+  (return (ok ((lump-at w (+ marker off)) 'data))))
+
+(defmacro- records-of (T off)
+  `(let (b (try (map-lump w marker ~off))
+         v:(Vector ~T) (read-records &b))
+     v))
+
+(defn map-parse (w:&Wad nm:Name):(Fallible Map)
+  (if-some (marker (lump-index w nm))
+    (let (bm (try (map-lump w marker 10)) rj (try (map-lump w marker 9)))
+      (return (ok (Map (records-of MapThing 1) (records-of MapLine 2) (records-of MapSide 3)
+                       (records-of MapVertex 4) (records-of MapSegment 5)
+                       (records-of MapSubSector 6) (records-of MapNode 7)
+                       (records-of MapSector 8) rj (read-block-map &bm) bm))))
+    (fail "Missing Map " nm)))
+
+(defn map-name (episode:i32 m:i32):Name
+  (let (s (str "E" episode "M" m))
+    (return (name (string-as-view &s)))))
+
+; E1M1..E4M9; an episode ends at its first missing map, as Iron Doom's does.
+(defn maps-parse (w:&Wad):(HashMap Name Map)
+  (let (maps (make (HashMap Name Map)) episode 1)
+    (while (<= episode 4)
+      (let (m 1 go true)
+        (while (and go (<= m 9))
+          (match (map-parse w (map-name episode m))
+            ((ok mp) (assoc &maps (map-name episode m) mp))
+            ((err e) (set! go false)))
+          (inc! m)))
+      (inc! episode))
+    (return maps)))

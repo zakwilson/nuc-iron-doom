@@ -1,0 +1,148 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom r_plane.c); this port is GPLv3, see COPYING.
+;
+; Floors and ceilings. Walls mark, per column, the rows a plane shows through;
+; afterwards each plane is turned into horizontal spans and drawn.
+
+(ns doom.render.plane)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.graphics)
+(import-use doom.fixed)
+(import-use doom.play.map)
+(import-use doom.render.state)
+(import-use doom.render.draw)
+
+(defn clear-planes (r:&Renderer):void
+  (dotimes (i:i32 (r 'view-width))
+    (set-floor-clip r i (r 'view-height))
+    (set-ceiling-clip r i -1))
+  (set! (r 'last-visplane) 0)
+  (set! (r 'last-opening) 0)
+  (dotimes (i:usize SCREENHEIGHT) (set (ref r 'cached-height) i 0))
+  (let (a (- (r 'view-angle) ANG90))
+    (set! (r 'base-xscale) (fixed-div (angle-cos a) (r 'center-x-frac)))
+    (set! (r 'base-yscale) (- 0 (fixed-div (angle-sin a) (r 'center-x-frac))))))
+
+(defn- reset-plane (p:&Visplane height:Fixed pic:i32 light:i32 min-x:i32 max-x:i32):void
+  (set! (p 'height) height)
+  (set! (p 'pic) pic)
+  (set! (p 'light-level) light)
+  (set! (p 'min-x) min-x)
+  (set! (p 'max-x) max-x)
+  (let (t (view (ref p 'top)))
+    (dotimes (i:usize (count &t)) (set &t i (as ui8 0xff)))))
+
+(defn- new-plane (r:&Renderer):(Fallible usize)
+  (when (= (r 'last-visplane) MAXVISPLANES) (fail "R_FindPlane: no more visplanes"))
+  (let (i (r 'last-visplane))
+    (set! (r 'last-visplane) (+ i 1))
+    (return (ok i))))
+
+; The plane for a height, flat and light, made if this frame has none. Every
+; sky is one plane.
+(defn find-plane (r:&Renderer sc:&Scene height:Fixed pic:i32 light:i32):(Fallible usize)
+  (let (h height l light)
+    (when (= pic ((sc 'level) 'sky-flat))
+      (set! h 0)
+      (set! l 0))
+    (dotimes (i:usize (r 'last-visplane))
+      (let (p (visplane-at r i))
+        (when (and (= (p 'height) h) (= (p 'pic) pic) (= (p 'light-level) l))
+          (return (ok i)))))
+    (let (i (try (new-plane r)))
+      (reset-plane (visplane-at r i) h pic l SCREENWIDTH -1)
+      (return (ok i)))))
+
+; Plane `pl` widened to columns start..stop, or a copy of it when any of
+; those columns is already marked.
+(defn check-plane (r:&Renderer pl:usize start:i32 stop:i32):(Fallible usize)
+  (let (p (visplane-at r pl)
+        intrl (if (< start (p 'min-x)) (p 'min-x) start)
+        unionl (if (< start (p 'min-x)) start (p 'min-x))
+        intrh (if (> stop (p 'max-x)) (p 'max-x) stop)
+        unionh (if (> stop (p 'max-x)) stop (p 'max-x))
+        x intrl)
+    (while (and (<= x intrh) (= (plane-top p x) 0xff)) (inc! x))
+    (when (> x intrh)
+      (set! (p 'min-x) unionl)
+      (set! (p 'max-x) unionh)
+      (return (ok pl)))
+    (let (i (try (new-plane r)))
+      (reset-plane (visplane-at r i) (p 'height) (p 'pic) (p 'light-level) start stop)
+      (return (ok i)))))
+
+; R_MapPlane: row y, columns x1..x2 of the plane being drawn.
+(defn- map-plane (r:&Renderer sc:&Scene flat:&Bytes y:i32 x1:i32 x2:i32):void
+  (let (yi (as usize y) distance:Fixed 0 xstep:Fixed 0 ystep:Fixed 0)
+    (if (!= (r 'plane-height) ((ref r 'cached-height) yi))
+      (do (set (ref r 'cached-height) yi (r 'plane-height))
+          (set! distance (fixed-mul (r 'plane-height) ((ref r 'y-slope) yi)))
+          (set (ref r 'cached-distance) yi distance)
+          (set! xstep (fixed-mul distance (r 'base-xscale)))
+          (set (ref r 'cached-xstep) yi xstep)
+          (set! ystep (fixed-mul distance (r 'base-yscale)))
+          (set (ref r 'cached-ystep) yi ystep))
+      (do (set! distance ((ref r 'cached-distance) yi))
+          (set! xstep ((ref r 'cached-xstep) yi))
+          (set! ystep ((ref r 'cached-ystep) yi))))
+    (let (length (fixed-mul distance ((ref r 'dist-scale) (as usize x1)))
+          a (+ (r 'view-angle) (x-to-view-angle r x1))
+          xfrac (wrap-add (r 'view-x) (fixed-mul (angle-cos a) length))
+          yfrac (wrap-sub (- 0 (r 'view-y)) (fixed-mul (angle-sin a) length))
+          index (bit-shr (unsafe/cast ui32 distance) LIGHTZSHIFT)
+          map (if (>= (r 'fixed-colormap) 0)
+                (r 'fixed-colormap)
+                (z-light r (r 'plane-z-light) (if (>= index MAXLIGHTZ) (- MAXLIGHTZ 1) (as i32 index)))))
+      (draw-span r (sc 'screen) (sc 'colormaps) flat y x1 x2 xfrac yfrac xstep ystep map))))
+
+; R_MakeSpans: close the spans that end before column x and open the ones
+; that start at it, given the plane's rows in columns x-1 (t1..b1) and x.
+(defn- make-spans (r:&Renderer sc:&Scene flat:&Bytes x:i32 t1:i32 b1:i32 t2:i32 b2:i32):void
+  (let (st (ref r 'span-start) a t1 b b1 c t2 d b2)
+    (while (and (< a c) (<= a b))
+      (map-plane r sc flat a (st (as usize a)) (- x 1))
+      (inc! a))
+    (while (and (> b d) (>= b a))
+      (map-plane r sc flat b (st (as usize b)) (- x 1))
+      (set! b (- b 1)))
+    (while (and (< c a) (<= c d))
+      (set st (as usize c) x)
+      (inc! c))
+    (while (and (> d b) (>= d c))
+      (set st (as usize d) x)
+      (set! d (- d 1)))))
+
+(defn- draw-sky (r:&Renderer sc:&Scene p:&Visplane):void
+  ; The sky ignores light: colormap 0, at the scale of the player's weapon.
+  (dotimes (k:i32 (+ (- (p 'max-x) (p 'min-x)) 1))
+    (let (x (+ (p 'min-x) k) yl (plane-top p x) yh (plane-bottom p x))
+      (when (<= yl yh)
+        (let (a (bit-shr (+ (r 'view-angle) (x-to-view-angle r x)) ANGLETOSKYSHIFT)
+              src (texture-column (sc 'textures) (r 'sky-texture) (unsafe/cast i32 a)))
+          (draw-column r (sc 'screen) (sc 'colormaps) x yl yh (r 'sky-texture-mid)
+                       (r 'pspriteiscale) &src 0))))))
+
+(defn draw-planes (r:&Renderer sc:&Scene):void
+  (dotimes (i:usize (r 'last-visplane))
+    (let (p (visplane-at r i))
+      (when (<= (p 'min-x) (p 'max-x))
+        (if (= (p 'pic) ((sc 'level) 'sky-flat))
+          (draw-sky r sc p)
+          (let (flat ((flat-at (sc 'flats) (as-checked usize (translated-flat sc (p 'pic)))) 'data)
+                light (+ (bit-shr (p 'light-level) LIGHTSEGSHIFT) (r 'extra-light)))
+            (set! (r 'plane-height) (iabs (wrap-sub (p 'height) (r 'view-z))))
+            (set! (r 'plane-z-light) (cond (>= light LIGHTLEVELS) (- LIGHTLEVELS 1) (< light 0) 0 true light))
+            (set-plane-top p (+ (p 'max-x) 1) 0xff)
+            (set-plane-top p (- (p 'min-x) 1) 0xff)
+            (let (x (p 'min-x))
+              (while (<= x (+ (p 'max-x) 1))
+                (make-spans r sc &flat x (plane-top p (- x 1)) (plane-bottom p (- x 1))
+                            (plane-top p x) (plane-bottom p x))
+                (inc! x)))))))))

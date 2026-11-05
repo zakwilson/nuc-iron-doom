@@ -1,0 +1,543 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_mobj.c, p_maputl.c, p_tick.c, p_setup.c);
+; this port is GPLv3, see COPYING.
+;
+; A level in play: the map, its things, and the thinker list that runs them.
+; Mobjs and thinkers live in the level's arena (vanilla's PU_LEVEL), so a
+; `&Mobj` stays valid while more are spawned, as vanilla's pointers do.
+
+(ns doom.play.world)
+
+(import-use nucleus.allocator)
+(import-use nucleus.create)
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.rand)
+(import-use doom.mapdata)
+(import-use doom.play.defs)
+(import-use doom.info)
+(import-use doom.play.map)
+
+(defconst MAXPLAYERS 4)
+(defconst ONFLOORZ -2147483648)
+(defconst ONCEILINGZ 2147483647)
+(defconst MTF-AMBUSH 8)
+
+(defenum Skill SK-BABY SK-EASY SK-MEDIUM SK-HARD SK-NIGHTMARE)
+
+; Fields in mobj_t's order. `state` indexes STATES; `player` indexes the
+; world's players.
+(defstruct Mobj
+  thinker:?&Thinker
+  x:Fixed y:Fixed z:Fixed
+  snext:?&Mobj sprev:?&Mobj
+  angle:Angle sprite:i32 frame:i32
+  bnext:?&Mobj bprev:?&Mobj
+  sub-sector:usize
+  floor-z:Fixed ceiling-z:Fixed radius:Fixed height:Fixed
+  mom-x:Fixed mom-y:Fixed mom-z:Fixed
+  valid-count:i32 type:i32 tics:i32 state:i32 flags:i32 health:i32
+  move-dir:i32 move-count:i32
+  target:?&Mobj
+  reaction-time:i32 threshold:i32
+  player:?usize
+  last-look:i32
+  spawn-point:MapThing
+  tracer:?&Mobj)
+
+; --- sector movers (p_spec.h) ----------------------------------------------------
+; Each keeps its thinker, to remove it when done.
+
+(defstruct VlDoor th:?&Thinker type:i32 sector:usize top-height:Fixed speed:Fixed
+  direction:i32 top-wait:i32 top-countdown:i32)
+; `crush` is an int: stairs leave it 10.
+(defstruct FloorMove th:?&Thinker type:i32 crush:i32 sector:usize direction:i32
+  new-special:i32 texture:i32 floor-dest-height:Fixed speed:Fixed)
+(defstruct Ceiling th:?&Thinker type:i32 sector:usize bottom-height:Fixed top-height:Fixed
+  speed:Fixed crush:bool direction:i32 tag:i32 old-direction:i32)
+(defstruct Plat th:?&Thinker sector:usize speed:Fixed low:Fixed high:Fixed wait:i32 count:i32
+  status:i32 old-status:i32 crush:bool tag:i32 type:i32)
+(defstruct LightFlash th:?&Thinker sector:usize count:i32 max-light:i32 min-light:i32
+  max-time:i32 min-time:i32)
+(defstruct Strobe th:?&Thinker sector:usize count:i32 min-light:i32 max-light:i32
+  dark-time:i32 bright-time:i32)
+(defstruct Glow th:?&Thinker sector:usize min-light:i32 max-light:i32 direction:i32)
+(defstruct FireFlicker th:?&Thinker sector:usize count:i32 max-light:i32 min-light:i32)
+
+; What a thinker runs.
+(defunion Think
+  (cap)
+  (mobj m:&Mobj)
+  (door d:&VlDoor)
+  (floor f:&FloorMove)
+  (ceiling c:&Ceiling)
+  (plat p:&Plat)
+  (flash l:&LightFlash)
+  (strobe s:&Strobe)
+  (glow g:&Glow)
+  (flicker f:&FireFlicker))
+
+; A removed thinker stays linked, and is unlinked and freed when the thinker
+; loop reaches it (P_RemoveThinker's function = -1). An idle one stays and
+; is skipped: a plat or ceiling in stasis (function = NULL).
+(defstruct Thinker prev:?&Thinker next:?&Thinker removed:bool idle:bool think:Think)
+
+; A switch waiting to flip back (button_t). `where` is a ButtonWhere.
+; `sound-sector` is the sector whose sound origin vanilla's soundorg points
+; at, none where it is null.
+(defstruct Button line:usize where:i32 texture:i32 timer:i32 sound-sector:?usize)
+
+; An animated flat or texture range (anim_t).
+(defstruct Anim is-texture:bool pic-num:i32 base-pic:i32 num-pics:i32 speed:i32)
+
+; What the specials need from the WAD's textures and flats: P_InitPicAnims'
+; animations, P_InitSwitchList's on/off texture pairs, and textureheight.
+(defstruct PicData anims:(Vector Anim) switches:(Vector i32) texture-heights:(Vector Fixed)
+  num-textures:usize num-flats:usize)
+
+; --- players (d_player.h, d_ticcmd.h) -------------------------------------------
+
+; One tic of input. Moves are signed bytes, the turn a 16-bit angle delta.
+(defstruct TicCmd forward-move:i32 side-move:i32 angle-turn:i32 chat-char:i32
+  buttons:i32 consistancy:i32)
+
+; A weapon sprite: `state` 0 means none.
+(defstruct PspDef state:i32 tics:i32 sx:Fixed sy:Fixed)
+
+(defstruct Player
+  mo:?&Mobj
+  state:i32
+  cmd:TicCmd
+  view-z:Fixed view-height:Fixed delta-view-height:Fixed bob:Fixed
+  health:i32 armor-points:i32 armor-type:i32
+  powers:(array i32 6)
+  cards:(array bool 6)
+  backpack:bool
+  frags:(array i32 4)
+  ready-weapon:i32 pending-weapon:i32
+  weapon-owned:(array bool 9)
+  ammo:(array i32 4) max-ammo:(array i32 4)
+  attack-down:bool use-down:bool
+  cheats:i32 refire:i32
+  kill-count:i32 item-count:i32 secret-count:i32
+  message:?CStr
+  damage-count:i32 bonus-count:i32
+  attacker:?&Mobj
+  extra-light:i32 fixed-colormap:i32 colormap:i32
+  psprites:(array PspDef 2)
+  did-secret:bool)
+
+; --- scratch state of the map searches ----------------------------------------
+; Vanilla's p_map.c, p_maputl.c and p_sight.c pass state to their iterator
+; callbacks in globals; these structs hold it.
+
+(defstruct Divline x:Fixed y:Fixed dx:Fixed dy:Fixed)
+
+(defunion InterceptOf (thing m:&Mobj) (line l:usize))
+(defstruct Intercept frac:Fixed of:InterceptOf)
+
+; P_LineOpening's results.
+(defstruct Opening top:Fixed bottom:Fixed range:Fixed low-floor:Fixed)
+
+(defstruct MapScratch
+  ; P_CheckPosition and P_TryMove.
+  tm-bbox:BBox tm-thing:?&Mobj tm-flags:i32 tm-x:Fixed tm-y:Fixed
+  float-ok:bool tm-floor-z:Fixed tm-ceiling-z:Fixed tm-dropoff-z:Fixed
+  ceiling-line:?usize
+  spechit:(Vector usize) num-spechit:i32
+  ; P_SlideMove.
+  best-slide-frac:Fixed second-slide-frac:Fixed
+  best-slide-line:?usize second-slide-line:?usize
+  slide-mo:?&Mobj tm-xmove:Fixed tm-ymove:Fixed
+  ; Aiming and shooting.
+  line-target:?&Mobj shoot-thing:?&Mobj shoot-z:Fixed la-damage:i32
+  attack-range:Fixed aim-slope:Fixed top-slope:Fixed bottom-slope:Fixed
+  use-thing:?&Mobj
+  ; P_RadiusAttack and P_ChangeSector.
+  bomb-source:?&Mobj bomb-spot:?&Mobj bomb-damage:i32
+  crush-change:bool no-fit:bool
+  ; P_PathTraverse.
+  opening:Opening
+  intercepts:(Vector Intercept)
+  trace:Divline
+  early-out:bool
+  ; P_CheckSight.
+  sight-z-start:Fixed t2x:Fixed t2y:Fixed strace:Divline
+  ; A_VileChase.
+  corpse-hit:?&Mobj vile-try-x:Fixed vile-try-y:Fixed)
+
+(defn- map-scratch-new ():MapScratch
+  (return (MapScratch (bbox-clear) none 0 0 0 false 0 0 0 none (make (Vector usize)) 0
+                      0 0 none none none 0 0
+                      none none 0 0 0 0 0 0 none
+                      none none 0 false false
+                      (Opening 0 0 0 0) (make (Vector Intercept)) (Divline 0 0 0 0) false
+                      0 0 0 (Divline 0 0 0 0)
+                      none 0 0)))
+
+; A sound the playsim started: the game layer plays and then clears them.
+; `located` is false for a sound at no place, which the whole level hears;
+; `origin` is the mobj it follows, if any.
+; A sound for the game layer's channels: S_StartSound's decision, made where
+; vanilla makes it, or S_StopSound. The origin is a mobj, a sector's sound
+; origin, or neither.
+(defstruct SoundEvent sfx:i32 origin:?&Mobj sector:?usize volume:i32 sep:i32 pitch:i32
+  stop:bool)
+
+; --- the world -------------------------------------------------------------------
+
+; How the game is being played (vanilla's globals of the same names).
+; `sfx-volume` is snd_SfxVolume (the menu's 0-15, times 8): S_StartSound
+; reads it, and it decides whether a sound draws from M_Random.
+(defstruct Rules sfx-volume:i32 skill:i32 deathmatch:i32 netgame:bool no-monsters:bool respawn-monsters:bool
+  fast:bool mode:i32 episode:i32 map:i32 console-player:i32 demo-playback:bool
+  ; Ultimate Doom's executable or later (gameversion >= exe_ultimate).
+  ultimate:bool
+  ; Deathmatch's -timer, in minutes; 0 for none.
+  time-limit:i32
+  ; -respawn, or the demo's flag: respawn-monsters is this or nightmare.
+  respawn-parm:bool)
+
+; The playsim's per-sector state beside the map's (sector_t's other fields).
+(defstruct SectorPlay sound-traversed:i32 sound-target:?&Mobj valid-count:i32
+  special-data:?&Thinker)
+
+(defstruct World
+  level:Level
+  arena:Arena
+  rules:Rules
+  random:Random
+  thinker-cap:&Thinker
+  ; Freed objects, reused last-freed first as the zone allocator tends to.
+  free-mobjs:(Vector &Mobj) free-thinkers:(Vector &Thinker)
+  ; Each sector's things and each blockmap cell's, most recent first.
+  sector-things:(Vector ?&Mobj)
+  block-links:(Vector ?&Mobj)
+  sector-play:(Vector SectorPlay)
+  ; Each line's validcount, and the counter.
+  line-valid:(Vector i32)
+  valid-count:i32
+  players:(Vector Player)
+  player-in-game:(Vector bool)
+  player-starts:(Vector MapThing) player-start-in-game:(Vector bool)
+  deathmatch-starts:(Vector MapThing)
+  total-kills:i32 total-items:i32 total-secret:i32
+  level-time:i32
+  ; 0 while playing; 1 when the exit is used, 2 the secret exit.
+  exit:i32
+  active-ceilings:(Vector ?&Ceiling)
+  active-plats:(Vector ?&Plat)
+  buttons:(Vector Button)
+  scratch:MapScratch
+  sounds:(Vector SoundEvent)
+  ; Deathmatch's item respawns (itemrespawnque).
+  item-respawn-que:(Vector MapThing) item-respawn-time:(Vector i32)
+  ique-head:i32 ique-tail:i32
+  ; Deathmatch's body queue.
+  body-que:(Vector ?&Mobj) body-que-slot:i32
+  ; An error raised inside an iterator callback, raised again once the
+  ; iteration ends (callbacks return a plain bool, as vanilla's do).
+  pending-error:?Failure
+  pics:PicData
+  ; What P_UpdateSpecials shows for each texture and flat this tic.
+  texture-translation:(Vector i32) flat-translation:(Vector i32)
+  ; Scrolling walls (linespeciallist), and deathmatch's level timer.
+  line-specials:(Vector usize)
+  level-timer:bool level-time-count:i32
+  ; p_user.c's onground, which P_CalcHeight reads after the last player that
+  ; moved set it.
+  on-ground:bool
+  ; gametic, which the game layer keeps: A_Tracer reads it, not leveltime.
+  game-tic:i32
+  ; A_BrainAwake's targets and A_BrainSpit's turn and easy-skill toggle.
+  brain-targets:(Vector &Mobj) brain-target-on:i32 brain-easy:i32
+  ; How many times the console player has spawned: the status bar and HUD
+  ; restart on each (P_SpawnPlayer's ST_Start and HU_Start).
+  console-spawns:i32
+  ; Set when the console player dies, for the automap to close (P_KillMobj's
+  ; AM_Stop); the game layer clears it.
+  console-died:bool)
+
+(defn mobj-info-of (m:&Mobj):MobjInfo (return (mobj-info (m 'type))))
+
+(defn sector-play-at (w:&World i:usize):&SectorPlay
+  (let (s (view (ref w 'sector-play))) (return (&s i))))
+
+(defn player-at (w:&World i:usize):&Player
+  (let (s (view (ref w 'players))) (return (&s i))))
+
+(defn p-random (w:&World):i32 (return (p-random (ref w 'random))))
+
+; --- the thinker list (p_tick.c) ---------------------------------------------
+
+(defn- new-thinker (w:&World t:Think):&Thinker
+  (when (= (count (ref w 'free-thinkers)) 0)
+    (return (new Thinker (ref w 'arena) none none false false t)))
+  (let (th (pop-last (ref w 'free-thinkers)))
+    (set! @th (Thinker none none false false t))
+    (return th)))
+
+; P_AddThinker: to the end of the list, before the cap.
+(defn add-thinker (w:&World t:Think):&Thinker
+  (let (th (new-thinker w t) cap (w 'thinker-cap))
+    (if-some (last (cap 'prev))
+      (do (set! (last 'next) (some th))
+          (set! (th 'prev) (some last)))
+      0)
+    (set! (th 'next) (some cap))
+    (set! (cap 'prev) (some th))
+    (return th)))
+
+(defn remove-thinker (th:&Thinker):void (set! (th 'removed) true))
+
+; --- positions (p_maputl.c) --------------------------------------------------
+
+(defn- block-of (w:&World x:Fixed y:Fixed):?usize
+  (let (l (ref w 'level)
+        bx (bit-shr (wrap-sub x (l 'bmap-org-x)) MAPBLOCKSHIFT)
+        by (bit-shr (wrap-sub y (l 'bmap-org-y)) MAPBLOCKSHIFT))
+    (if (and (>= bx 0) (< bx (l 'bmap-width)) (>= by 0) (< by (l 'bmap-height)))
+      (return (some (as-checked usize (+ (* by (l 'bmap-width)) bx))))
+      (return none))))
+
+(defn- sector-of (w:&World m:&Mobj):usize
+  (return ((sub-sector-at (ref w 'level) (m 'sub-sector)) 'sector)))
+
+; P_UnsetThingPosition: out of its sector's list and its block's.
+(defn unset-thing-position (w:&World m:&Mobj):void
+  (when (= (bit-and (m 'flags) MF-NOSECTOR) 0)
+    (if-some (n (m 'snext)) (set! (n 'sprev) (m 'sprev)) 0)
+    (match (m 'sprev)
+      ((some p) (set! (p 'snext) (m 'snext)))
+      ((none) (set (ref w 'sector-things) (sector-of w m) (m 'snext)))))
+  (when (= (bit-and (m 'flags) MF-NOBLOCKMAP) 0)
+    (if-some (n (m 'bnext)) (set! (n 'bprev) (m 'bprev)) 0)
+    (match (m 'bprev)
+      ((some p) (set! (p 'bnext) (m 'bnext)))
+      ((none) (if-some (b (block-of w (m 'x) (m 'y)))
+                (set (ref w 'block-links) b (m 'bnext))
+                0)))))
+
+; P_SetThingPosition: find its subsector, and link it at the head of its
+; sector's list and its block's.
+(defn set-thing-position (w:&World m:&Mobj):void
+  (set! (m 'sub-sector) (point-in-sub-sector (ref w 'level) (m 'x) (m 'y)))
+  (when (= (bit-and (m 'flags) MF-NOSECTOR) 0)
+    (let (s (sector-of w m) head ((ref w 'sector-things) s))
+      (set! (m 'sprev) none)
+      (set! (m 'snext) head)
+      (if-some (h head) (set! (h 'sprev) (some m)) 0)
+      (set (ref w 'sector-things) s (some m))))
+  (when (= (bit-and (m 'flags) MF-NOBLOCKMAP) 0)
+    (match (block-of w (m 'x) (m 'y))
+      ((some b)
+       (let (head ((ref w 'block-links) b))
+         (set! (m 'bprev) none)
+         (set! (m 'bnext) head)
+         (if-some (h head) (set! (h 'bprev) (some m)) 0)
+         (set (ref w 'block-links) b (some m))))
+      ((none) (set! (m 'bnext) none) (set! (m 'bprev) none)))))
+
+; --- creation ----------------------------------------------------------------------
+
+(defn- filled (n:usize v:?&Mobj):(Vector ?&Mobj)
+  (let (out (make (Vector ?&Mobj)))
+    (dotimes (i:usize n) (conj &out v))
+    (return out)))
+
+(defn- bools (n:usize):(Vector bool)
+  (let (out (make (Vector bool)))
+    (dotimes (i:usize n) (conj &out false))
+    (return out)))
+
+(defn- ints (n:usize):(Vector i32)
+  (let (out (make (Vector i32)))
+    (dotimes (i:usize n) (conj &out 0))
+    (return out)))
+
+(defn- identity (n:usize):(Vector i32)
+  (let (out (make (Vector i32)))
+    (dotimes (i:usize n) (conj &out (as-checked i32 i)))
+    (return out)))
+
+(defn ticcmd-zero ():TicCmd (return (TicCmd 0 0 0 0 0 0)))
+
+; memset(p, 0, sizeof *p).
+(defn player-zero ():Player
+  (let (psp:PspDef (PspDef 0 0 0 0))
+    (return (Player none 0 (ticcmd-zero) 0 0 0 0 0 0 0
+                    (array i32 0 0 0 0 0 0) (array bool false false false false false false) false
+                    (array i32 0 0 0 0) 0 0
+                    (array bool false false false false false false false false false)
+                    (array i32 0 0 0 0) (array i32 0 0 0 0)
+                    false false 0 0 0 0 0 none 0 0 none 0 0 0
+                    (array PspDef psp psp) false))))
+
+; A level's world before its things: P_SetupLevel up to P_LoadThings.
+; `players` and `random` carry over from the previous level, as vanilla's
+; globals do.
+(defn world-new (l:Level rules:Rules players:(Vector Player) in-game:&(Vector bool)
+                 random:Random pics:PicData):&World
+  (let (arena (make Arena)
+        cap (new Thinker &arena none none false false (Think-cap))
+        nsec (count (ref l 'sectors))
+        nlines (count (ref l 'lines))
+        nblocks (as-checked usize (* (l 'bmap-width) (l 'bmap-height)))
+        play (make (Vector SectorPlay))
+        w (new World heap l arena rules random cap
+               (make (Vector &Mobj)) (make (Vector &Thinker))
+               (filled nsec none) (filled nblocks none) play
+               (ints nlines) 0
+               players (bools MAXPLAYERS) (make (Vector MapThing)) (bools MAXPLAYERS)
+               (make (Vector MapThing))
+               0 0 0 0 0
+               (make (Vector ?&Ceiling)) (make (Vector ?&Plat)) (make (Vector Button))
+               (map-scratch-new) (make (Vector SoundEvent))
+               (make (Vector MapThing)) (ints 128) 0 0
+               (filled 32 none) 0 none
+               pics (identity (pics 'num-textures)) (identity (pics 'num-flats))
+               (make (Vector usize)) false 0 false
+               0 (make (Vector &Mobj)) 0 0 0 false))
+    ; P_InitThinkers: the cap alone is a circular list.
+    (set! (cap 'prev) (some cap))
+    (set! (cap 'next) (some cap))
+    (dotimes (i:usize nsec) (conj (ref w 'sector-play) (SectorPlay 0 none 0 none)))
+    (dotimes (i:usize 128) (conj (ref w 'item-respawn-que) (MapThing 0 0 0 0 0)))
+    (dotimes (i:usize MAXPLAYERS)
+      (conj (ref w 'player-starts) (MapThing 0 0 0 0 0))
+      (set (ref w 'player-in-game) i (in-game i)))
+    ; ISSUE-022: conj can't take a bare none.
+    (let (nc:?&Ceiling none np:?&Plat none)
+      (dotimes (i:usize MAXCEILINGS) (conj (ref w 'active-ceilings) nc))
+      (dotimes (i:usize MAXPLATS) (conj (ref w 'active-plats) np)))
+    (return w)))
+
+; --- sounds (s_sound.c) ----------------------------------------------------------
+; S_StartSound decides a sound's volume and separation, and draws M_Random for
+; its pitch, in the middle of the tic. It's done here, where the positions are
+; the ones vanilla sees, and the channels are left to the game layer.
+
+(defconst S-CLIPPING-DIST (* 1200 65536))
+(defconst S-CLOSE-DIST (* 200 65536))
+(defconst S-ATTENUATOR 1000)
+(defconst S-STEREO-SWING (* 96 65536))
+(defconst NORM-SEP 128)
+(defconst NORM-PITCH 128)
+
+(defstruct SoundParams volume:i32 sep:i32)
+
+; S_AdjustSoundParams: none when out of earshot. E1M8 (and every map 8)
+; carries its sounds across the whole map.
+(defn sound-params (w:&World listener:&Mobj x:Fixed y:Fixed volume:i32):?SoundParams
+  (let (adx (iabs (- (listener 'x) x)) ady (iabs (- (listener 'y) y))
+        dist (- (+ adx ady) (bit-shr (if (< adx ady) adx ady) 1))
+        map8 (= ((ref w 'rules) 'map) 8)
+        sfxv ((ref w 'rules) 'sfx-volume))
+    (when (and (not map8) (> dist S-CLIPPING-DIST)) (return none))
+    (let (angle (point-to-angle2 (listener 'x) (listener 'y) x y)
+          la (listener 'angle))
+      (set! angle (if (> angle la) (- angle la) (+ angle (- 0xffffffff la))))
+      (let (sep (- 128 (bit-shr (fixed-mul S-STEREO-SWING (finesine (fine-index angle))) FRACBITS))
+            vol (cond (< dist S-CLOSE-DIST) sfxv
+                      map8 (+ 15 (/ (* (- sfxv 15) (bit-shr (- S-CLIPPING-DIST (min dist S-CLIPPING-DIST)) FRACBITS))
+                                    S-ATTENUATOR))
+                      true (/ (* sfxv (bit-shr (- S-CLIPPING-DIST dist) FRACBITS)) S-ATTENUATOR)))
+        (return (if (> vol 0) (some (SoundParams vol sep)) none))))))
+
+; The console player's body, which hears.
+(defn listener (w:&World):?&Mobj
+  (return ((player-at w (as-checked usize ((ref w 'rules) 'console-player))) 'mo)))
+
+; S_StartSound's pitch variation, from M_Random: the chainsaw's a little, the
+; rest more, the item pickup and tink not at all.
+(defn vary-pitch (r:&Random sfx:i32 pitch:i32):i32
+  (let (p pitch)
+    (cond (and (>= sfx SFX-SAWUP) (<= sfx SFX-SAWHIT)) (set! p (+ p (- 8 (bit-and (m-random r) 15))))
+          (and (!= sfx SFX-ITEMUP) (!= sfx SFX-TINK)) (set! p (+ p (- 16 (bit-and (m-random r) 31))))
+          true 0)
+    (return (max 0 (min p 255)))))
+
+(defn- start-sound-at (w:&World origin:?&Mobj sector:?usize x:Fixed y:Fixed sfx:i32):void
+  (let (volume ((ref w 'rules) 'sfx-volume) pitch NORM-PITCH sep NORM-SEP
+        lmo (listener w)
+        positioned (or (some? sector)
+                       (match origin
+                         ((some m) (match lmo ((some l) (not (same? m l))) ((none) true)))
+                         ((none) false))))
+    ; chgun is the one link: the pistol at pitch 150, and silent at volume 0.
+    (when (= sfx SFX-CHGUN)
+      (set! pitch 150)
+      (when (< volume 1) (return)))
+    (when positioned
+      (match lmo
+        ((some l)
+         (match (sound-params w l x y volume)
+           ((some sp) (set! volume (sp 'volume))
+                      (set! sep (if (and (= x (l 'x)) (= y (l 'y))) NORM-SEP (sp 'sep))))
+           ((none) (return))))
+        ((none) 0)))
+    (conj (ref w 'sounds) (SoundEvent sfx origin sector volume sep (vary-pitch (ref w 'random) sfx pitch) false))))
+
+; S_StartSound from a mobj, or from nowhere.
+(defn start-sound (w:&World origin:?&Mobj sfx:i32):void
+  (match origin
+    ((some m) (start-sound-at w origin none (m 'x) (m 'y) sfx))
+    ((none) (start-sound-at w none none 0 0 sfx))))
+
+; S_StartSound from a sector's sound origin (its bounding box centre).
+(defn start-sector-sound (w:&World sector:usize sfx:i32):void
+  (let (s (sector-at (ref w 'level) sector))
+    (start-sound-at w none (some sector) (s 'sound-x) (s 'sound-y) sfx)))
+
+; S_StopSound.
+(defn stop-sound (w:&World mo:&Mobj):void
+  (conj (ref w 'sounds) (SoundEvent 0 (some mo) none 0 0 0 true)))
+
+; G_InitNew's players: all reborn, so each is set up at its first spawn.
+(defn new-game-players ():(Vector Player)
+  (let (out (make (Vector Player)))
+    (dotimes (i:usize MAXPLAYERS)
+      (let (p (player-zero))
+        (set! (p 'state) PST-REBORN)
+        (conj &out p)))
+    (return out)))
+
+; A single-player game's rules.
+(defn single-player-rules (skill:i32 mode:i32 episode:i32 m:i32):Rules
+  (return (Rules 64 skill 0 false false false false mode episode m 0 false (= mode RETAIL) 0 false)))
+
+; Only player 1 in the game.
+(defn single-player-in-game ():(Vector bool)
+  (let (out (make (Vector bool)))
+    (dotimes (i:usize MAXPLAYERS) (conj &out (= i 0)))
+    (return out)))
+
+; Frees a level's world once the session has taken what carries over. No
+; struct gets a drop of its fields (ISSUE-025), so each owning field is listed
+; here. `players` and `pics` share buffers with the session's through shallow
+; copies, so they stay.
+(defn world-free (w:&World):void
+  (let (l (ref w 'level))
+    (drop (ref l 'vertexes)) (drop (ref l 'sectors)) (drop (ref l 'sides))
+    (drop (ref l 'lines)) (drop (ref l 'sub-sectors)) (drop (ref l 'nodes))
+    (drop (ref l 'segs)) (drop (ref l 'sector-lines)) (drop (ref l 'blockmap)))
+  ; Every mobj and thinker.
+  (drop (ref w 'arena))
+  (drop (ref w 'free-mobjs)) (drop (ref w 'free-thinkers))
+  (drop (ref w 'sector-things)) (drop (ref w 'block-links)) (drop (ref w 'sector-play))
+  (drop (ref w 'line-valid)) (drop (ref w 'player-in-game))
+  (drop (ref w 'player-starts)) (drop (ref w 'player-start-in-game))
+  (drop (ref w 'deathmatch-starts))
+  (drop (ref w 'active-ceilings)) (drop (ref w 'active-plats)) (drop (ref w 'buttons))
+  (drop (ref (ref w 'scratch) 'spechit)) (drop (ref (ref w 'scratch) 'intercepts))
+  (drop (ref w 'sounds))
+  (drop (ref w 'item-respawn-que)) (drop (ref w 'item-respawn-time)) (drop (ref w 'body-que))
+  (drop (ref w 'texture-translation)) (drop (ref w 'flat-translation))
+  (drop (ref w 'line-specials)) (drop (ref w 'brain-targets))
+  (deallocate (ref heap) (unsafe/cast ?&ui8 w) (as usize (sizeof World)) (as usize (alignof World))))

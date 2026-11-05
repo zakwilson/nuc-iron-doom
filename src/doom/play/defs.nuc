@@ -1,0 +1,108 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom doomdef.h, p_local.h, d_player.h, d_event.h,
+; p_spec.h); this port is GPLv3, see COPYING.
+;
+; The playsim's constants and enums.
+
+(ns doom.play.defs)
+
+(defconst TICRATE 35)
+
+; Game modes, as far as the playsim tells them apart.
+(defenum GameMode SHAREWARE REGISTERED COMMERCIAL RETAIL INDETERMINATE)
+
+(defenum Card IT-BLUECARD IT-YELLOWCARD IT-REDCARD IT-BLUESKULL IT-YELLOWSKULL IT-REDSKULL NUMCARDS)
+
+(defenum Weapon
+  WP-FIST WP-PISTOL WP-SHOTGUN WP-CHAINGUN WP-MISSILE WP-PLASMA WP-BFG WP-CHAINSAW
+  WP-SUPERSHOTGUN NUMWEAPONS WP-NOCHANGE)
+
+(defenum Ammo AM-CLIP AM-SHELL AM-CELL AM-MISL NUMAMMO AM-NOAMMO)
+
+(defenum Power PW-INVULNERABILITY PW-STRENGTH PW-INVISIBILITY PW-IRONFEET PW-ALLMAP
+  PW-INFRARED NUMPOWERS)
+
+(defconst INVULNTICS (* 30 TICRATE))
+(defconst INVISTICS (* 60 TICRATE))
+(defconst INFRATICS (* 120 TICRATE))
+(defconst IRONTICS (* 60 TICRATE))
+
+(defenum PlayerState PST-LIVE PST-DEAD PST-REBORN)
+
+(defconst CF-NOCLIP 1)
+(defconst CF-GODMODE 2)
+(defconst CF-NOMOMENTUM 4)
+
+(defenum PsprNum PS-WEAPON PS-FLASH NUMPSPRITES)
+
+; ticcmd_t buttons.
+(defconst BT-ATTACK 1)
+(defconst BT-USE 2)
+(defconst BT-SPECIAL 128)
+(defconst BT-SPECIALMASK 3)
+(defconst BT-CHANGE 4)
+(defconst BT-WEAPONMASK (+ 8 16 32))
+(defconst BT-WEAPONSHIFT 3)
+(defconst BTS-PAUSE 1)
+(defconst BTS-SAVEGAME 2)
+(defconst BTS-SAVEMASK (+ 4 8 16))
+(defconst BTS-SAVESHIFT 2)
+
+; p_local.h.
+(defconst FLOATSPEED (* 4 65536))
+(defconst MAXHEALTH 100)
+
+; Ammo without a backpack, and what a clip holds (p_inter.c), by Ammo.
+(defvar MAXAMMO:(array i32 4) (array i32 200 50 300 50))
+(defvar CLIPAMMO:(array i32 4) (array i32 10 4 20 1))
+(defconst VIEWHEIGHT (* 41 65536))
+(defconst MAPBLOCKUNITS 128)
+(defconst MAPBLOCKSIZE (* 128 65536))
+(defconst MAPBMASK (- (* 128 65536) 1))
+(defconst MAPBTOFRAC 7)
+(defconst PLAYERRADIUS (* 16 65536))
+(defconst GRAVITY 65536)
+(defconst MAXMOVE (* 30 65536))
+(defconst USERANGE (* 64 65536))
+(defconst MELEERANGE (* 64 65536))
+(defconst MISSILERANGE (* 32 64 65536))
+(defconst BASETHRESHOLD 100)
+(defconst STOPSPEED 0x1000)
+(defconst FRICTION 0xe800)
+
+(defconst PT-ADDLINES 1)
+(defconst PT-ADDTHINGS 2)
+(defconst PT-EARLYOUT 4)
+
+; Sector movers (p_spec.h).
+(defenum PlatStatus PLAT-UP PLAT-DOWN PLAT-WAITING PLAT-IN-STASIS)
+(defenum PlatType PERPETUAL-RAISE DOWN-WAIT-UP-STAY RAISE-AND-CHANGE
+  RAISE-TO-NEAREST-AND-CHANGE BLAZE-DWUS)
+(defenum DoorType VLD-NORMAL VLD-CLOSE30-THEN-OPEN VLD-CLOSE VLD-OPEN VLD-RAISE-IN-5-MINS
+  VLD-BLAZE-RAISE VLD-BLAZE-OPEN VLD-BLAZE-CLOSE)
+(defenum CeilingType LOWER-TO-FLOOR RAISE-TO-HIGHEST LOWER-AND-CRUSH CRUSH-AND-RAISE
+  FAST-CRUSH-AND-RAISE SILENT-CRUSH-AND-RAISE)
+(defenum FloorType LOWER-FLOOR LOWER-FLOOR-TO-LOWEST TURBO-LOWER RAISE-FLOOR
+  RAISE-FLOOR-TO-NEAREST RAISE-TO-TEXTURE LOWER-AND-CHANGE RAISE-FLOOR-24
+  RAISE-FLOOR-24-AND-CHANGE RAISE-FLOOR-CRUSH RAISE-FLOOR-TURBO DONUT-RAISE RAISE-FLOOR-512)
+(defenum StairType BUILD8 TURBO16)
+(defenum MoveResult RES-OK RES-CRUSHED RES-PASTDEST)
+(defenum ButtonWhere BW-TOP BW-MIDDLE BW-BOTTOM)
+
+(defconst GLOWSPEED 8)
+(defconst STROBEBRIGHT 5)
+(defconst FASTDARK 15)
+(defconst SLOWDARK 35)
+(defconst PLATWAIT 3)
+(defconst PLATSPEED 65536)
+(defconst MAXPLATS 30)
+(defconst VDOORSPEED (* 2 65536))
+(defconst VDOORWAIT 150)
+(defconst CEILSPEED 65536)
+(defconst CEILWAIT 150)
+(defconst MAXCEILINGS 30)
+(defconst FLOORSPEED 65536)
+(defconst MAXBUTTONS 16)
+(defconst BUTTONTIME 35)
+(defconst MAXSWITCHES 50)

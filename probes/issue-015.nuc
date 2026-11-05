@@ -1,0 +1,13 @@
+; ISSUE-015: a float literal adapts to an f32 overload parameter, but a
+; defconst naming the same literal doesn't, and the error doesn't say why.
+; fixed-when: runs
+; Actual: "_*: mixed float and non-float operands — use explicit cast" on the
+; (* v K) line, where (* v 0.5) compiles.
+
+(defstruct V x:f32 y:f32)
+(defn _* (v:V k:f32):V (return (V (* (v 'x) k) (* (v 'y) k))))
+(defconst K 0.5)
+
+(defn main ():i32
+  (let (v (V 2.0 4.0) a (* v 0.5) b (* v K))
+    (return (if (= (a 'y) (b 'y)) 0 1))))

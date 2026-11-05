@@ -1,0 +1,13 @@
+; ISSUE-014: Vector has no pop, so a stack needs count, invoke and truncate!.
+; fixed-when: runs
+; Actual: "unknown: pop".
+
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+
+(defn main ():i32
+  (let (v (make (Vector i32)))
+    (conj &v 1)
+    (conj &v 2)
+    (return (- (pop &v) 2))))

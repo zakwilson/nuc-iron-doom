@@ -1,0 +1,11 @@
+; ISSUE-001: a two-key invoke reads, but the same place can't be set!.
+; Expected: compiles (set! (g x y) v) as (set g x y v), as (set! (m k) v) is (set m k v).
+; Actual: set!: not an assignable place.
+; fixed-when: compiles
+(defstruct Grid (cells (array i32 16)) width:i32)
+(defn invoke (g:&Grid x:i32 y:i32):i32 (aref (g 'cells) (+ x (* y (g 'width)))))
+(defn set (g:&Grid x:i32 y:i32 v:i32):void (set! (aref (g 'cells) (+ x (* y (g 'width)))) v))
+(defn main ():i32
+  (let (g:&Grid (Grid (width 4)))
+    (set! (g 1 2) 7)
+    (if (= (g 1 2) 7) 0 1)))

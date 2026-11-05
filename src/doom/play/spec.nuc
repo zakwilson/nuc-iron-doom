@@ -1,0 +1,579 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_spec.c); this port is GPLv3, see COPYING.
+;
+; Line and sector specials: what a line does when crossed, shot or used,
+; damaging floors and secrets, and the animated textures and flats.
+;
+; Vanilla's three big switches on line->special become tables from the
+; special to a LineAction, run by one dispatcher.
+
+(ns doom.play.spec)
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.math)
+(import-use nucleus.slice)
+(import-use nucleus.io)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.buffer)
+(import-use doom.fixed)
+(import-use doom.graphics)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.mobj)
+(import-use doom.play.inter)
+(import-use doom.play.lights)
+(import-use doom.play.doors)
+(import-use doom.play.floors)
+(import-use doom.play.ceilings)
+(import-use doom.play.plats)
+(import-use doom.play.telept)
+(import-use doom.play.switch)
+
+(defconst MAXLINEANIMS 64)
+(defconst MAX-ADJOINING-SECTORS 20)
+
+; --- the WAD's animations and switches ----------------------------------------
+
+(defstruct AnimDef is-texture:bool end-name:CStr start-name:CStr speed:i32)
+
+(defvar ANIMDEFS:(array AnimDef 22)
+  (array AnimDef
+    (AnimDef false "NUKAGE3" "NUKAGE1" 8) (AnimDef false "FWATER4" "FWATER1" 8)
+    (AnimDef false "SWATER4" "SWATER1" 8) (AnimDef false "LAVA4" "LAVA1" 8)
+    (AnimDef false "BLOOD3" "BLOOD1" 8)
+    ; Doom II's.
+    (AnimDef false "RROCK08" "RROCK05" 8) (AnimDef false "SLIME04" "SLIME01" 8)
+    (AnimDef false "SLIME08" "SLIME05" 8) (AnimDef false "SLIME12" "SLIME09" 8)
+    (AnimDef true "BLODGR4" "BLODGR1" 8) (AnimDef true "SLADRIP3" "SLADRIP1" 8)
+    (AnimDef true "BLODRIP4" "BLODRIP1" 8) (AnimDef true "FIREWALL" "FIREWALA" 8)
+    (AnimDef true "GSTFONT3" "GSTFONT1" 8) (AnimDef true "FIRELAVA" "FIRELAV3" 8)
+    (AnimDef true "FIREMAG3" "FIREMAG1" 8) (AnimDef true "FIREBLU2" "FIREBLU1" 8)
+    (AnimDef true "ROCKRED3" "ROCKRED1" 8) (AnimDef true "BFALL4" "BFALL1" 8)
+    (AnimDef true "SFALL4" "SFALL1" 8) (AnimDef true "WFALL4" "WFALL1" 8)
+    (AnimDef true "DBRAIN4" "DBRAIN1" 8)))
+
+; Switch textures, off then on, and the first episode each is in.
+(defstruct SwitchDef off:CStr on:CStr episode:i32)
+
+(defvar SWITCHDEFS:(array SwitchDef 40)
+  (array SwitchDef
+    (SwitchDef "SW1BRCOM" "SW2BRCOM" 1) (SwitchDef "SW1BRN1" "SW2BRN1" 1)
+    (SwitchDef "SW1BRN2" "SW2BRN2" 1) (SwitchDef "SW1BRNGN" "SW2BRNGN" 1)
+    (SwitchDef "SW1BROWN" "SW2BROWN" 1) (SwitchDef "SW1COMM" "SW2COMM" 1)
+    (SwitchDef "SW1COMP" "SW2COMP" 1) (SwitchDef "SW1DIRT" "SW2DIRT" 1)
+    (SwitchDef "SW1EXIT" "SW2EXIT" 1) (SwitchDef "SW1GRAY" "SW2GRAY" 1)
+    (SwitchDef "SW1GRAY1" "SW2GRAY1" 1) (SwitchDef "SW1METAL" "SW2METAL" 1)
+    (SwitchDef "SW1PIPE" "SW2PIPE" 1) (SwitchDef "SW1SLAD" "SW2SLAD" 1)
+    (SwitchDef "SW1STARG" "SW2STARG" 1) (SwitchDef "SW1STON1" "SW2STON1" 1)
+    (SwitchDef "SW1STON2" "SW2STON2" 1) (SwitchDef "SW1STONE" "SW2STONE" 1)
+    (SwitchDef "SW1STRTN" "SW2STRTN" 1)
+    (SwitchDef "SW1BLUE" "SW2BLUE" 2) (SwitchDef "SW1CMT" "SW2CMT" 2)
+    (SwitchDef "SW1GARG" "SW2GARG" 2) (SwitchDef "SW1GSTON" "SW2GSTON" 2)
+    (SwitchDef "SW1HOT" "SW2HOT" 2) (SwitchDef "SW1LION" "SW2LION" 2)
+    (SwitchDef "SW1SATYR" "SW2SATYR" 2) (SwitchDef "SW1SKIN" "SW2SKIN" 2)
+    (SwitchDef "SW1VINE" "SW2VINE" 2) (SwitchDef "SW1WOOD" "SW2WOOD" 2)
+    (SwitchDef "SW1PANEL" "SW2PANEL" 3) (SwitchDef "SW1ROCK" "SW2ROCK" 3)
+    (SwitchDef "SW1MET2" "SW2MET2" 3) (SwitchDef "SW1WDMET" "SW2WDMET" 3)
+    (SwitchDef "SW1BRIK" "SW2BRIK" 3) (SwitchDef "SW1MOD1" "SW2MOD1" 3)
+    (SwitchDef "SW1ZIM" "SW2ZIM" 3) (SwitchDef "SW1STON6" "SW2STON6" 3)
+    (SwitchDef "SW1TEK" "SW2TEK" 3) (SwitchDef "SW1MARB" "SW2MARB" 3)
+    (SwitchDef "SW1SKULL" "SW2SKULL" 3)))
+
+(defn- texture-num (tx:&WallTextures n:CStr):(Fallible i32)
+  (match (texture-index tx (name n))
+    ((some i) (return (ok (as-checked i32 i))))
+    ((none) (fail "R_TextureNumForName: " n " not found"))))
+
+(defn- flat-num (fl:&Flats n:CStr):(Fallible i32)
+  (match (flat-index fl (name n))
+    ((some i) (return (ok (as-checked i32 i))))
+    ((none) (fail "R_FlatNumForName: " n " not found"))))
+
+; P_InitPicAnims and P_InitSwitchList, once the WAD's textures are known.
+(defn pic-data-new (tx:&WallTextures fl:&Flats mode:i32):(Fallible PicData)
+  (let (anims (make (Vector Anim)) switches (make (Vector i32)) heights (make (Vector Fixed))
+        ntex (count (ref tx 'list)))
+    (dotimes (i:usize 22)
+      (let (d (aref ANIMDEFS (as i64 i)))
+        (when (if (d 'is-texture)
+                (some? (texture-index tx (name (d 'start-name))))
+                (some? (flat-index fl (name (d 'start-name)))))
+          (let (pic (try (if (d 'is-texture) (texture-num tx (d 'end-name)) (flat-num fl (d 'end-name))))
+                base (try (if (d 'is-texture) (texture-num tx (d 'start-name)) (flat-num fl (d 'start-name))))
+                n (+ (- pic base) 1))
+            (when (< n 2)
+              (fail "P_InitPicAnims: bad cycle from " (d 'start-name) " to " (d 'end-name)))
+            (conj &anims (Anim (d 'is-texture) pic base n (d 'speed)))))))
+    (let (episode (case mode (:or REGISTERED RETAIL) 2 COMMERCIAL 3 1))
+      (dotimes (i:usize 40)
+        (let (d (aref SWITCHDEFS (as i64 i)))
+          (when (<= (d 'episode) episode)
+            (conj &switches (try (texture-num tx (d 'off))))
+            (conj &switches (try (texture-num tx (d 'on))))))))
+    (dotimes (i:usize ntex)
+      (conj &heights (int-to-fixed (as-checked i32 (height (ref (texture-at tx i) 'pixels))))))
+    (return (ok (PicData anims switches heights ntex (count (ref fl 'list)))))))
+
+; --- utilities -----------------------------------------------------------------
+
+(defn sector-line (w:&World s:&Sector i:usize):usize
+  (return ((ref (ref w 'level) 'sector-lines) (+ (s 'first-line) i))))
+
+(defn- is? (a:?usize b:usize):bool
+  (match a ((some x) (return (= x b))) ((none) (return false))))
+
+; getNextSector: the sector across a two-sided line.
+(defn get-next-sector (w:&World li:usize sec:usize):?usize
+  (let (line (line-at (ref w 'level) li))
+    (when (= (bit-and (line 'flags) ML-TWOSIDED) 0) (return none))
+    (when (is? (line 'front-sector) sec) (return (line 'back-sector)))
+    (return (line 'front-sector))))
+
+; getSide's side, for a sector's i-th line.
+(defn side-of-line (w:&World sec:usize i:usize side:usize):&Side
+  (let (l (ref w 'level) li (sector-line w (sector-at l sec) i))
+    (return (side-at l (as-checked usize (aref ((line-at l li) 'side-num) (as i64 side)))))))
+
+(defn two-sided? (w:&World sec:usize i:usize):bool
+  (let (l (ref w 'level) li (sector-line w (sector-at l sec) i))
+    (return (!= (bit-and ((line-at l li) 'flags) ML-TWOSIDED) 0))))
+
+; The neighbours' extreme floor or ceiling, starting from `start`.
+(defn- surrounding (w:&World sec:usize start:Fixed ceiling:bool highest:bool):Fixed
+  (let (l (ref w 'level) s (sector-at l sec) v start)
+    (dotimes (i:usize (s 'line-count))
+      (when-some (o (get-next-sector w (sector-line w s i) sec))
+        (let (os (sector-at l o) h (if ceiling (os 'ceiling-height) (os 'floor-height)))
+          (when (if highest (> h v) (< h v)) (set! v h)))))
+    (return v)))
+
+(defn find-lowest-floor-surrounding (w:&World sec:usize):Fixed
+  (return (surrounding w sec ((sector-at (ref w 'level) sec) 'floor-height) false false)))
+
+(defn find-highest-floor-surrounding (w:&World sec:usize):Fixed
+  (return (surrounding w sec (* -500 FRACUNIT) false true)))
+
+(defn find-lowest-ceiling-surrounding (w:&World sec:usize):Fixed
+  (return (surrounding w sec 2147483647 true false)))
+
+(defn find-highest-ceiling-surrounding (w:&World sec:usize):Fixed
+  (return (surrounding w sec 0 true true)))
+
+; P_FindNextHighestFloor, with Chocolate Doom's emulation of vanilla's
+; 20-entry stack array overflowing into `height`.
+(defn find-next-highest-floor (w:&World sec:usize current:Fixed):(Fallible Fixed)
+  (let (l (ref w 'level) s (sector-at l sec) height current
+        list (make (Vector Fixed)))
+    (dotimes (i:usize (s 'line-count))
+      (when-some (o (get-next-sector w (sector-line w s i) sec))
+        (let (f ((sector-at l o) 'floor-height))
+          (when (> f height)
+            (let (h (count &list))
+              (when (= h (+ MAX-ADJOINING-SECTORS 1)) (set! height f))
+              (when (= h (+ MAX-ADJOINING-SECTORS 2))
+                (drop &list)
+                (fail "Sector with more than 22 adjoining sectors. Vanilla will crash here"))
+              (conj &list f))))))
+    (when (= (count &list) 0) (drop &list) (return (ok current)))
+    (let (mn (&list 0))
+      (dotimes (i:usize (count &list)) (set! mn (min mn (&list i))))
+      (drop &list)
+      (return (ok mn)))))
+
+; P_FindSectorFromLineTag: the next sector after `start` with the line's tag.
+(defn find-sector-from-line-tag (w:&World line:&Line start:i32):i32
+  (let (l (ref w 'level) n (as-checked i32 (count (ref l 'sectors))) i (+ start 1))
+    (while (< i n)
+      (when (= ((sector-at l (as-checked usize i)) 'tag) (line 'tag)) (return i))
+      (inc! i))
+    (return -1)))
+
+; P_FindMinSurroundingLight.
+(defn find-min-surrounding-light (w:&World sec:usize max:i32):i32
+  (let (l (ref w 'level) s (sector-at l sec) mn max)
+    (dotimes (i:usize (s 'line-count))
+      (when-some (o (get-next-sector w (sector-line w s i) sec))
+        (let (ll ((sector-at l o) 'light-level)) (when (< ll mn) (set! mn ll)))))
+    (return mn)))
+
+(defn special-data (w:&World sec:usize):?&Thinker
+  (return ((sector-play-at w sec) 'special-data)))
+
+(defn set-special-data (w:&World sec:usize th:?&Thinker):void
+  (set! ((sector-play-at w sec) 'special-data) th))
+
+; G_ExitLevel and G_SecretExitLevel: the game layer ends the level.
+(defn exit-level (w:&World):void (set! (w 'exit) 1))
+(defn secret-exit-level (w:&World):void (set! (w 'exit) 2))
+
+; --- line actions -------------------------------------------------------------
+
+(defunion LineAction
+  (nothing)
+  (door type:i32)
+  (locked-door type:i32)
+  (vertical-door)
+  (floor type:i32)
+  (ceiling type:i32)
+  ; Special 40: the ceiling up to the highest, then the floor down to the lowest.
+  (ceiling-and-floor)
+  (plat type:i32 amount:i32)
+  (stop-plat)
+  (crush-stop)
+  (stairs type:i32)
+  (donut)
+  (light-on bright:i32)
+  (strobe)
+  (lights-off)
+  (teleport)
+  ; Specials 125 and 126 teleport monsters only.
+  (monster-teleport)
+  (exit)
+  (secret-exit))
+
+; Whether the action did something; switches only change if it did.
+(defn- run-action (w:&World li:usize a:LineAction side:i32 thing:&Mobj):(Fallible bool)
+  (match a
+    ((nothing) (return (ok false)))
+    ((door t) (return (do-door w li t)))
+    ((locked-door t) (return (do-locked-door w li t thing)))
+    ((vertical-door) (try (vertical-door w li thing)) (return (ok true)))
+    ((floor t) (return (do-floor w li t)))
+    ((ceiling t) (return (do-ceiling w li t)))
+    ((ceiling-and-floor)
+     (try (do-ceiling w li RAISE-TO-HIGHEST))
+     (return (do-floor w li LOWER-FLOOR-TO-LOWEST)))
+    ((plat t n) (return (do-plat w li t n)))
+    ((stop-plat) (stop-plat w li) (return (ok true)))
+    ((crush-stop) (return (ok (ceiling-crush-stop w li))))
+    ((stairs t) (return (build-stairs w li t)))
+    ((donut) (return (do-donut w li)))
+    ((light-on b) (light-turn-on w li b) (return (ok true)))
+    ((strobe) (start-light-strobing w li) (return (ok true)))
+    ((lights-off) (turn-tag-lights-off w li) (return (ok true)))
+    ((teleport) (return (teleport w li side thing)))
+    ((monster-teleport)
+     (when (some? (thing 'player)) (return (ok false)))
+     (return (teleport w li side thing)))
+    ((exit) (exit-level w) (return (ok true)))
+    ((secret-exit) (secret-exit-level w) (return (ok true)))))
+
+; A walk-over line: its action, and whether it works once (W1) or again (WR).
+(defstruct Trigger action:LineAction once:bool)
+
+(defn- w1 (a:LineAction):Trigger (return (Trigger a true)))
+(defn- wr (a:LineAction):Trigger (return (Trigger a false)))
+
+(defn- cross-trigger (sp:i32):Trigger
+  (return
+    (case sp
+      2 (w1 (LineAction-door VLD-OPEN))
+      3 (w1 (LineAction-door VLD-CLOSE))
+      4 (w1 (LineAction-door VLD-NORMAL))
+      5 (w1 (LineAction-floor RAISE-FLOOR))
+      6 (w1 (LineAction-ceiling FAST-CRUSH-AND-RAISE))
+      8 (w1 (LineAction-stairs BUILD8))
+      10 (w1 (LineAction-plat DOWN-WAIT-UP-STAY 0))
+      12 (w1 (LineAction-light-on 0))
+      13 (w1 (LineAction-light-on 255))
+      16 (w1 (LineAction-door VLD-CLOSE30-THEN-OPEN))
+      17 (w1 (LineAction-strobe))
+      19 (w1 (LineAction-floor LOWER-FLOOR))
+      22 (w1 (LineAction-plat RAISE-TO-NEAREST-AND-CHANGE 0))
+      25 (w1 (LineAction-ceiling CRUSH-AND-RAISE))
+      30 (w1 (LineAction-floor RAISE-TO-TEXTURE))
+      35 (w1 (LineAction-light-on 35))
+      36 (w1 (LineAction-floor TURBO-LOWER))
+      37 (w1 (LineAction-floor LOWER-AND-CHANGE))
+      38 (w1 (LineAction-floor LOWER-FLOOR-TO-LOWEST))
+      39 (w1 (LineAction-teleport))
+      40 (w1 (LineAction-ceiling-and-floor))
+      44 (w1 (LineAction-ceiling LOWER-AND-CRUSH))
+      52 (wr (LineAction-exit))
+      53 (w1 (LineAction-plat PERPETUAL-RAISE 0))
+      54 (w1 (LineAction-stop-plat))
+      56 (w1 (LineAction-floor RAISE-FLOOR-CRUSH))
+      57 (w1 (LineAction-crush-stop))
+      58 (w1 (LineAction-floor RAISE-FLOOR-24))
+      59 (w1 (LineAction-floor RAISE-FLOOR-24-AND-CHANGE))
+      104 (w1 (LineAction-lights-off))
+      108 (w1 (LineAction-door VLD-BLAZE-RAISE))
+      109 (w1 (LineAction-door VLD-BLAZE-OPEN))
+      100 (w1 (LineAction-stairs TURBO16))
+      110 (w1 (LineAction-door VLD-BLAZE-CLOSE))
+      119 (w1 (LineAction-floor RAISE-FLOOR-TO-NEAREST))
+      121 (w1 (LineAction-plat BLAZE-DWUS 0))
+      124 (wr (LineAction-secret-exit))
+      125 (w1 (LineAction-monster-teleport))
+      130 (w1 (LineAction-floor RAISE-FLOOR-TURBO))
+      141 (w1 (LineAction-ceiling SILENT-CRUSH-AND-RAISE))
+      72 (wr (LineAction-ceiling LOWER-AND-CRUSH))
+      73 (wr (LineAction-ceiling CRUSH-AND-RAISE))
+      74 (wr (LineAction-crush-stop))
+      75 (wr (LineAction-door VLD-CLOSE))
+      76 (wr (LineAction-door VLD-CLOSE30-THEN-OPEN))
+      77 (wr (LineAction-ceiling FAST-CRUSH-AND-RAISE))
+      79 (wr (LineAction-light-on 35))
+      80 (wr (LineAction-light-on 0))
+      81 (wr (LineAction-light-on 255))
+      82 (wr (LineAction-floor LOWER-FLOOR-TO-LOWEST))
+      83 (wr (LineAction-floor LOWER-FLOOR))
+      84 (wr (LineAction-floor LOWER-AND-CHANGE))
+      86 (wr (LineAction-door VLD-OPEN))
+      87 (wr (LineAction-plat PERPETUAL-RAISE 0))
+      88 (wr (LineAction-plat DOWN-WAIT-UP-STAY 0))
+      89 (wr (LineAction-stop-plat))
+      90 (wr (LineAction-door VLD-NORMAL))
+      91 (wr (LineAction-floor RAISE-FLOOR))
+      92 (wr (LineAction-floor RAISE-FLOOR-24))
+      93 (wr (LineAction-floor RAISE-FLOOR-24-AND-CHANGE))
+      94 (wr (LineAction-floor RAISE-FLOOR-CRUSH))
+      95 (wr (LineAction-plat RAISE-TO-NEAREST-AND-CHANGE 0))
+      96 (wr (LineAction-floor RAISE-TO-TEXTURE))
+      97 (wr (LineAction-teleport))
+      98 (wr (LineAction-floor TURBO-LOWER))
+      105 (wr (LineAction-door VLD-BLAZE-RAISE))
+      106 (wr (LineAction-door VLD-BLAZE-OPEN))
+      107 (wr (LineAction-door VLD-BLAZE-CLOSE))
+      120 (wr (LineAction-plat BLAZE-DWUS 0))
+      126 (wr (LineAction-monster-teleport))
+      128 (wr (LineAction-floor RAISE-FLOOR-TO-NEAREST))
+      129 (wr (LineAction-floor RAISE-FLOOR-TURBO))
+      (wr (LineAction-nothing)))))
+
+; P_CrossSpecialLine: `thing` crossed line `li` from `side`. This is the
+; post-1.2 executable's rule for which monsters and missiles may.
+(defn cross-special-line (w:&World li:usize side:i32 thing:&Mobj):(Fallible void)
+  (let (line (line-at (ref w 'level) li) sp (line 'special))
+    (when (none? (thing 'player))
+      ; Projectiles can't trigger anything.
+      (case (thing 'type)
+        (:or MT-ROCKET MT-PLASMA MT-BFG MT-TROOPSHOT MT-HEADSHOT MT-BRUISERSHOT) (return (ok))
+        0)
+      ; Monsters may only teleport, open doors and lower lifts.
+      (when (not (case sp (:or 39 97 125 126 4 10 88) true false)) (return (ok))))
+    (let (t (cross-trigger sp))
+      (try (run-action w li (t 'action) side thing))
+      ; 125 clears only when a monster used it.
+      (when (and (t 'once) (or (!= sp 125) (none? (thing 'player))))
+        (set! (line 'special) 0))))
+  (return (ok)))
+
+; P_ShootSpecialLine: impact specials.
+(defn shoot-special-line (w:&World thing:&Mobj li:usize):(Fallible void)
+  (let (sp ((line-at (ref w 'level) li) 'special))
+    (when (and (none? (thing 'player)) (!= sp 46)) (return (ok)))
+    (case sp
+      24 (do (try (do-floor w li RAISE-FLOOR)) (try (change-switch-texture w li false)))
+      46 (do (try (do-door w li VLD-OPEN)) (try (change-switch-texture w li true)))
+      47 (do (try (do-plat w li RAISE-TO-NEAREST-AND-CHANGE 0))
+             (try (change-switch-texture w li false)))
+      0))
+  (return (ok)))
+
+; The use table, P_UseSpecialLine's switch: the action, and how the switch
+; texture changes. SW-NONE: it doesn't; SW-ON-SUCCESS: if the action did
+; something; SW-ALWAYS: regardless.
+(defenum SwitchChange SW-NONE SW-ON-SUCCESS SW-ALWAYS)
+(defstruct UseEntry action:LineAction change:i32 again:bool)
+
+(defn- s1 (a:LineAction):UseEntry (return (UseEntry a SW-ON-SUCCESS false)))
+(defn- sr (a:LineAction):UseEntry (return (UseEntry a SW-ON-SUCCESS true)))
+
+(defn use-entry (sp:i32):UseEntry
+  (return
+    (case sp
+      (:or 1 26 27 28 31 32 33 34 117 118) (UseEntry (LineAction-vertical-door) SW-NONE false)
+      7 (s1 (LineAction-stairs BUILD8))
+      9 (s1 (LineAction-donut))
+      11 (UseEntry (LineAction-exit) SW-ALWAYS false)
+      14 (s1 (LineAction-plat RAISE-AND-CHANGE 32))
+      15 (s1 (LineAction-plat RAISE-AND-CHANGE 24))
+      18 (s1 (LineAction-floor RAISE-FLOOR-TO-NEAREST))
+      20 (s1 (LineAction-plat RAISE-TO-NEAREST-AND-CHANGE 0))
+      21 (s1 (LineAction-plat DOWN-WAIT-UP-STAY 0))
+      23 (s1 (LineAction-floor LOWER-FLOOR-TO-LOWEST))
+      29 (s1 (LineAction-door VLD-NORMAL))
+      41 (s1 (LineAction-ceiling LOWER-TO-FLOOR))
+      71 (s1 (LineAction-floor TURBO-LOWER))
+      49 (s1 (LineAction-ceiling CRUSH-AND-RAISE))
+      50 (s1 (LineAction-door VLD-CLOSE))
+      51 (UseEntry (LineAction-secret-exit) SW-ALWAYS false)
+      55 (s1 (LineAction-floor RAISE-FLOOR-CRUSH))
+      101 (s1 (LineAction-floor RAISE-FLOOR))
+      102 (s1 (LineAction-floor LOWER-FLOOR))
+      103 (s1 (LineAction-door VLD-OPEN))
+      111 (s1 (LineAction-door VLD-BLAZE-RAISE))
+      112 (s1 (LineAction-door VLD-BLAZE-OPEN))
+      113 (s1 (LineAction-door VLD-BLAZE-CLOSE))
+      122 (s1 (LineAction-plat BLAZE-DWUS 0))
+      127 (s1 (LineAction-stairs TURBO16))
+      131 (s1 (LineAction-floor RAISE-FLOOR-TURBO))
+      (:or 133 135 137) (s1 (LineAction-locked-door VLD-BLAZE-OPEN))
+      140 (s1 (LineAction-floor RAISE-FLOOR-512))
+      42 (sr (LineAction-door VLD-CLOSE))
+      43 (sr (LineAction-ceiling LOWER-TO-FLOOR))
+      45 (sr (LineAction-floor LOWER-FLOOR))
+      60 (sr (LineAction-floor LOWER-FLOOR-TO-LOWEST))
+      61 (sr (LineAction-door VLD-OPEN))
+      62 (sr (LineAction-plat DOWN-WAIT-UP-STAY 1))
+      63 (sr (LineAction-door VLD-NORMAL))
+      64 (sr (LineAction-floor RAISE-FLOOR))
+      66 (sr (LineAction-plat RAISE-AND-CHANGE 24))
+      67 (sr (LineAction-plat RAISE-AND-CHANGE 32))
+      65 (sr (LineAction-floor RAISE-FLOOR-CRUSH))
+      68 (sr (LineAction-plat RAISE-TO-NEAREST-AND-CHANGE 0))
+      69 (sr (LineAction-floor RAISE-FLOOR-TO-NEAREST))
+      70 (sr (LineAction-floor TURBO-LOWER))
+      114 (sr (LineAction-door VLD-BLAZE-RAISE))
+      115 (sr (LineAction-door VLD-BLAZE-OPEN))
+      116 (sr (LineAction-door VLD-BLAZE-CLOSE))
+      123 (sr (LineAction-plat BLAZE-DWUS 0))
+      132 (sr (LineAction-floor RAISE-FLOOR-TURBO))
+      (:or 99 134 136) (sr (LineAction-locked-door VLD-BLAZE-OPEN))
+      138 (UseEntry (LineAction-light-on 255) SW-ALWAYS true)
+      139 (UseEntry (LineAction-light-on 35) SW-ALWAYS true)
+      (UseEntry (LineAction-nothing) SW-NONE false))))
+
+; Run a use-table entry for P_UseSpecialLine.
+(defn run-use-entry (w:&World li:usize e:&UseEntry thing:&Mobj):(Fallible void)
+  (let (done (try (run-action w li (e 'action) 0 thing)))
+    (when (or (= (e 'change) SW-ALWAYS) (and (= (e 'change) SW-ON-SUCCESS) done))
+      (try (change-switch-texture w li (e 'again)))))
+  (return (ok)))
+
+; --- sectors -----------------------------------------------------------------
+
+; P_PlayerInSpecialSector: called every tic the player is on the floor.
+(defn player-in-special-sector (w:&World pi:usize):(Fallible void)
+  (let (p (player-at w pi) mo (unwrap (p 'mo)) sec (sector-of-mobj w mo)
+        tick (= (bit-and (w 'level-time) 0x1f) 0)
+        iron (!= (aref (p 'powers) (as i64 PW-IRONFEET)) 0))
+    (when (!= (mo 'z) (sec 'floor-height)) (return (ok)))
+    (case (sec 'special)
+      ; Hellslime, nukage.
+      5 (when (and (not iron) tick) (try (damage-mobj w mo none none 10)))
+      7 (when (and (not iron) tick) (try (damage-mobj w mo none none 5)))
+      ; Super hellslime, strobe hurt; the suit sometimes leaks.
+      (:or 16 4) (when (or (not iron) (< (p-random w) 5))
+                   (when tick (try (damage-mobj w mo none none 20))))
+      9 (do (set! (p 'secret-count) (+ (p 'secret-count) 1))
+            (set! (sec 'special) 0))
+      ; E1M8's exit floor: no god mode, and out at 10% health.
+      11 (do (set! (p 'cheats) (bit-and (p 'cheats) (bit-not CF-GODMODE)))
+             (when tick (try (damage-mobj w mo none none 20)))
+             (when (<= (p 'health) 10) (exit-level w)))
+      (fail "P_PlayerInSpecialSector: unknown special " (sec 'special))))
+  (return (ok)))
+
+; P_UpdateSpecials: the level timer, animations, scrolling walls, buttons.
+(defn update-specials (w:&World):(Fallible void)
+  (when (w 'level-timer)
+    (set! (w 'level-time-count) (- (w 'level-time-count) 1))
+    (when (= (w 'level-time-count) 0) (exit-level w)))
+  (let (anims (view (ref (ref w 'pics) 'anims)))
+    (dotimes (k:usize (count &anims))
+      (let (a (&anims k) i (a 'base-pic))
+        (while (< i (+ (a 'base-pic) (a 'num-pics)))
+          (let (pic (+ (a 'base-pic) (% (+ (/ (w 'level-time) (a 'speed)) i) (a 'num-pics))))
+            (set (if (a 'is-texture) (ref w 'texture-translation) (ref w 'flat-translation))
+                 (as-checked usize i) pic))
+          (inc! i)))))
+  (let (l (ref w 'level) specials (ref w 'line-specials))
+    (dotimes (i:usize (count specials))
+      (let (line (line-at l (specials i)))
+        (when (= (line 'special) 48)
+          (let (side (side-at l (as-checked usize (aref (line 'side-num) 0))))
+            (set! (side 'texture-offset) (wrap-add (side 'texture-offset) FRACUNIT))))))
+    (let (buttons (view (ref w 'buttons)))
+      (dotimes (i:usize (count &buttons))
+        (let (b (&buttons i))
+          (when (!= (b 'timer) 0)
+            (set! (b 'timer) (- (b 'timer) 1))
+            (when (= (b 'timer) 0)
+              (let (side (side-at l (as-checked usize (aref ((line-at l (b 'line)) 'side-num) 0))))
+                (case (b 'where)
+                  BW-TOP (set! (side 'top-texture) (b 'texture))
+                  BW-MIDDLE (set! (side 'mid-texture) (b 'texture))
+                  BW-BOTTOM (set! (side 'bottom-texture) (b 'texture))
+                  0))
+              (match (b 'sound-sector)
+                ((some sec) (start-sector-sound w sec SFX-SWTCHN))
+                ((none) (start-sound w none SFX-SWTCHN)))
+              (set! @b (Button 0 0 0 0 none))))))))
+  (return (ok)))
+
+; EV_DoDonut: the pillar sinks while the slime around it rises.
+(defn do-donut (w:&World li:usize):(Fallible bool)
+  (let (l (ref w 'level) line (line-at l li) rtn false
+        s1 (find-sector-from-line-tag w line -1) stop false)
+    (while (and (>= s1 0) (not stop))
+      (let (sec1 (as-checked usize s1) sector1 (sector-at l sec1))
+        (when (none? (special-data w sec1))
+          (set! rtn true)
+          (match (get-next-sector w (sector-line w sector1 0) sec1)
+            ((none)
+             (eprintln "EV_DoDonut: linedef had no second sidedef! Unexpected behavior may occur in Vanilla Doom.")
+             (set! stop true))
+            ((some sec2)
+             (let (sector2 (sector-at l sec2) i:usize 0 done false)
+               (while (and (< i (sector2 'line-count)) (not done))
+                 (let (back ((line-at l (sector-line w sector2 i)) 'back-sector))
+                   (when (not (is? back sec1))
+                     ; Chocolate Doom's stand-in for the overrun with no back sector.
+                     (let (s3-height:Fixed 0 s3-pic:i32 0x16)
+                       (when-some (s3 back)
+                         (set! s3-height ((sector-at l s3) 'floor-height))
+                         (set! s3-pic ((sector-at l s3) 'floor-pic)))
+                       (when (none? back)
+                         (eprintln "EV_DoDonut: WARNING: emulating buffer overrun due to NULL back sector. Unexpected behavior may occur in Vanilla Doom."))
+                       (spawn-floor w sec2 DONUT-RAISE 0 1 (/ FLOORSPEED 2) s3-pic 0 s3-height)
+                       (spawn-floor w sec1 LOWER-FLOOR 0 -1 (/ FLOORSPEED 2) 0 0 s3-height)
+                       (set! done true))))
+                 (inc! i)))))))
+      (when (not stop) (set! s1 (find-sector-from-line-tag w line s1))))
+    (return (ok rtn))))
+
+; P_SpawnSpecials, once the level's things are in.
+(defn spawn-specials (w:&World):(Fallible void)
+  (let (r (ref w 'rules) l (ref w 'level))
+    (if (and (> (r 'time-limit) 0) (!= (r 'deathmatch) 0))
+      (do (set! (w 'level-timer) true)
+          (set! (w 'level-time-count) (* (r 'time-limit) 60 TICRATE)))
+      (set! (w 'level-timer) false))
+    (dotimes (i:usize (count (ref l 'sectors)))
+      (let (s (sector-at l i))
+        (case (s 'special)
+          1 (spawn-light-flash w i)
+          2 (spawn-strobe-flash w i FASTDARK false)
+          3 (spawn-strobe-flash w i SLOWDARK false)
+          4 (do (spawn-strobe-flash w i FASTDARK false)
+                (set! (s 'special) 4))
+          8 (spawn-glowing-light w i)
+          9 (set! (w 'total-secret) (+ (w 'total-secret) 1))
+          10 (spawn-door-close-in-30 w i)
+          12 (spawn-strobe-flash w i SLOWDARK true)
+          13 (spawn-strobe-flash w i FASTDARK true)
+          14 (spawn-door-raise-in-5-mins w i)
+          ; Post-1.2 executables only.
+          17 (spawn-fire-flicker w i)
+          0)))
+    (truncate! (ref w 'line-specials) 0)
+    (dotimes (i:usize (count (ref l 'lines)))
+      (when (= ((line-at l i) 'special) 48)
+        (when (>= (count (ref w 'line-specials)) MAXLINEANIMS)
+          (fail "Too many scrolling wall linedefs! (Vanilla limit is 64)"))
+        (conj (ref w 'line-specials) i)))
+    (let (nc:?&Ceiling none np:?&Plat none)
+      (dotimes (i:usize MAXCEILINGS) (set (ref w 'active-ceilings) i nc))
+      (dotimes (i:usize MAXPLATS) (set (ref w 'active-plats) i np)))
+    (truncate! (ref w 'buttons) 0)
+    (dotimes (i:usize MAXBUTTONS) (conj (ref w 'buttons) (Button 0 0 0 0 none))))
+  (return (ok)))

@@ -1,0 +1,251 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_floor.c); this port is GPLv3, see COPYING.
+;
+; Moving a sector's floor or ceiling, the floor movers, and stairs.
+
+(ns doom.play.floors)
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.move)
+(import-use doom.play.spec)
+
+; EV_BuildStairs leaves `crush` at this, which P_ChangeSector reads as true
+; and T_MovePlane's `crush == true` as false.
+(defconst STAIRS-UNINITIALIZED-CRUSH-FIELD-VALUE 10)
+
+; Move `sector`'s floor (0) or ceiling (1) by `speed` toward `dest`, undoing
+; the move if something doesn't fit, unless it may be crushed. `crush` is an
+; int because stairs leave it 10.
+(defn move-plane (w:&World sector:usize speed:Fixed dest:Fixed crush:i32
+                  floor-or-ceiling:i32 direction:i32):(Fallible i32)
+  (let (s (sector-at (ref w 'level) sector) crunch (!= crush 0))
+    (if (= floor-or-ceiling 0)
+      (case direction
+        -1 (if (< (- (s 'floor-height) speed) dest)
+             (let (last (s 'floor-height))
+               (set! (s 'floor-height) dest)
+               (when (try (change-sector w sector crunch))
+                 (set! (s 'floor-height) last)
+                 (try (change-sector w sector crunch)))
+               (return (ok RES-PASTDEST)))
+             (let (last (s 'floor-height))
+               (set! (s 'floor-height) (- (s 'floor-height) speed))
+               (when (try (change-sector w sector crunch))
+                 (set! (s 'floor-height) last)
+                 (try (change-sector w sector crunch))
+                 (return (ok RES-CRUSHED)))))
+        1 (if (> (+ (s 'floor-height) speed) dest)
+            (let (last (s 'floor-height))
+              (set! (s 'floor-height) dest)
+              (when (try (change-sector w sector crunch))
+                (set! (s 'floor-height) last)
+                (try (change-sector w sector crunch)))
+              (return (ok RES-PASTDEST)))
+            (let (last (s 'floor-height))
+              (set! (s 'floor-height) (+ (s 'floor-height) speed))
+              (when (try (change-sector w sector crunch))
+                (when (= crush 1) (return (ok RES-CRUSHED)))
+                (set! (s 'floor-height) last)
+                (try (change-sector w sector crunch))
+                (return (ok RES-CRUSHED)))))
+        0)
+      (case direction
+        -1 (if (< (- (s 'ceiling-height) speed) dest)
+             (let (last (s 'ceiling-height))
+               (set! (s 'ceiling-height) dest)
+               (when (try (change-sector w sector crunch))
+                 (set! (s 'ceiling-height) last)
+                 (try (change-sector w sector crunch)))
+               (return (ok RES-PASTDEST)))
+             (let (last (s 'ceiling-height))
+               (set! (s 'ceiling-height) (- (s 'ceiling-height) speed))
+               (when (try (change-sector w sector crunch))
+                 (when (= crush 1) (return (ok RES-CRUSHED)))
+                 (set! (s 'ceiling-height) last)
+                 (try (change-sector w sector crunch))
+                 (return (ok RES-CRUSHED)))))
+        ; A rising ceiling never stops for what's under it.
+        1 (if (> (+ (s 'ceiling-height) speed) dest)
+            (let (last (s 'ceiling-height))
+              (set! (s 'ceiling-height) dest)
+              (when (try (change-sector w sector crunch))
+                (set! (s 'ceiling-height) last)
+                (try (change-sector w sector crunch)))
+              (return (ok RES-PASTDEST)))
+            (do (set! (s 'ceiling-height) (+ (s 'ceiling-height) speed))
+                (try (change-sector w sector crunch))))
+        0))
+    (return (ok RES-OK))))
+
+; T_MoveFloor.
+(defn t-move-floor (w:&World f:&FloorMove):(Fallible void)
+  (let (res (try (move-plane w (f 'sector) (f 'speed) (f 'floor-dest-height) (f 'crush) 0
+                             (f 'direction))))
+    (when (= (bit-and (w 'level-time) 7) 0) (start-sector-sound w (f 'sector) SFX-STNMOV))
+    (when (= res RES-PASTDEST)
+      (let (s (sector-at (ref w 'level) (f 'sector)))
+        (set-special-data w (f 'sector) none)
+        (when (or (and (= (f 'direction) 1) (= (f 'type) DONUT-RAISE))
+                  (and (= (f 'direction) -1) (= (f 'type) LOWER-AND-CHANGE)))
+          (set! (s 'special) (f 'new-special))
+          (set! (s 'floor-pic) (f 'texture)))
+        (remove-thinker (unwrap (f 'th)))
+        (start-sector-sound w (f 'sector) SFX-PSTOP))))
+  (return (ok)))
+
+; A new floor mover on `sec`, which becomes the sector's special data.
+(defn spawn-floor (w:&World sec:usize type:i32 crush:i32 direction:i32 speed:Fixed
+                   texture:i32 new-special:i32 dest:Fixed):&FloorMove
+  (let (f (new FloorMove (ref w 'arena)))
+    (set! @f (FloorMove none type crush sec direction new-special texture dest speed))
+    (let (th (add-thinker w (Think-floor f)))
+      (set! (f 'th) (some th))
+      (set-special-data w sec (some th)))
+    (return f)))
+
+; The shortest lower texture on a sector's two-sided lines.
+(defn- shortest-lower-texture (w:&World sec:usize):Fixed
+  (let (minsize:Fixed 2147483647 heights (ref (ref w 'pics) 'texture-heights)
+        s (sector-at (ref w 'level) sec))
+    (dotimes (i:usize (s 'line-count))
+      (when (two-sided? w sec i)
+        (dotimes (k:usize 2)
+          (let (t ((side-of-line w sec i k) 'bottom-texture))
+            ; Vanilla also counts texture 0, the "-" of no texture.
+            (when (and (>= t 0) (< (heights (as-checked usize t)) minsize))
+              (set! minsize (heights (as-checked usize t))))))))
+    (return minsize)))
+
+; EV_DoFloor.
+(defn do-floor (w:&World li:usize type:i32):(Fallible bool)
+  (return (do-floor-line w (line-at (ref w 'level) li) type)))
+
+; The same for a line that may not be in the map: A_BossDeath's, which has
+; only a tag.
+(defn do-floor-line (w:&World line:&Line type:i32):(Fallible bool)
+  (let (l (ref w 'level) rtn false
+        secnum (find-sector-from-line-tag w line -1))
+    (while (>= secnum 0)
+      (let (si (as-checked usize secnum) sec (sector-at l si))
+        (when (none? (special-data w si))
+          (set! rtn true)
+          ; Vanilla leaves texture and newspecial as the allocator found them.
+          (let (f (spawn-floor w si type 0 0 0 0 0 0))
+            (case type
+              LOWER-FLOOR
+              (do (set! (f 'direction) -1)
+                  (set! (f 'speed) FLOORSPEED)
+                  (set! (f 'floor-dest-height) (find-highest-floor-surrounding w si)))
+              LOWER-FLOOR-TO-LOWEST
+              (do (set! (f 'direction) -1)
+                  (set! (f 'speed) FLOORSPEED)
+                  (set! (f 'floor-dest-height) (find-lowest-floor-surrounding w si)))
+              TURBO-LOWER
+              (do (set! (f 'direction) -1)
+                  (set! (f 'speed) (* FLOORSPEED 4))
+                  (set! (f 'floor-dest-height) (find-highest-floor-surrounding w si))
+                  (when (!= (f 'floor-dest-height) (sec 'floor-height))
+                    (set! (f 'floor-dest-height) (+ (f 'floor-dest-height) (* 8 FRACUNIT)))))
+              (:or RAISE-FLOOR-CRUSH RAISE-FLOOR)
+              (do (when (= type RAISE-FLOOR-CRUSH) (set! (f 'crush) 1))
+                  (set! (f 'direction) 1)
+                  (set! (f 'speed) FLOORSPEED)
+                  (set! (f 'floor-dest-height)
+                        (min (find-lowest-ceiling-surrounding w si) (sec 'ceiling-height)))
+                  (when (= type RAISE-FLOOR-CRUSH)
+                    (set! (f 'floor-dest-height) (- (f 'floor-dest-height) (* 8 FRACUNIT)))))
+              RAISE-FLOOR-TURBO
+              (do (set! (f 'direction) 1)
+                  (set! (f 'speed) (* FLOORSPEED 4))
+                  (set! (f 'floor-dest-height) (try (find-next-highest-floor w si (sec 'floor-height)))))
+              RAISE-FLOOR-TO-NEAREST
+              (do (set! (f 'direction) 1)
+                  (set! (f 'speed) FLOORSPEED)
+                  (set! (f 'floor-dest-height) (try (find-next-highest-floor w si (sec 'floor-height)))))
+              RAISE-FLOOR-24
+              (do (set! (f 'direction) 1)
+                  (set! (f 'speed) FLOORSPEED)
+                  (set! (f 'floor-dest-height) (+ (sec 'floor-height) (* 24 FRACUNIT))))
+              RAISE-FLOOR-512
+              (do (set! (f 'direction) 1)
+                  (set! (f 'speed) FLOORSPEED)
+                  (set! (f 'floor-dest-height) (+ (sec 'floor-height) (* 512 FRACUNIT))))
+              RAISE-FLOOR-24-AND-CHANGE
+              (let (front (sector-at l (unwrap-or (line 'front-sector) 0)))
+                (set! (f 'direction) 1)
+                (set! (f 'speed) FLOORSPEED)
+                (set! (f 'floor-dest-height) (+ (sec 'floor-height) (* 24 FRACUNIT)))
+                (set! (sec 'floor-pic) (front 'floor-pic))
+                (set! (sec 'special) (front 'special)))
+              RAISE-TO-TEXTURE
+              (do (set! (f 'direction) 1)
+                  (set! (f 'speed) FLOORSPEED)
+                  (set! (f 'floor-dest-height)
+                        (wrap-add (sec 'floor-height) (shortest-lower-texture w si))))
+              LOWER-AND-CHANGE
+              (let (i:usize 0 found false)
+                (set! (f 'direction) -1)
+                (set! (f 'speed) FLOORSPEED)
+                (set! (f 'floor-dest-height) (find-lowest-floor-surrounding w si))
+                (set! (f 'texture) (sec 'floor-pic))
+                (while (and (< i (sec 'line-count)) (not found))
+                  (when (two-sided? w si i)
+                    ; The sector on the line's other side.
+                    (let (k (if (= ((side-of-line w si i 0) 'sector) si) 1 0)
+                          other (sector-at l ((side-of-line w si i k) 'sector)))
+                      (when (= (other 'floor-height) (f 'floor-dest-height))
+                        (set! (f 'texture) (other 'floor-pic))
+                        (set! (f 'new-special) (other 'special))
+                        (set! found true))))
+                  (inc! i)))
+              0))))
+      (set! secnum (find-sector-from-line-tag w line secnum)))
+    (return (ok rtn))))
+
+; EV_BuildStairs: each step is the next sector across a two-sided line whose
+; front is the last step and whose floor flat matches.
+(defn build-stairs (w:&World li:usize type:i32):(Fallible bool)
+  (let (l (ref w 'level) line (line-at l li) rtn false
+        speed (if (= type BUILD8) (/ FLOORSPEED 4) (* FLOORSPEED 4))
+        stairsize (if (= type BUILD8) (* 8 FRACUNIT) (* 16 FRACUNIT))
+        secnum (find-sector-from-line-tag w line -1))
+    (while (>= secnum 0)
+      (let (si (as-checked usize secnum))
+        (when (none? (special-data w si))
+          (set! rtn true)
+          (let (height (+ ((sector-at l si) 'floor-height) stairsize)
+                texture ((sector-at l si) 'floor-pic)
+                cur si ok true)
+            (spawn-floor w si LOWER-FLOOR STAIRS-UNINITIALIZED-CRUSH-FIELD-VALUE 1 speed 0 0 height)
+            (while ok
+              (set! ok false)
+              (let (s (sector-at l cur) i:usize 0 stop false)
+                (while (and (< i (s 'line-count)) (not stop))
+                  (let (sl (line-at l (sector-line w s i)))
+                    (when (and (!= (bit-and (sl 'flags) ML-TWOSIDED) 0)
+                               (= (unwrap-or (sl 'front-sector) 0) cur))
+                      (let (t (unwrap-or (sl 'back-sector) 0))
+                        (when (= ((sector-at l t) 'floor-pic) texture)
+                          (set! height (+ height stairsize))
+                          (when (none? (special-data w t))
+                            (set! cur t)
+                            (spawn-floor w t LOWER-FLOOR STAIRS-UNINITIALIZED-CRUSH-FIELD-VALUE
+                                         1 speed 0 0 height)
+                            (set! ok true)
+                            (set! stop true))))))
+                  (inc! i))))
+            ; Vanilla goes on from the last step's sector number.
+            (set! secnum (as-checked i32 cur)))))
+      (set! secnum (find-sector-from-line-tag w line secnum)))
+    (return (ok rtn))))

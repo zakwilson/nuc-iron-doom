@@ -1,0 +1,287 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom st_stuff.c, st_lib.c); this port is GPLv3,
+; see COPYING.
+;
+; The status bar: its state ticks with the game (ST_Ticker), and it's drawn
+; whole each frame. Vanilla redraws only the widgets that changed, which
+; leaves the same pixels.
+
+(ns doom.statusbar)
+
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.fixed)
+(import-use doom.play.defs)
+(import-use doom.play.world)
+(import-use doom.play.pspr)
+
+(defconst ST-Y 168)
+(defconst ST-FX 143)
+
+; Faces: five pain levels of three straight, two turned, ouch, evil grin and
+; rampage, then god and dead.
+(defconst NUMPAINFACES 5)
+(defconst NUMSTRAIGHTFACES 3)
+(defconst FACESTRIDE 8)
+(defconst TURNOFFSET 3)
+(defconst OUCHOFFSET 5)
+(defconst EVILGRINOFFSET 6)
+(defconst RAMPAGEOFFSET 7)
+(defconst GODFACE 40)
+(defconst DEADFACE 41)
+(defconst EVILGRINCOUNT 70)
+(defconst STRAIGHTFACECOUNT 17)
+(defconst TURNCOUNT 35)
+(defconst RAMPAGEDELAY 70)
+(defconst MUCHPAIN 20)
+
+; Palettes: damage reds, bonus golds and the radiation suit's green.
+(defconst STARTREDPALS 1)
+(defconst STARTBONUSPALS 9)
+(defconst NUMREDPALS 8)
+(defconst NUMBONUSPALS 4)
+(defconst RADIATIONPAL 13)
+
+; "Not a number": a weapon without ammo shows nothing.
+(defconst LARGEAMMO 1994)
+
+(defstruct StatusGraphics
+  sbar:Patch faceback:Patch armsbg:Patch tallpercent:Patch minus:?Patch
+  tallnum:(Vector Patch) shortnum:(Vector Patch) keys:(Vector Patch)
+  ; Gray weapon numbers 2 to 7; the yellow ones are shortnum's.
+  arms:(Vector Patch)
+  faces:(Vector Patch))
+
+(defn- numbered (w:&Wad prefix:CStr i:i32):(Fallible Patch)
+  (let (s (str prefix i))
+    (return (lump-patch w (string-as-view &s)))))
+
+(defn- two-numbered (w:&Wad prefix:CStr i:i32 j:i32):(Fallible Patch)
+  (let (s (str prefix i j))
+    (return (lump-patch w (string-as-view &s)))))
+
+; ST_loadGraphics, for the console player's face background.
+(defn status-graphics-load (w:&Wad console-player:i32):(Fallible StatusGraphics)
+  (let (tall (make (Vector Patch)) short (make (Vector Patch)) keys (make (Vector Patch))
+        arms (make (Vector Patch)) faces (make (Vector Patch)))
+    (dotimes (i:i32 10)
+      (conj &tall (try (numbered w "STTNUM" i)))
+      (conj &short (try (numbered w "STYSNUM" i))))
+    (dotimes (i:i32 NUMCARDS) (conj &keys (try (numbered w "STKEYS" i))))
+    (dotimes (i:i32 6) (conj &arms (try (numbered w "STGNUM" (+ i 2)))))
+    (dotimes (i:i32 NUMPAINFACES)
+      (dotimes (j:i32 NUMSTRAIGHTFACES) (conj &faces (try (two-numbered w "STFST" i j))))
+      (conj &faces (try (two-numbered w "STFTR" i 0)))
+      (conj &faces (try (two-numbered w "STFTL" i 0)))
+      (conj &faces (try (numbered w "STFOUCH" i)))
+      (conj &faces (try (numbered w "STFEVL" i)))
+      (conj &faces (try (numbered w "STFKILL" i))))
+    (conj &faces (try (lump-patch w (strview-from-cstr "STFGOD0"))))
+    (conj &faces (try (lump-patch w (strview-from-cstr "STFDEAD0"))))
+    ; STTMINUS only exists in some IWADs; vanilla draws it when it's there.
+    (let (minus:?Patch (if (some? (lump-index w "STTMINUS"))
+                         (some (try (lump-patch w (strview-from-cstr "STTMINUS"))))
+                         none))
+      (return (ok (StatusGraphics (try (lump-patch w (strview-from-cstr "STBAR")))
+                                  (try (numbered w "STFB" console-player))
+                                  (try (lump-patch w (strview-from-cstr "STARMS")))
+                                  (try (lump-patch w (strview-from-cstr "STTPRCNT")))
+                                  minus tall short keys arms faces))))))
+
+; The status bar's state: st_stuff.c's statics, the function-local ones too.
+(defstruct StatusBar
+  face-index:i32 face-count:i32 old-health:i32
+  old-weapons-owned:(array bool 9)
+  keyboxes:(array i32 3)
+  random-number:i32
+  ; ST_updateFaceWidget's statics, which ST_Start doesn't reset.
+  priority:i32 last-attack-down:i32
+  ; ST_calcPainOffset's.
+  pain-old-health:i32 pain-last-calc:i32
+  ; The palette last set, -1 after ST_Start.
+  palette:i32
+  ; The world's console-spawns at the last ST_Start.
+  spawns:i32)
+
+(defn status-bar-new ():StatusBar
+  (return (StatusBar 0 0 -1 (array bool false false false false false false false false false)
+                     (array i32 -1 -1 -1) 0 0 -1 -1 0 -1 -1)))
+
+; ST_Start's ST_initData.
+(defn- st-start (sb:&StatusBar p:&Player):void
+  (set! (sb 'face-index) 0)
+  (set! (sb 'palette) -1)
+  (set! (sb 'old-health) -1)
+  (dotimes (i:i64 NUMWEAPONS)
+    (set! (aref (sb 'old-weapons-owned) i) (aref (p 'weapon-owned) i)))
+  (dotimes (i:i64 3) (set! (aref (sb 'keyboxes) i) -1)))
+
+(defn- pain-offset (sb:&StatusBar p:&Player):i32
+  (let (health (if (> (p 'health) 100) 100 (p 'health)))
+    (when (!= health (sb 'pain-old-health))
+      (set! (sb 'pain-last-calc) (* FACESTRIDE (/ (* (- 100 health) NUMPAINFACES) 101)))
+      (set! (sb 'pain-old-health) health))
+    (return (sb 'pain-last-calc))))
+
+; ST_updateFaceWidget: dead > evil grin > turned head > straight ahead.
+(defn- update-face (sb:&StatusBar p:&Player):void
+  (when (and (< (sb 'priority) 10) (= (p 'health) 0))
+    (set! (sb 'priority) 9)
+    (set! (sb 'face-index) DEADFACE)
+    (set! (sb 'face-count) 1))
+  (when (and (< (sb 'priority) 9) (!= (p 'bonus-count) 0))
+    (let (grin false)
+      (dotimes (i:i64 NUMWEAPONS)
+        (when (!= (aref (sb 'old-weapons-owned) i) (aref (p 'weapon-owned) i))
+          (set! grin true)
+          (set! (aref (sb 'old-weapons-owned) i) (aref (p 'weapon-owned) i))))
+      (when grin
+        (set! (sb 'priority) 8)
+        (set! (sb 'face-count) EVILGRINCOUNT)
+        (set! (sb 'face-index) (+ (pain-offset sb p) EVILGRINOFFSET)))))
+  (when (< (sb 'priority) 8)
+    (when-some (att (p 'attacker))
+      (let (mo (unwrap (p 'mo)))
+        (when (and (!= (p 'damage-count) 0) (not (same? att mo)))
+          (set! (sb 'priority) 7)
+          (if (> (- (p 'health) (sb 'old-health)) MUCHPAIN)
+            (do (set! (sb 'face-count) TURNCOUNT)
+                (set! (sb 'face-index) (+ (pain-offset sb p) OUCHOFFSET)))
+            (let (bad (point-to-angle2 (mo 'x) (mo 'y) (att 'x) (att 'y))
+                  ; Which way to turn: vanilla's "confusing, ain't it?"
+                  right (if (> bad (mo 'angle))
+                          (> (- bad (mo 'angle)) ANG180)
+                          (<= (- (mo 'angle) bad) ANG180))
+                  diff (if (> bad (mo 'angle)) (- bad (mo 'angle)) (- (mo 'angle) bad)))
+              (set! (sb 'face-count) TURNCOUNT)
+              (set! (sb 'face-index) (pain-offset sb p))
+              (set! (sb 'face-index)
+                    (+ (sb 'face-index)
+                       (cond (< diff ANG45) RAMPAGEOFFSET
+                             right TURNOFFSET
+                             true (+ TURNOFFSET 1))))))))))
+  ; Hurt by your own damn stupidity.
+  (when (and (< (sb 'priority) 7) (!= (p 'damage-count) 0))
+    (set! (sb 'face-count) TURNCOUNT)
+    (if (> (- (p 'health) (sb 'old-health)) MUCHPAIN)
+      (do (set! (sb 'priority) 7)
+          (set! (sb 'face-index) (+ (pain-offset sb p) OUCHOFFSET)))
+      (do (set! (sb 'priority) 6)
+          (set! (sb 'face-index) (+ (pain-offset sb p) RAMPAGEOFFSET)))))
+  ; Rapid fire.
+  (when (< (sb 'priority) 6)
+    (if (p 'attack-down)
+      (if (= (sb 'last-attack-down) -1)
+        (set! (sb 'last-attack-down) RAMPAGEDELAY)
+        (do (set! (sb 'last-attack-down) (- (sb 'last-attack-down) 1))
+            (when (= (sb 'last-attack-down) 0)
+              (set! (sb 'priority) 5)
+              (set! (sb 'face-index) (+ (pain-offset sb p) RAMPAGEOFFSET))
+              (set! (sb 'face-count) 1)
+              (set! (sb 'last-attack-down) 1))))
+      (set! (sb 'last-attack-down) -1)))
+  (when (and (< (sb 'priority) 5)
+             (or (!= (bit-and (p 'cheats) CF-GODMODE) 0)
+                 (!= (aref (p 'powers) (as i64 PW-INVULNERABILITY)) 0)))
+    (set! (sb 'priority) 4)
+    (set! (sb 'face-index) GODFACE)
+    (set! (sb 'face-count) 1))
+  ; Look left or right once the count runs out.
+  (when (= (sb 'face-count) 0)
+    (set! (sb 'face-index) (+ (pain-offset sb p) (% (sb 'random-number) 3)))
+    (set! (sb 'face-count) STRAIGHTFACECOUNT)
+    (set! (sb 'priority) 0))
+  (set! (sb 'face-count) (- (sb 'face-count) 1)))
+
+; ST_Ticker, with the turn's M_Random already drawn: P_SpawnPlayer's ST_Start
+; first if the console player has spawned since.
+(defn st-ticker (sb:&StatusBar w:&World p:&Player random-number:i32):void
+  (when (!= (sb 'spawns) (w 'console-spawns))
+    (set! (sb 'spawns) (w 'console-spawns))
+    (st-start sb p))
+  (set! (sb 'random-number) random-number)
+  (dotimes (i:i64 3)
+    (set! (aref (sb 'keyboxes) i) (if (aref (p 'cards) i) (as-checked i32 i) -1))
+    (when (aref (p 'cards) (+ i 3)) (set! (aref (sb 'keyboxes) i) (as-checked i32 (+ i 3)))))
+  (update-face sb p)
+  (set! (sb 'old-health) (p 'health)))
+
+; ST_doPaletteStuff: which PLAYPAL palette the player's state calls for.
+(defn st-palette (p:&Player):i32
+  (let (cnt (p 'damage-count) strength (aref (p 'powers) (as i64 PW-STRENGTH))
+        ironfeet (aref (p 'powers) (as i64 PW-IRONFEET)))
+    ; The berserk's red fades slowly.
+    (when (!= strength 0)
+      (let (bzc (- 12 (bit-shr strength 6)))
+        (when (> bzc cnt) (set! cnt bzc))))
+    (return (cond (!= cnt 0) (+ (min (bit-shr (+ cnt 7) 3) (- NUMREDPALS 1)) STARTREDPALS)
+                  (!= (p 'bonus-count) 0)
+                  (+ (min (bit-shr (+ (p 'bonus-count) 7) 3) (- NUMBONUSPALS 1)) STARTBONUSPALS)
+                  (or (> ironfeet (* 4 32)) (!= (bit-and ironfeet 8) 0)) RADIATIONPAL
+                  true 0))))
+
+(defn- min (a:i32 b:i32):i32 (return (if (< a b) a b)))
+
+(defn- patch-at (v:&(Vector Patch) i:i32):&Patch
+  (let (s (view v)) (return (&s (as-checked usize i)))))
+
+(defn- draw (buf:&Buffer x:i32 y:i32 p:&Patch):(Fallible void)
+  (return (draw-patch buf (as-checked usize x) (as-checked usize y) p)))
+
+; STlib_drawNum: right-aligned at x, `digits` wide.
+(defn- draw-num (buf:&Buffer g:&StatusGraphics nums:&(Vector Patch) x:i32 y:i32 digits:i32 value:i32):(Fallible void)
+  (let (num value neg (< value 0) w (as-checked i32 ((patch-at nums 0) 'width)) cx x n digits)
+    (when neg
+      (cond (and (= digits 2) (< num -9)) (set! num -9)
+            (and (= digits 3) (< num -99)) (set! num -99))
+      (set! num (- 0 num)))
+    (when (= num LARGEAMMO) (return (ok)))
+    (when (= num 0) (try (draw buf (- cx w) y (patch-at nums 0))))
+    (while (and (!= num 0) (> n 0))
+      (set! cx (- cx w))
+      (try (draw buf cx y (patch-at nums (% num 10))))
+      (set! num (/ num 10))
+      (set! n (- n 1)))
+    (when neg
+      (when-some (m (g 'minus)) (let (mm m) (try (draw buf (- cx 8) y &mm)))))
+    (return (ok))))
+
+; ST_Drawer with everything refreshed.
+(defn st-drawer (sb:&StatusBar g:&StatusGraphics buf:&Buffer p:&Player deathmatch:bool netgame:bool frags:i32):(Fallible void)
+  (try (draw buf 0 ST-Y (ref g 'sbar)))
+  (when netgame (try (draw buf ST-FX ST-Y (ref g 'faceback))))
+  (let (tall (ref g 'tallnum) short (ref g 'shortnum)
+        a ((weapon-info (p 'ready-weapon)) 'ammo))
+    (try (draw-num buf g tall 44 171 3 (if (= a AM-NOAMMO) LARGEAMMO (aref (p 'ammo) (as i64 a)))))
+    (dotimes (i:i32 4)
+      (let (y (case i 0 173 1 179 2 191 185))
+        (try (draw-num buf g short 288 y 3 (aref (p 'ammo) (as i64 i))))
+        (try (draw-num buf g short 314 y 3 (aref (p 'max-ammo) (as i64 i))))))
+    (try (draw-num buf g tall 90 171 3 (p 'health)))
+    (try (draw buf 90 171 (ref g 'tallpercent)))
+    (try (draw-num buf g tall 221 171 3 (p 'armor-points)))
+    (try (draw buf 221 171 (ref g 'tallpercent)))
+    (if deathmatch
+      (try (draw-num buf g tall 138 171 2 frags))
+      (do (try (draw buf 104 168 (ref g 'armsbg)))
+          (dotimes (i:i32 6)
+            (let (x (+ 111 (* (% i 3) 12)) y (+ 172 (* (/ i 3) 10)))
+              (try (draw buf x y (if (aref (p 'weapon-owned) (as i64 (+ i 1)))
+                                   (patch-at short (+ i 2))
+                                   (patch-at (ref g 'arms) i))))))))
+    (try (draw buf 143 168 (patch-at (ref g 'faces) (sb 'face-index))))
+    (dotimes (i:i32 3)
+      (let (k (aref (sb 'keyboxes) (as i64 i)))
+        (when (!= k -1) (try (draw buf 239 (+ 171 (* i 10)) (patch-at (ref g 'keys) k)))))))
+  (return (ok)))

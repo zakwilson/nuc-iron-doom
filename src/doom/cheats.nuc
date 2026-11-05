@@ -1,0 +1,167 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom m_cheat.c, st_stuff.c); this port is GPLv3,
+; see COPYING.
+;
+; The cheat codes: ST_Responder's half of G_Responder. Each sequence keeps its
+; own progress, and an earlier match in vanilla's if-else chain stops the later
+; sequences seeing the key, so the order below is vanilla's.
+
+(ns doom.cheats)
+
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use nucleus.create)
+(import-use doom.fixed)
+(import-use doom.bytes)
+(import-use doom.play.defs)
+(import-use doom.play.world)
+(import-use doom.play.inter)
+(import-use doom.sounds)
+
+; cheatseq_t: `read` of the sequence matched, then `pread` parameter keys.
+(defstruct CheatSeq seq:StrView params:usize read:usize pread:usize buf:(array i32 2))
+
+(defn cheat-seq (s:CStr params:usize):CheatSeq
+  (return (CheatSeq (strview-from-cstr s) params 0 0 (array i32 0 0))))
+
+(defstruct Cheats
+  mus:CheatSeq god:CheatSeq ammo:CheatSeq ammo-no-key:CheatSeq
+  noclip:CheatSeq commercial-noclip:CheatSeq
+  behold-v:CheatSeq behold-s:CheatSeq behold-i:CheatSeq behold-r:CheatSeq
+  behold-a:CheatSeq behold-l:CheatSeq behold:CheatSeq
+  choppers:CheatSeq clev:CheatSeq mypos:CheatSeq
+  ; idmypos's message, which the player's message points into.
+  pos-text:String
+  ; idmus's song for the game to play, 0 for none.
+  music:i32)
+
+(defn cheats-new ():Cheats
+  (return (Cheats (cheat-seq "idmus" 2) (cheat-seq "iddqd" 0) (cheat-seq "idkfa" 0) (cheat-seq "idfa" 0)
+                  (cheat-seq "idspispopd" 0) (cheat-seq "idclip" 0)
+                  (cheat-seq "idbeholdv" 0) (cheat-seq "idbeholds" 0) (cheat-seq "idbeholdi" 0)
+                  (cheat-seq "idbeholdr" 0) (cheat-seq "idbeholda" 0) (cheat-seq "idbeholdl" 0)
+                  (cheat-seq "idbehold" 0)
+                  (cheat-seq "idchoppers" 0) (cheat-seq "idclev" 2) (cheat-seq "idmypos" 0)
+                  (make String) 0)))
+
+; cht_CheckCheat. A wrong key restarts the sequence; parameter keys are taken
+; as they come.
+(defn cheat-check (c:&CheatSeq key:i32):bool
+  (let (n ((c 'seq) 'len))
+    (if (< (c 'read) n)
+      (do (if (= key (byte-of (c 'seq) (c 'read)))
+            (set! (c 'read) (+ (c 'read) 1))
+            (set! (c 'read) 0))
+          (set! (c 'pread) 0))
+      (when (< (c 'pread) (c 'params))
+        (set! (aref (c 'buf) (as i64 (c 'pread))) key)
+        (set! (c 'pread) (+ (c 'pread) 1))))
+    (when (and (>= (c 'read) n) (>= (c 'pread) (c 'params)))
+      (set! (c 'read) 0)
+      (set! (c 'pread) 0)
+      (return true)))
+  (return false))
+
+(defn- param (c:&CheatSeq i:i64):i32 (return (aref (c 'buf) i)))
+
+; What idclev asks of the game: G_DeferedInitNew at the current skill.
+(defstruct Clev episode:i32 map:i32)
+
+(defn- arsenal (p:&Player):void
+  (dotimes (i:i64 NUMWEAPONS) (set! (aref (p 'weapon-owned) i) true))
+  (dotimes (i:i64 NUMAMMO) (set! (aref (p 'ammo) i) (aref (p 'max-ammo) i))))
+
+; idbehold's toggle: a power on, or one already on cut to its last tic
+; (berserk off at once, since it counts up).
+(defn- behold (p:&Player power:i32):void
+  (let (i (as i64 power))
+    (cond (= (aref (p 'powers) i) 0) (give-power p power)
+          (!= power PW-STRENGTH) (set! (aref (p 'powers) i) 1)
+          true (set! (aref (p 'powers) i) 0)))
+  (set! (p 'message) (some "Power-up Toggled")))
+
+; The Doom II tune numbers v1.9 tried for every game, or Ultimate Doom's
+; episode and map.
+(defn- music-cheat (c:&Cheats p:&Player r:&Rules):void
+  (let (a (param (ref c 'mus) 0) b (param (ref c 'mus) 1))
+    (set! (p 'message) (some "Music Change"))
+    (if (or (= (r 'mode) COMMERCIAL) (not (r 'ultimate)))
+      (let (k (+ (* (- a 48) 10) (- b 48)))
+        (if (> k 35)
+          (set! (p 'message) (some "IMPOSSIBLE SELECTION"))
+          (set! (c 'music) (+ MUS-RUNNIN (- k 1)))))
+      (let (k (+ (* (- a 49) 9) (- b 49)))
+        (if (> k 31)
+          (set! (p 'message) (some "IMPOSSIBLE SELECTION"))
+          (set! (c 'music) (+ MUS-E1M1 k)))))))
+
+(defn- mypos (c:&Cheats p:&Player):void
+  (let (s (ref c 'pos-text) mo (unwrap (p 'mo)))
+    (clear! s)
+    (str-into s "ang=0x" (hex (mo 'angle)) ";x,y=(0x" (hex (unsafe/cast ui32 (mo 'x)))
+              ",0x" (hex (unsafe/cast ui32 (mo 'y))) ")")
+    (set! (p 'message) (some (string-as-cstr s)))))
+
+; idclev's map, if it names one this game's version accepts.
+(defn- clev (c:&Cheats r:&Rules):?Clev
+  (let (a (param (ref c 'clev) 0) b (param (ref c 'clev) 1))
+    (if (= (r 'mode) COMMERCIAL)
+      (let (m (+ (* (- a 48) 10) (- b 48)))
+        (when (or (< m 1) (> m 40)) (return none))
+        (return (some (Clev 0 m))))
+      (let (e (- a 48) m (- b 48))
+        (when (or (< e 1) (> e 4) (and (= e 4) (not (r 'ultimate))) (< m 1) (> m 9))
+          (return none))
+        (return (some (Clev e m)))))))
+
+; ST_Responder for one typed key `ch`, in a level. A map change is returned
+; for the game to start.
+(defn cheat-responder (c:&Cheats w:&World ch:i32):?Clev
+  (let (r (ref w 'rules) p (player-at w (as-checked usize (r 'console-player))))
+    (when (and (not (r 'netgame)) (!= (r 'skill) SK-NIGHTMARE))
+      (cond (cheat-check (ref c 'god) ch)
+            (do (set! (p 'cheats) (bit-xor (p 'cheats) CF-GODMODE))
+                (if (!= (bit-and (p 'cheats) CF-GODMODE) 0)
+                  (do (when-some (mo (p 'mo)) (set! (mo 'health) 100))
+                      (set! (p 'health) 100)
+                      (set! (p 'message) (some "Degreelessness Mode On")))
+                  (set! (p 'message) (some "Degreelessness Mode Off"))))
+            (cheat-check (ref c 'ammo-no-key) ch)
+            (do (set! (p 'armor-points) 200)
+                (set! (p 'armor-type) 2)
+                (arsenal p)
+                (set! (p 'message) (some "Ammo (no keys) Added")))
+            (cheat-check (ref c 'ammo) ch)
+            (do (set! (p 'armor-points) 200)
+                (set! (p 'armor-type) 2)
+                (arsenal p)
+                (dotimes (i:i64 NUMCARDS) (set! (aref (p 'cards) i) true))
+                (set! (p 'message) (some "Very Happy Ammo Added")))
+            (cheat-check (ref c 'mus) ch) (music-cheat c p r)
+            (if (= (r 'mode) COMMERCIAL) (cheat-check (ref c 'commercial-noclip) ch) (cheat-check (ref c 'noclip) ch))
+            (do (set! (p 'cheats) (bit-xor (p 'cheats) CF-NOCLIP))
+                (set! (p 'message) (some (if (!= (bit-and (p 'cheats) CF-NOCLIP) 0)
+                                           "No Clipping Mode ON" "No Clipping Mode OFF"))))
+            true 0)
+      ; Every power's sequence sees the key.
+      (when (cheat-check (ref c 'behold-v) ch) (behold p PW-INVULNERABILITY))
+      (when (cheat-check (ref c 'behold-s) ch) (behold p PW-STRENGTH))
+      (when (cheat-check (ref c 'behold-i) ch) (behold p PW-INVISIBILITY))
+      (when (cheat-check (ref c 'behold-r) ch) (behold p PW-IRONFEET))
+      (when (cheat-check (ref c 'behold-a) ch) (behold p PW-ALLMAP))
+      (when (cheat-check (ref c 'behold-l) ch) (behold p PW-INFRARED))
+      (cond (cheat-check (ref c 'behold) ch)
+            (set! (p 'message) (some "inVuln, Str, Inviso, Rad, Allmap, or Lite-amp"))
+            (cheat-check (ref c 'choppers) ch)
+            (do (set! (aref (p 'weapon-owned) (as i64 WP-CHAINSAW)) true)
+                (set! (aref (p 'powers) (as i64 PW-INVULNERABILITY)) 1)
+                (set! (p 'message) (some "... doesn't suck - GM")))
+            (cheat-check (ref c 'mypos) ch) (mypos c p)
+            true 0))
+    (when (and (not (r 'netgame)) (cheat-check (ref c 'clev) ch))
+      (when-some (to (clev c r))
+        (set! (p 'message) (some "Changing Level..."))
+        (return (some to)))))
+  (return none))

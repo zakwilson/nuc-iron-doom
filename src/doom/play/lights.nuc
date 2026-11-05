@@ -1,0 +1,130 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_lights.c); this port is GPLv3, see COPYING.
+;
+; Sector lighting effects: flicker, flash, strobe and glow, and the line
+; specials that switch lights.
+
+(ns doom.play.lights)
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use doom.util)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.spec)
+
+(defn- sector (w:&World i:usize):&Sector (return (sector-at (ref w 'level) i)))
+
+; T_FireFlicker.
+(defn t-fire-flicker (w:&World f:&FireFlicker):void
+  (set! (f 'count) (- (f 'count) 1))
+  (when (!= (f 'count) 0) (return))
+  (let (amount (* (bit-and (p-random w) 3) 16) s (sector w (f 'sector)))
+    (if (< (- (s 'light-level) amount) (f 'min-light))
+      (set! (s 'light-level) (f 'min-light))
+      (set! (s 'light-level) (- (f 'max-light) amount)))
+    (set! (f 'count) 4)))
+
+(defn spawn-fire-flicker (w:&World sec:usize):void
+  (let (s (sector w sec) f (new FireFlicker (ref w 'arena)))
+    (set! (s 'special) 0)
+    (set! @f (FireFlicker none sec 4 (s 'light-level)
+                          (+ (find-min-surrounding-light w sec (s 'light-level)) 16)))
+    (set! (f 'th) (some (add-thinker w (Think-flicker f))))))
+
+; T_LightFlash: on for a random time, off for a shorter random one.
+(defn t-light-flash (w:&World f:&LightFlash):void
+  (set! (f 'count) (- (f 'count) 1))
+  (when (!= (f 'count) 0) (return))
+  (let (s (sector w (f 'sector)))
+    (if (= (s 'light-level) (f 'max-light))
+      (do (set! (s 'light-level) (f 'min-light))
+          (set! (f 'count) (+ (bit-and (p-random w) (f 'min-time)) 1)))
+      (do (set! (s 'light-level) (f 'max-light))
+          (set! (f 'count) (+ (bit-and (p-random w) (f 'max-time)) 1))))))
+
+(defn spawn-light-flash (w:&World sec:usize):void
+  (let (s (sector w sec) f (new LightFlash (ref w 'arena)))
+    (set! (s 'special) 0)
+    (set! @f (LightFlash none sec 0 (s 'light-level)
+                         (find-min-surrounding-light w sec (s 'light-level)) 64 7))
+    (set! (f 'th) (some (add-thinker w (Think-flash f))))
+    (set! (f 'count) (+ (bit-and (p-random w) (f 'max-time)) 1))))
+
+; T_StrobeFlash.
+(defn t-strobe-flash (w:&World f:&Strobe):void
+  (set! (f 'count) (- (f 'count) 1))
+  (when (!= (f 'count) 0) (return))
+  (let (s (sector w (f 'sector)))
+    (if (= (s 'light-level) (f 'min-light))
+      (do (set! (s 'light-level) (f 'max-light))
+          (set! (f 'count) (f 'bright-time)))
+      (do (set! (s 'light-level) (f 'min-light))
+          (set! (f 'count) (f 'dark-time))))))
+
+(defn spawn-strobe-flash (w:&World sec:usize fast-or-slow:i32 in-sync:bool):void
+  (let (s (sector w sec) f (new Strobe (ref w 'arena))
+        mn (find-min-surrounding-light w sec (s 'light-level)))
+    (set! @f (Strobe none sec 0 (if (= mn (s 'light-level)) 0 mn) (s 'light-level)
+                     fast-or-slow STROBEBRIGHT))
+    (set! (f 'th) (some (add-thinker w (Think-strobe f))))
+    (set! (s 'special) 0)
+    (set! (f 'count) (if in-sync 1 (+ (bit-and (p-random w) 7) 1)))))
+
+; EV_StartLightStrobing.
+(defn start-light-strobing (w:&World li:usize):void
+  (let (line (line-at (ref w 'level) li) sec (find-sector-from-line-tag w line -1))
+    (while (>= sec 0)
+      (when (none? ((sector-play-at w (as usize sec)) 'special-data))
+        (spawn-strobe-flash w (as usize sec) SLOWDARK false))
+      (set! sec (find-sector-from-line-tag w line sec)))))
+
+; The lowest (or brightest) light among a sector's neighbours, from `start`.
+(defn- surrounding-light (w:&World sec:usize start:i32 brightest:bool):i32
+  (let (s (sector w sec) v start)
+    (dotimes (i:usize (s 'line-count))
+      (when-some (o (get-next-sector w (sector-line w s i) sec))
+        (let (ll ((sector w o) 'light-level))
+          (when (if brightest (> ll v) (< ll v)) (set! v ll)))))
+    (return v)))
+
+; EV_TurnTagLightsOff: each tagged sector to its darkest neighbour.
+(defn turn-tag-lights-off (w:&World li:usize):void
+  (let (l (ref w 'level) tag ((line-at l li) 'tag))
+    (dotimes (j:usize (count (ref l 'sectors)))
+      (let (s (sector w j))
+        (when (= (s 'tag) tag)
+          (set! (s 'light-level) (surrounding-light w j (s 'light-level) false)))))))
+
+; EV_LightTurnOn: 0 means as bright as the brightest neighbour. Vanilla
+; keeps the first tagged sector's brightness for the later ones.
+(defn light-turn-on (w:&World li:usize bright:i32):void
+  (let (l (ref w 'level) tag ((line-at l li) 'tag) b bright)
+    (dotimes (i:usize (count (ref l 'sectors)))
+      (let (s (sector w i))
+        (when (= (s 'tag) tag)
+          (when (= b 0) (set! b (surrounding-light w i b true)))
+          (set! (s 'light-level) b))))))
+
+; T_Glow.
+(defn t-glow (w:&World g:&Glow):void
+  (let (s (sector w (g 'sector)))
+    (case (g 'direction)
+      -1 (do (set! (s 'light-level) (- (s 'light-level) GLOWSPEED))
+             (when (<= (s 'light-level) (g 'min-light))
+               (set! (s 'light-level) (+ (s 'light-level) GLOWSPEED))
+               (set! (g 'direction) 1)))
+      1 (do (set! (s 'light-level) (+ (s 'light-level) GLOWSPEED))
+            (when (>= (s 'light-level) (g 'max-light))
+              (set! (s 'light-level) (- (s 'light-level) GLOWSPEED))
+              (set! (g 'direction) -1)))
+      0)))
+
+(defn spawn-glowing-light (w:&World sec:usize):void
+  (let (s (sector w sec) g (new Glow (ref w 'arena)))
+    (set! @g (Glow none sec (find-min-surrounding-light w sec (s 'light-level)) (s 'light-level) -1))
+    (set! (g 'th) (some (add-thinker w (Think-glow g))))
+    (set! (s 'special) 0)))

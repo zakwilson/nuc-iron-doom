@@ -1,0 +1,89 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom g_game.c); this port is GPLv3, see COPYING.
+;
+; G_BuildTiccmd: the keyboard's state as one tic of player input.
+
+(ns doom.ticcmd)
+
+(import-use "SDL2/SDL.h")
+(import-use doom.play.defs)
+(import-use doom.play.world)
+(import-use nucleus.math)
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use doom.util)
+
+(defvar FORWARDMOVE:(array i32 2) (array i32 0x19 0x32))
+(defvar SIDEMOVE:(array i32 2) (array i32 0x18 0x28))
+; Normal, fast, and the slow first tics of a turn.
+(defvar ANGLETURN:(array i32 3) (array i32 640 1280 320))
+(defconst SLOWTURNTICS 6)
+(defconst MAXPLMOVE 0x32)
+
+(defn- key? (keys:&ui8 sc:i32):bool
+  (return (!= (aref keys (as i64 sc)) 0)))
+
+; Each action's keys, as SDL scancodes (from the settings file).
+(defstruct Bindings
+  forward:(Vector i32) backward:(Vector i32) turn-left:(Vector i32) turn-right:(Vector i32)
+  strafe-left:(Vector i32) strafe-right:(Vector i32) strafe:(Vector i32) speed:(Vector i32)
+  fire:(Vector i32) use:(Vector i32))
+
+(defn- arrow? (sc:i32):bool
+  (return (or (= sc SDL_SCANCODE_UP) (= sc SDL_SCANCODE_DOWN)
+              (= sc SDL_SCANCODE_LEFT) (= sc SDL_SCANCODE_RIGHT))))
+
+; Whether any of an action's keys is down. Without `arrows` the arrow keys
+; are the automap's.
+(defn- down? (keys:&ui8 action:&(Vector i32) arrows:bool):bool
+  (let (v (view action))
+    (dotimes (i:usize (count &v))
+      (let (sc @(&v i))
+        (when (and (key? keys sc) (or arrows (not (arrow? sc)))) (return true)))))
+  (return false))
+
+; The bound controls, with 1-7 for the weapons. `turn-held` counts the tics a
+; turn key has been down.
+(defn build-ticcmd (turn-held:&i32 arrows:bool b:&Bindings):TicCmd
+  (let (keys (unsafe/cast &ui8 (SDL_GetKeyboardState null))
+        cmd (ticcmd-zero)
+        speed (if (down? keys (ref b 'speed) arrows) 1 0)
+        strafe (down? keys (ref b 'strafe) arrows)
+        left (down? keys (ref b 'turn-left) arrows)
+        right (down? keys (ref b 'turn-right) arrows)
+        forward 0 side 0)
+    ; Two-stage accelerative turning on the keyboard.
+    (if (or left right) (set! @turn-held (+ @turn-held 1)) (set! @turn-held 0))
+    (let (tspeed (if (< @turn-held SLOWTURNTICS) 2 speed)
+          fm (aref FORWARDMOVE (as i64 speed)) sm (aref SIDEMOVE (as i64 speed)))
+      (if strafe
+        (do (when right (set! side (+ side sm)))
+            (when left (set! side (- side sm))))
+        (do (when right (set! (cmd 'angle-turn) (- (cmd 'angle-turn) (aref ANGLETURN (as i64 tspeed)))))
+            (when left (set! (cmd 'angle-turn) (+ (cmd 'angle-turn) (aref ANGLETURN (as i64 tspeed)))))))
+      (when (down? keys (ref b 'forward) arrows) (set! forward (+ forward fm)))
+      (when (down? keys (ref b 'backward) arrows) (set! forward (- forward fm)))
+      (when (down? keys (ref b 'strafe-right) arrows) (set! side (+ side sm)))
+      (when (down? keys (ref b 'strafe-left) arrows) (set! side (- side sm))))
+    (when (down? keys (ref b 'fire) arrows)
+      (set! (cmd 'buttons) (bit-or (cmd 'buttons) BT-ATTACK)))
+    (when (down? keys (ref b 'use) arrows)
+      (set! (cmd 'buttons) (bit-or (cmd 'buttons) BT-USE)))
+    ; Weapon keys: the first one down.
+    (let (i 0 done false)
+      (while (and (< i 7) (not done))
+        (when (key? keys (+ SDL_SCANCODE_1 i))
+          (set! (cmd 'buttons) (bit-or (cmd 'buttons) (bit-or BT-CHANGE (bit-shl i BT-WEAPONSHIFT))))
+          (set! done true))
+        (inc! i)))
+    (set! (cmd 'forward-move) (max (- 0 MAXPLMOVE) (min forward MAXPLMOVE)))
+    (set! (cmd 'side-move) (max (- 0 MAXPLMOVE) (min side MAXPLMOVE)))
+    (return cmd)))
+
+; Chocolate Doom's lowres_turn while recording: the turn rounds to the demo's
+; one byte, and what that loses carries to the next tic.
+(defn lowres-turn (cmd:&TicCmd carry:&i32):void
+  (let (desired (unsafe/cast i32 (unsafe/cast i16 (+ (cmd 'angle-turn) @carry))))
+    (set! (cmd 'angle-turn) (unsafe/cast i32 (unsafe/cast i16 (bit-and (+ desired 128) 0xff00))))
+    (set! @carry (unsafe/cast i32 (unsafe/cast i16 (- desired (cmd 'angle-turn)))))))

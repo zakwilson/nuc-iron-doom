@@ -1,0 +1,72 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_tick.c); this port is GPLv3, see COPYING.
+;
+; One tic of the level: the players, then every thinker in the order it was
+; added, then the animated specials.
+
+(ns doom.play.tick)
+
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.play.world)
+(import-use doom.play.mobj)
+(import-use doom.play.player)
+(import-use doom.play.spec)
+(import-use doom.play.lights)
+(import-use doom.play.doors)
+(import-use doom.play.floors)
+(import-use doom.play.ceilings)
+(import-use doom.play.plats)
+
+(defn- think (w:&World th:&Thinker):(Fallible void)
+  (match (th 'think)
+    ((cap) 0)
+    ((mobj m) (try (mobj-thinker w m)))
+    ((door d) (try (t-vertical-door w d)))
+    ((floor f) (try (t-move-floor w f)))
+    ((ceiling c) (try (t-move-ceiling w c)))
+    ((plat p) (try (t-plat-raise w p)))
+    ((flash l) (t-light-flash w l))
+    ((strobe s) (t-strobe-flash w s))
+    ((glow g) (t-glow w g))
+    ((flicker f) (t-fire-flicker w f)))
+  (return (ok)))
+
+; P_RunThinkers: a removed thinker is unlinked and freed when reached.
+(defn- run-thinkers (w:&World):(Fallible void)
+  (let (cap (w 'thinker-cap) cur (unwrap (cap 'next)))
+    (while (not (same? cur cap))
+      (let (next (unwrap (cur 'next)))
+        (if (cur 'removed)
+          (do (set! ((unwrap (cur 'next)) 'prev) (cur 'prev))
+              (set! ((unwrap (cur 'prev)) 'next) (cur 'next))
+              (match (cur 'think)
+                ((mobj m) (conj (ref w 'free-mobjs) m))
+                (_ 0))
+              (conj (ref w 'free-thinkers) cur))
+          (do (when (not (cur 'idle)) (try (think w cur)))
+              ; Read after thinking, as vanilla does: a thinker added now
+              ; runs this tic if it went at the end.
+              (set! next (unwrap (cur 'next)))))
+        (set! cur next))))
+  (return (ok)))
+
+; P_Ticker. `menu-active` pauses a single-player game once the console
+; player has had a tic, as vanilla does.
+(defn ticker (w:&World paused:bool menu-active:bool):(Fallible void)
+  (let (r (ref w 'rules))
+    (when paused (return (ok)))
+    (when (and (not (r 'netgame)) menu-active (not (r 'demo-playback))
+               (!= ((player-at w (as-checked usize (r 'console-player))) 'view-z) 1))
+      (return (ok))))
+  (dotimes (i:usize MAXPLAYERS)
+    (when ((ref w 'player-in-game) i)
+      (try (player-think w i))))
+  (try (run-thinkers w))
+  (try (update-specials w))
+  (try (respawn-specials w))
+  (set! (w 'level-time) (+ (w 'level-time) 1))
+  (return (ok)))

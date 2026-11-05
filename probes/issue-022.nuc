@@ -1,0 +1,16 @@
+; ISSUE-022: `none` passed to a generic method isn't typed from the other
+; arguments: (conj v none) on a (Vector ?&P) finds no conj.
+; fixed-when: runs
+; Actual: "no matching method for overloaded 'conj' with argument types
+; (&(Vector ?&P), ?ptr) ... argument 2: ?ptr is not ?&P".
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+
+(defstruct P x:i32)
+
+(defn main ():i32
+  (let (v (make (Vector ?&P)))
+    (conj &v none)
+    (return (- (unsafe/cast i32 (count &v)) 1))))

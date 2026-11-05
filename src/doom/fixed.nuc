@@ -1,0 +1,118 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom m_fixed.c, tables.h, m_bbox.c); this port is
+; GPLv3, see COPYING.
+;
+; 16.16 fixed point and binary angles. Vanilla's arithmetic wraps at 32 bits,
+; and Nucleus's signed operators don't promise to (they're `nsw`), so a sum
+; that can overflow is done unsigned and cast back.
+
+(ns doom.fixed)
+
+(import-use doom.tables)
+
+(deftype Fixed i32)
+; A turn is 2^32, so angle arithmetic wraps by itself.
+(deftype Angle ui32)
+
+(defconst FRACBITS 16)
+(defconst FRACUNIT 65536)
+(defconst FIXED-MAX 2147483647)
+(defconst FIXED-MIN -2147483648)
+
+(defconst ANG45 0x20000000)
+(defconst ANG90 0x40000000)
+(defconst ANG180 0x80000000)
+(defconst ANG270 0xc0000000)
+
+(defconst FINEANGLES 8192)
+(defconst FINEMASK 8191)
+(defconst ANGLETOFINESHIFT 19)
+(defconst SLOPERANGE 2048)
+(defconst SLOPEBITS 11)
+(defconst DBITS 5)
+
+(defn int-to-fixed (i:i32):Fixed (return (bit-shl i FRACBITS)))
+
+(defn fixed-mul (a:Fixed b:Fixed):Fixed
+  (return (unsafe/cast i32 (bit-shr (* (as i64 a) (as i64 b)) FRACBITS))))
+
+; C's abs, which leaves INT_MIN as it is.
+(defn iabs (a:i32):i32
+  (return (if (< a 0) (unsafe/cast i32 (- 0 (as i64 a))) a)))
+
+; Saturates where the quotient wouldn't fit, as vanilla's does.
+(defn fixed-div (a:Fixed b:Fixed):Fixed
+  (if (>= (bit-shr (iabs a) 14) (iabs b))
+    (return (if (< (bit-xor a b) 0) FIXED-MIN FIXED-MAX))
+    (return (unsafe/cast i32 (/ (bit-shl (as i64 a) FRACBITS) (as i64 b))))))
+
+; Wrapping sum and difference, for the places vanilla lets them overflow.
+; ISSUE-012: `wrap+` is not a legal function name.
+(defn wrap-add (a:i32 b:i32):i32
+  (return (unsafe/cast i32 (+ (unsafe/cast ui32 a) (unsafe/cast ui32 b)))))
+(defn wrap-sub (a:i32 b:i32):i32
+  (return (unsafe/cast i32 (- (unsafe/cast ui32 a) (unsafe/cast ui32 b)))))
+
+(defn wrap-mul (a:i32 b:i32):i32
+  (return (unsafe/cast i32 (* (as i64 a) (as i64 b)))))
+
+(defn fine-index (a:Angle):usize (return (as usize (bit-shr a ANGLETOFINESHIFT))))
+
+(defn finesine (i:usize):Fixed (return (aref FINESINE (as i64 i))))
+(defn finecosine (i:usize):Fixed (return (aref FINESINE (as i64 (+ i (/ FINEANGLES 4))))))
+(defn finetangent (i:usize):Fixed (return (aref FINETANGENT (as i64 i))))
+(defn tantoangle (i:usize):Angle (return (aref TANTOANGLE (as i64 i))))
+
+; The sine and cosine of a binary angle.
+(defn angle-sin (a:Angle):Fixed (return (finesine (fine-index a))))
+(defn angle-cos (a:Angle):Fixed (return (finecosine (fine-index a))))
+
+; tantoangle's index for num/den, both non-negative.
+(defn slope-div (num:ui32 den:ui32):usize
+  (when (< den 512) (return SLOPERANGE))
+  (let (ans (/ (bit-shl num 3) (bit-shr den 8)))
+    (return (if (<= ans SLOPERANGE) (as usize ans) SLOPERANGE))))
+
+; --- bounding boxes (m_bbox) ----------------------------------------------------
+
+(defconst BOXTOP 0)
+(defconst BOXBOTTOM 1)
+(defconst BOXLEFT 2)
+(defconst BOXRIGHT 3)
+
+(defstruct BBox top:Fixed bottom:Fixed left:Fixed right:Fixed)
+
+(defn bbox-clear ():BBox (return (BBox FIXED-MIN FIXED-MAX FIXED-MAX FIXED-MIN)))
+
+(defn bbox-add (b:&BBox x:Fixed y:Fixed):void
+  (cond (< x (b 'left)) (set! (b 'left) x)
+        (> x (b 'right)) (set! (b 'right) x))
+  (cond (< y (b 'bottom)) (set! (b 'bottom) y)
+        (> y (b 'top)) (set! (b 'top) y)))
+
+; R_PointToAngle of the vector (x, y): its direction as a binary angle, by
+; octant and tantoangle.
+(defn angle-of (x:Fixed y:Fixed):Angle
+  (when (and (= x 0) (= y 0)) (return 0))
+  (let (ux (unsafe/cast ui32 x) uy (unsafe/cast ui32 y)
+        nx (unsafe/cast ui32 (wrap-sub 0 x)) ny (unsafe/cast ui32 (wrap-sub 0 y)))
+    (if (>= x 0)
+      (if (>= y 0)
+        (if (> x y)
+          (return (tantoangle (slope-div uy ux)))
+          (return (- (- ANG90 1) (tantoangle (slope-div ux uy)))))
+        (if (> x (wrap-sub 0 y))
+          (return (- 0 (tantoangle (slope-div ny ux))))
+          (return (+ ANG270 (tantoangle (slope-div ux ny))))))
+      (if (>= y 0)
+        (if (> (wrap-sub 0 x) y)
+          (return (- (- ANG180 1) (tantoangle (slope-div uy nx))))
+          (return (+ ANG90 (tantoangle (slope-div nx uy)))))
+        (if (> (wrap-sub 0 x) (wrap-sub 0 y))
+          (return (+ ANG180 (tantoangle (slope-div ny nx))))
+          (return (- (- ANG270 1) (tantoangle (slope-div nx ny)))))))))
+
+; R_PointToAngle2: the angle from (x1, y1) to (x2, y2).
+(defn point-to-angle2 (x1:Fixed y1:Fixed x2:Fixed y2:Fixed):Angle
+  (return (angle-of (wrap-sub x2 x1) (wrap-sub y2 y1))))

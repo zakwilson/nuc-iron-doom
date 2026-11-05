@@ -1,0 +1,200 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_user.c, g_game.c); this port is GPLv3,
+; see COPYING.
+;
+; The player: moving by the ticcmd, the view bob, dying, and starting over.
+
+(ns doom.play.player)
+
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.mobj)
+(import-use doom.play.move)
+(import-use doom.play.spec)
+(import-use doom.play.pspr)
+
+(defconst INVERSECOLORMAP 32)
+; 16 pixels of bob.
+(defconst MAXBOB 0x100000)
+(defconst ANG5 (/ ANG90 18))
+; (unsigned)-ANG5.
+(defconst NEG-ANG5 (- 4294967296 (/ ANG90 18)))
+
+(defn- owns? (p:&Player wp:i32):bool (return (aref (p 'weapon-owned) (as i64 wp))))
+(defn- power (p:&Player pw:i32):i32 (return (aref (p 'powers) (as i64 pw))))
+(defn- set-power (p:&Player pw:i32 v:i32):void (set! (aref (p 'powers) (as i64 pw)) v))
+
+; G_PlayerReborn: a fresh player, keeping only the level's tallies.
+(defn player-reborn (w:&World pi:usize):void
+  (let (p (player-at w pi) old @p)
+    (set! @p (player-zero))
+    ; As in C, an array field is copied element by element.
+    (dotimes (i:usize 4) (set! (aref (p 'frags) (as i64 i)) (aref (old 'frags) (as i64 i))))
+    (set! (p 'kill-count) (old 'kill-count))
+    (set! (p 'item-count) (old 'item-count))
+    (set! (p 'secret-count) (old 'secret-count))
+    ; Don't do anything immediately.
+    (set! (p 'use-down) true)
+    (set! (p 'attack-down) true)
+    (set! (p 'state) PST-LIVE)
+    (set! (p 'health) MAXHEALTH)
+    (set! (p 'ready-weapon) WP-PISTOL)
+    (set! (p 'pending-weapon) WP-PISTOL)
+    (set! (aref (p 'weapon-owned) (as i64 WP-FIST)) true)
+    (set! (aref (p 'weapon-owned) (as i64 WP-PISTOL)) true)
+    (set! (aref (p 'ammo) (as i64 AM-CLIP)) 50)
+    (dotimes (i:usize 4)
+      (set! (aref (p 'max-ammo) (as i64 i)) (aref MAXAMMO (as i64 i))))))
+
+; P_Thrust.
+(defn- thrust (p:&Player angle:Angle move:Fixed):void
+  (let (mo (unwrap (p 'mo)) an (fine-index angle))
+    (set! (mo 'mom-x) (wrap-add (mo 'mom-x) (fixed-mul move (finecosine an))))
+    (set! (mo 'mom-y) (wrap-add (mo 'mom-y) (fixed-mul move (finesine an))))))
+
+; P_CalcHeight: the view's height, with its bob and its recovery from a drop.
+(defn calc-height (w:&World p:&Player):void
+  (let (mo (unwrap (p 'mo)))
+    (set! (p 'bob) (wrap-add (fixed-mul (mo 'mom-x) (mo 'mom-x)) (fixed-mul (mo 'mom-y) (mo 'mom-y))))
+    (set! (p 'bob) (bit-shr (p 'bob) 2))
+    (when (> (p 'bob) MAXBOB) (set! (p 'bob) MAXBOB))
+    (when (or (!= (bit-and (p 'cheats) CF-NOMOMENTUM) 0) (not (w 'on-ground)))
+      ; Vanilla computes a clamped height here and then overwrites it.
+      (set! (p 'view-z) (wrap-add (mo 'z) (p 'view-height)))
+      (return))
+    (let (angle (bit-and (* (/ FINEANGLES 20) (w 'level-time)) FINEMASK)
+          bob (fixed-mul (/ (p 'bob) 2) (finesine (as-checked usize angle))))
+      (when (= (p 'state) PST-LIVE)
+        (set! (p 'view-height) (+ (p 'view-height) (p 'delta-view-height)))
+        (when (> (p 'view-height) VIEWHEIGHT)
+          (set! (p 'view-height) VIEWHEIGHT)
+          (set! (p 'delta-view-height) 0))
+        (when (< (p 'view-height) (/ VIEWHEIGHT 2))
+          (set! (p 'view-height) (/ VIEWHEIGHT 2))
+          (when (<= (p 'delta-view-height) 0) (set! (p 'delta-view-height) 1)))
+        (when (!= (p 'delta-view-height) 0)
+          (set! (p 'delta-view-height) (+ (p 'delta-view-height) (/ FRACUNIT 4)))
+          (when (= (p 'delta-view-height) 0) (set! (p 'delta-view-height) 1))))
+      (set! (p 'view-z) (wrap-add (wrap-add (mo 'z) (p 'view-height)) bob))
+      (when (> (p 'view-z) (- (mo 'ceiling-z) (* 4 FRACUNIT)))
+        (set! (p 'view-z) (- (mo 'ceiling-z) (* 4 FRACUNIT)))))))
+
+; P_MovePlayer.
+(defn- move-player (w:&World p:&Player):(Fallible void)
+  (let (mo (unwrap (p 'mo)) cmd (ref p 'cmd))
+    (set! (mo 'angle) (+ (mo 'angle) (unsafe/cast ui32 (bit-shl (cmd 'angle-turn) FRACBITS))))
+    ; Don't let the player control movement in the air.
+    (set! (w 'on-ground) (<= (mo 'z) (mo 'floor-z)))
+    (when (and (!= (cmd 'forward-move) 0) (w 'on-ground))
+      (thrust p (mo 'angle) (* (cmd 'forward-move) 2048)))
+    (when (and (!= (cmd 'side-move) 0) (w 'on-ground))
+      (thrust p (- (mo 'angle) ANG90) (* (cmd 'side-move) 2048)))
+    (when (and (or (!= (cmd 'forward-move) 0) (!= (cmd 'side-move) 0))
+               (= (mo 'state) S-PLAY))
+      (try (set-mobj-state w mo S-PLAY-RUN1))))
+  (return (ok)))
+
+; P_DeathThink: sink to the floor, turn toward the killer, wait for use.
+(defn- death-think (w:&World pi:usize):(Fallible void)
+  (let (p (player-at w pi) mo (unwrap (p 'mo)))
+    (try (move-psprites w pi))
+    (when (> (p 'view-height) (* 6 FRACUNIT))
+      (set! (p 'view-height) (- (p 'view-height) FRACUNIT)))
+    (when (< (p 'view-height) (* 6 FRACUNIT))
+      (set! (p 'view-height) (* 6 FRACUNIT)))
+    (set! (p 'delta-view-height) 0)
+    (set! (w 'on-ground) (<= (mo 'z) (mo 'floor-z)))
+    (calc-height w p)
+    (match (p 'attacker)
+      ((some a)
+       (if (same? a mo)
+         (when (!= (p 'damage-count) 0) (set! (p 'damage-count) (- (p 'damage-count) 1)))
+         (let (angle (point-to-angle2 (mo 'x) (mo 'y) (a 'x) (a 'y))
+               delta (- angle (mo 'angle)))
+           (cond (or (< delta ANG5) (> delta NEG-ANG5))
+                 ; Looking at the killer: fade the damage.
+                 (do (set! (mo 'angle) angle)
+                     (when (!= (p 'damage-count) 0)
+                       (set! (p 'damage-count) (- (p 'damage-count) 1))))
+                 (< delta ANG180) (set! (mo 'angle) (+ (mo 'angle) ANG5))
+                 true (set! (mo 'angle) (- (mo 'angle) ANG5))))))
+      ((none) (when (!= (p 'damage-count) 0) (set! (p 'damage-count) (- (p 'damage-count) 1)))))
+    (when (!= (bit-and ((ref p 'cmd) 'buttons) BT-USE) 0)
+      (set! (p 'state) PST-REBORN)))
+  (return (ok)))
+
+; The weapon a weapon-change button asks for, after the chainsaw and super
+; shotgun substitutions.
+(defn- wanted-weapon (w:&World p:&Player):i32
+  (let (nw (bit-shr (bit-and ((ref p 'cmd) 'buttons) BT-WEAPONMASK) BT-WEAPONSHIFT)
+        )
+    (when (and (= nw WP-FIST) (owns? p WP-CHAINSAW)
+               (not (and (= (p 'ready-weapon) WP-CHAINSAW) (!= (power p PW-STRENGTH) 0))))
+      (set! nw WP-CHAINSAW))
+    (when (and (= ((ref w 'rules) 'mode) COMMERCIAL) (= nw WP-SHOTGUN)
+               (owns? p WP-SUPERSHOTGUN) (!= (p 'ready-weapon) WP-SUPERSHOTGUN))
+      (set! nw WP-SUPERSHOTGUN))
+    (return nw)))
+
+; P_PlayerThink.
+(defn player-think (w:&World pi:usize):(Fallible void)
+  (let (p (player-at w pi) mo (unwrap (p 'mo)) cmd (ref p 'cmd))
+    (if (!= (bit-and (p 'cheats) CF-NOCLIP) 0)
+      (set! (mo 'flags) (bit-or (mo 'flags) MF-NOCLIP))
+      (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-NOCLIP))))
+    ; The chainsaw's lunge.
+    (when (!= (bit-and (mo 'flags) MF-JUSTATTACKED) 0)
+      (set! (cmd 'angle-turn) 0)
+      (set! (cmd 'forward-move) (/ 0xc800 512))
+      (set! (cmd 'side-move) 0)
+      (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-JUSTATTACKED))))
+    (when (= (p 'state) PST-DEAD)
+      (return (death-think w pi)))
+    ; A teleport freezes the player for a moment.
+    (if (!= (mo 'reaction-time) 0)
+      (set! (mo 'reaction-time) (- (mo 'reaction-time) 1))
+      (try (move-player w p)))
+    (calc-height w p)
+    (when (!= ((sector-of-mobj w mo) 'special) 0)
+      (try (player-in-special-sector w pi)))
+    ; A special event (pause, save) isn't a game action.
+    (when (!= (bit-and (cmd 'buttons) BT-SPECIAL) 0)
+      (set! (cmd 'buttons) 0))
+    (when (!= (bit-and (cmd 'buttons) BT-CHANGE) 0)
+      (let (nw (wanted-weapon w p))
+        ; Shareware has no plasma rifle or BFG.
+        (when (and (aref (p 'weapon-owned) (as i64 nw)) (!= nw (p 'ready-weapon))
+                   (or (and (!= nw WP-PLASMA) (!= nw WP-BFG))
+                       (!= ((ref w 'rules) 'mode) SHAREWARE)))
+          (set! (p 'pending-weapon) nw))))
+    (if (!= (bit-and (cmd 'buttons) BT-USE) 0)
+      (when (not (p 'use-down))
+        (try (use-lines w p))
+        (set! (p 'use-down) true))
+      (set! (p 'use-down) false))
+    (try (move-psprites w pi))
+    ; Berserk counts up; the others count down.
+    (when (!= (power p PW-STRENGTH) 0) (set-power p PW-STRENGTH (+ (power p PW-STRENGTH) 1)))
+    (when (!= (power p PW-INVULNERABILITY) 0)
+      (set-power p PW-INVULNERABILITY (- (power p PW-INVULNERABILITY) 1)))
+    (when (!= (power p PW-INVISIBILITY) 0)
+      (set-power p PW-INVISIBILITY (- (power p PW-INVISIBILITY) 1))
+      (when (= (power p PW-INVISIBILITY) 0)
+        (set! (mo 'flags) (bit-and (mo 'flags) (bit-not MF-SHADOW)))))
+    (when (!= (power p PW-INFRARED) 0) (set-power p PW-INFRARED (- (power p PW-INFRARED) 1)))
+    (when (!= (power p PW-IRONFEET) 0) (set-power p PW-IRONFEET (- (power p PW-IRONFEET) 1)))
+    (when (!= (p 'damage-count) 0) (set! (p 'damage-count) (- (p 'damage-count) 1)))
+    (when (!= (p 'bonus-count) 0) (set! (p 'bonus-count) (- (p 'bonus-count) 1)))
+    ; The invulnerability and light-amp colormaps flicker as they run out.
+    (let (inv (power p PW-INVULNERABILITY) ir (power p PW-INFRARED))
+      (set! (p 'fixed-colormap)
+            (cond (!= inv 0) (if (or (> inv (* 4 32)) (!= (bit-and inv 8) 0)) INVERSECOLORMAP 0)
+                  (!= ir 0) (if (or (> ir (* 4 32)) (!= (bit-and ir 8) 0)) 1 0)
+                  true 0))))
+  (return (ok)))

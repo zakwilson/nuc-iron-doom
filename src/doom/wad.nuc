@@ -1,0 +1,103 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; The WAD file and its lump directory (Iron Doom crates/wad: header.rs,
+; lump.rs). The file is read whole; each lump is a view into it, so the Wad
+; must outlive every Bytes taken from it.
+
+(ns doom.wad)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.hashmap)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.file)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.bytes)
+(import-use doom.util)
+
+(defstruct Lump name:Name data:Bytes)
+
+(defn lump-size (l:&Lump):usize (return (count (ref l 'data))))
+
+; A zero-length lump only marks a range (F_START, E1M1).
+(defn marker? (l:&Lump):bool (return (= (lump-size l) 0)))
+
+(defstruct Wad
+  bytes:String
+  lumps:(Vector Lump)
+  ; Name → first lump with that name. Iron Doom scans the directory front to
+  ; back and takes the first match; vanilla scans back to front so a PWAD wins.
+  index:(HashMap Name usize))
+
+(defn- whole (s:&String):Bytes
+  (let (v (string-as-view s))
+    (return (slice-of (v 'data) (v 'len)))))
+
+(defstruct WadHeader dir-offset:usize num-lumps:usize)
+
+(defn- wad-header (b:&Bytes):(Fallible WadHeader)
+  (when (< (count b) 12) (fail "WAD is too short for a header"))
+  (let (id (name-from (unsafe/cast &ui8 (b 'data)) 4)
+        num-lumps (le-i32 b 4)
+        dir-offset (le-i32 b 8))
+    (when (and (!= id (name "IWAD")) (!= id (name "PWAD")))
+      (fail "WAD has invalid identification " id))
+    (when (< num-lumps 0) (fail "WAD has invalid numbers of lumps"))
+    ; Vanilla Doom doesn't like PWADs with more than 4046 lumps.
+    (when (and (= id (name "PWAD")) (> num-lumps 4096))
+      (fail "PWAD cannot have more than 4046 lumps, but this one has " num-lumps))
+    (when (< dir-offset 0) (fail "WAD has invalid directory offset"))
+    (return (ok (WadHeader (as usize dir-offset) (as usize num-lumps))))))
+
+(defn- read-lump (b:&Bytes entry:usize):(Fallible Lump)
+  (let (position (le-i32 b entry)
+        size (le-i32 b (+ entry 4))
+        nm (name-at b (+ entry 8)))
+    (when (< position 0) (fail "Directory entry has invalid lump position"))
+    (when (< size 0) (fail "Directory entry has invalid lump size"))
+    (let (start (as usize position) end (+ start (as usize size)))
+      (when (>= start (count b)) (fail "Lump " nm " has invalid pointer to lump data"))
+      (when (> end (count b)) (fail "Lump " nm " size exceeds WAD file size"))
+      (return (ok (Lump nm (sub-bytes b start (as usize size))))))))
+
+(defn wad-from-bytes (bytes:String):(Fallible Wad)
+  (let (w (Wad bytes (make (Vector Lump)) (make (HashMap Name usize)))
+        b (whole (ref w 'bytes))
+        hdr (try (wad-header &b)))
+    ; The directory must fit; this dies where Iron Doom's slice index panics.
+    (sub-bytes &b (hdr 'dir-offset) (* 16 (hdr 'num-lumps)))
+    (dotimes (i:usize (hdr 'num-lumps))
+      (let (l (try (read-lump &b (+ (hdr 'dir-offset) (* i 16)))))
+        (when (not (contains? (ref w 'index) (l 'name)))
+          (assoc (ref w 'index) (l 'name) (count (ref w 'lumps))))
+        (conj (ref w 'lumps) l)))
+    (return (ok w))))
+
+(defn wad-open (path:StrView):(Fallible Wad)
+  (with (f (try (file-open-read &path)))
+    (return (wad-from-bytes (try (file-read-to-string f))))))
+
+(defn lump-count (w:&Wad):usize (return (count (ref w 'lumps))))
+
+(defn lump-at (w:&Wad i:usize):&Lump
+  (let (s (view (ref w 'lumps)))
+    (return (&s i))))
+
+(defn lump-index (w:&Wad n:Name):?usize
+  (return (get (ref w 'index) n)))
+
+(defn lump-index (w:&Wad n:CStr):?usize
+  (return (lump-index w (name n))))
+
+(defn lump-named (w:&Wad n:Name):(Fallible &Lump)
+  (if-some (i (lump-index w n))
+    (return (ok (lump-at w i)))
+    (fail "Missing lump " n)))
+
+(defn lump-named (w:&Wad n:CStr):(Fallible &Lump)
+  (return (lump-named w (name n))))

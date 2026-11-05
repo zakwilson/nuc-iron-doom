@@ -1,0 +1,5 @@
+(ns issue027.one)
+; Loaded by the probe, not imported by issue027.user.
+(defstruct Box a:i32)
+(defvar B1:Box (Box 1))
+(defn box-at (i:usize):&Box (return &B1))

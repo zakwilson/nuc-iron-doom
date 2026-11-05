@@ -1,0 +1,83 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; The player's camera (Iron Doom crates/level/src/map_object/camera.rs). Camera
+; space has y along the view direction and x to the right; the screen is a
+; projection plane 160 units across each way from the centre.
+
+(ns doom.camera)
+
+(import-use doom.vec2)
+(import-use doom.level)
+
+(defconst FOV 0x1.921fb6p+0)
+(defconst HALF-FOV 0x1.921fb6p-1)
+
+(defstruct ProjectionPlane normal:Vec2 origin:Vec2 end:Vec2)
+
+(defstruct Camera
+  position:Vec2 x-axis:Vec2 y-axis:Vec2
+  plane:ProjectionPlane left-clip:Vec2 right-clip:Vec2)
+
+(defn camera-new (player:&MapObject):Camera
+  (let (normal (Vec2 0.0 1.0)
+        origin-dir (rotate (rot2 HALF-FOV) normal)
+        end-dir (rotate (rot2 (- 0.0 HALF-FOV)) normal)
+        distance:f32 (/ 160.0 (cosf HALF-FOV))
+        dir (player 'dir))
+    (return (Camera (player 'pos) (rotate (rot2 (- 0.0 FOV)) dir) dir
+                    (ProjectionPlane normal (* distance origin-dir) (* distance end-dir))
+                    (rotate (rot2 (- 0.0 FOV)) origin-dir)
+                    (rotate (rot2 FOV) end-dir)))))
+
+(defn world-to-camera (c:&Camera p:Vec2):Vec2
+  (let (q (- p (c 'position)))
+    (return (Vec2 (dot q (c 'x-axis)) (dot q (c 'y-axis))))))
+
+; How much a wall at camera-space `p` is scaled on screen.
+(defn find-scale (c:&Camera p:Vec2):f32
+  (let (pl (c 'plane))
+    (return (/ (dot (pl 'origin) (pl 'normal)) (dot (pl 'normal) p)))))
+
+; Where screen column x's ray meets the segment, in camera space.
+(defn viewport-to-world (c:&Camera s:&Segment x:usize):Vec2
+  (let (pl (c 'plane) origin (pl 'origin)
+        v1 (+ origin (* (/ (unsafe/cast f32 x) 320.0) (- (pl 'end) origin)))
+        p1 VEC2-ZERO p2 v1
+        p3 (world-to-camera c (s 'v1))
+        p4 (world-to-camera c (s 'v2))
+        num (- (* (- (p1 'x) (p3 'x)) (- (p3 'y) (p4 'y))) (* (- (p1 'y) (p3 'y)) (- (p3 'x) (p4 'x))))
+        den (- (* (- (p1 'x) (p2 'x)) (- (p3 'y) (p4 'y))) (* (- (p1 'y) (p2 'y)) (- (p3 'x) (p4 'x)))))
+    (return (* (/ num den) v1))))
+
+(defn- clip-point (c:&Camera p:Vec2):Vec2
+  (when (and (< (p 'x) 0.0) (< (dot p (c 'left-clip)) 0.0)) (return ((c 'plane) 'origin)))
+  (when (and (> (p 'x) 0.0) (< (dot p (c 'right-clip)) 0.0)) (return ((c 'plane) 'end)))
+  (return p))
+
+; The fraction of the way across the screen, times 320.
+(defn- project (pl:&ProjectionPlane p:Vec2):f32
+  (let (p1 (pl 'origin) p2 (pl 'end)
+        num (- (* (p1 'y) (p 'x)) (* (p1 'x) (p 'y)))
+        den (- (* (- (p1 'y) (p2 'y)) (p 'x)) (* (- (p1 'x) (p2 'x)) (p 'y)))
+        d (/ num den))
+    ; f32::clamp: NaN passes through, and the caller's cast takes it to 0.
+    (when (< d 0.0) (set! d 0.0))
+    (when (> d 1.0) (set! d 1.0))
+    (return (* 320.0 d))))
+
+; The screen columns a segment covers, first and last, or none when it faces
+; away, lies behind the camera or is narrower than a column.
+(defn world-to-viewport (c:&Camera s:&Segment x1:&usize x2:&usize):bool
+  (when (> (dot (- (s 'v1) (c 'position)) (s 'normal)) 0.0) (return false))
+  (let (v1 (world-to-camera c (s 'v1)) v2 (world-to-camera c (s 'v2)))
+    (when (and (<= (v1 'y) 0.0) (<= (v2 'y) 0.0)) (return false))
+    (let (c1 (clip-point c v1) c2 (clip-point c v2))
+      (when (= c1 c2) (return false))
+      (let (pl (c 'plane)
+            a (f32-to-usize (ceilf (project &pl c1)))
+            b (f32-to-usize (ceilf (project &pl c2))))
+        (when (>= a b) (return false))
+        (set! @x1 a)
+        (set! @x2 (- b 1))
+        (return true)))))

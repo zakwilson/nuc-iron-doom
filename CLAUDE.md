@@ -1,107 +1,132 @@
-# nuc-doom
+# nuc-iron-doom
 
-A port of Chocolate Doom to the Nucleus language. Its **primary purpose is to
-stress-test Nucleus** and record language problems in `ISSUES.md`; the playable
-port is secondary. The full brief is in `PROMPT.md`, and current status is in
-`PROGRESS.md`.
+A port of Iron Doom (a Rust Doom built on Chocolate Doom) to the Nucleus
+language. Its **primary purpose is to stress-test Nucleus** and record language
+problems in `ISSUES.md`; the playable port is secondary. The full brief is in
+`PROMPT.md`, and current status is in `PROGRESS.md`.
 
 ## Locations
 
-- `/home/zak/code/chocolate-doom`: the C original. **Read-only.** The game is in
-  `src/doom/`, platform and shared code in `src/*.c`. `src/chocolate-doom` is a
-  built reference binary, and `src/DOOM1.WAD` is the shareware IWAD (the
-  only IWAD available). Its demo lumps are in the pre-1.4 format (first byte
-  3, no version byte), so Chocolate Doom sets `gameversion = exe_doom_1_2`
-  for it, and every `gameversion` branch in the playsim takes its 1.2 side.
-- `/home/zak/code/nucleus`: the language, on branch `doom-bugfixes`. You may fix
-  compiler **bugs** there (`PROMPT.md` §7, "Fixing the compiler"), following
-  that repo's own `CLAUDE.md`. **Never run `make` in that tree.** Its binaries
-  are host-built, and `make` in the container would relink them against LLVM 19.
-  Docs are in `docs/`, idiom examples in `examples/`, the stdlib in
-  `lib/nucleus/`, and design history and known gaps in `design/`.
+The work runs in an ephemeral cloud container. `scripts/setup-cloud.sh` (run by
+the environment's setup script) clones everything beside this repo, so all of
+these are siblings of the repo root (`..`). Scripts find them relative to the
+repo and never by absolute path.
+
+- `../iron-doom`: the Rust original (`Henrique194/iron-doom`, `main`).
+  **Read-only.** It's about 6,600 lines in a Cargo workspace: `src/main.rs`
+  builds a Bevy `App` from the plugin in each `crates/*` (`cli`, `wad`,
+  `window`, `game-state`, `title-screen`, `screen-melt`, `level`,
+  `world-view`, `rand`, `exit`, `common`) plus the `macros/sys-fail` proc
+  macro. It covers title screen → melt → E1M1 with textured walls, sky and
+  free movement only: no floors or ceilings, no sprites, no collision, no
+  playsim. Movement and the renderer use `f32`, and its README says it does
+  not keep demo sync. It is **GPLv3**.
+- `../chocolate-doom`: Chocolate Doom 3.1.1, the C that Iron Doom was built from.
+  **Read-only.** It's the reference for everything Iron Doom doesn't cover
+  (`PROMPT.md` §5, phase B). The game is in `src/doom/`, and shared code is
+  in `src/*.c`.
+- `../nucleus`: the language, on branch `doom-bugfixes`. You may fix compiler
+  **bugs** there (`PROMPT.md` §7, "Fixing the compiler"), following that repo's
+  own `CLAUDE.md` (skip its subagent and `context/local.md` guidance). Docs are
+  in `docs/`, idiom examples in `examples/`, the stdlib in `lib/nucleus/`, and
+  design history and known gaps in `design/`.
+- `../nucleus-boot`: the bootstrap IR (`boot/*.ll`), which is gitignored in
+  `nucleus`. The setup script copies it into `../nucleus/boot/`.
+- The previous Nucleus Doom port (a Chocolate Doom transliteration) is **not
+  available**; don't look for it. Its findings and the rulings on them are
+  recorded in nucleus `design/doom-port-fixes/` and in the nucleus commit log
+  (messages cite `nuc-doom ISSUE-NNN`). Check those before calling a finding
+  new.
+- IWADs: `/usr/share/games/doom/doom1.wad` is shareware **v1.9** (md5
+  `f0cefca49926d00903cf57551d901abe`). Its demos use the v1.9 format. Iron Doom's IWAD search already looks in `/usr/share/games/doom`.
+  `freedoom1.wad` and `freedoom2.wad` may sit beside it, but they're not in
+  the setup's package list.
 
 ## Environment
 
-The container runs LLVM 19, but the Nucleus binaries are built on the host
-against a newer `libLLVM.so.N` (currently 23). Everything goes through two
-scripts:
-
-- `. scripts/env.sh` sets `NUCLEUS_HOME` and puts `$NUCLEUS_HOME/build` on
-  `PATH`, so `nucleus` and `nucleusc` resolve.
-  - **On the host:** the real tree's compiler runs natively and is used as is.
-  - **In the container:** the script sets `LD_LIBRARY_PATH` to the libLLVM that
-    `scripts/setup-llvm.sh` unpacks into `.toolchain/`. It then uses the
-    compiler built in `.toolchain/nucleus`, falling back to the real tree's
-    binary if that copy hasn't been built yet.
-- `scripts/build-compiler.sh [make targets]` (container only) rsyncs the Nucleus
-  working tree into `.toolchain/nucleus` and runs `make` there, against the
-  shim. With no arguments it builds in about a minute; `-k test bootstrap` runs the
-  gates. **Rerun it after every Nucleus source change.** The port otherwise
-  keeps using the old compiler.
-  - Five `suite-target` datalayout tests always fail in the container
-    (baseline 2026-10-28: 1611 passed, 5 failed, bootstrap PASS). Their failure
-    makes `make test` exit non-zero, which is why the bootstrap needs `-k` to
-    run after it.
-  - `build-compiler.sh` marks `.toolchain/nucleus` as a repository root
-    (`.jj`), so the `suite-build` scratch projects stop there rather than find
-    the port's `build.edn` (ISSUE-005). Baseline 2026-11-03: 1674 passed,
-    5 failed, bootstrap PASS.
-  - On the host, compiler fixes take effect only after `make` in
-    `/home/zak/code/nucleus`. Say so in every playtest request.
-  - **A fix that changes the compiler's own codegen moves the bootstrap.** The
-    bootstrap diff then fails by construction (nucleus `context/build.md`,
-    "After a codegen change"). To converge in the container:
-    1. Check the fixed point: `build/nucleusc-stage2 --emit-llvm
-       src/nucleusc.nuc` must equal `build/stage2.ll`.
-    2. Run `scripts/build-compiler.sh update-bootstrap`.
-    3. Copy `.toolchain/nucleus/boot/*.ll` into the real tree's (gitignored)
-       `boot/`, because the next sync restores `boot/` from there.
-    4. Rerun the gates.
-
-    The host's own `bin/nucleusc` still needs `make && make update-bootstrap
-    && make && make bootstrap`. Say so in the playtest request.
-
-Other environment facts:
+- **Setup.** In the environment settings, the setup script should be just
+  `nuc-iron-doom/scripts/setup-cloud.sh`, which runs one directory above the
+  repo. It installs LLVM 20, the SDL2 dev packages and the shareware WAD,
+  clones the siblings, and builds the compiler with `make` in `../nucleus`.
+  If a session starts without `../nucleus/build/nucleusc`, run the script by
+  hand.
+  - Run by hand on 2026-11-05 it took about 5 minutes. The `make` step is
+    allowed from a session when it runs through this script.
+  - **`nucleus-boot` `main` is older than `doom-bugfixes`.** Its IR predates
+    the `_get` → `field` rename (nucleus `cac7bac`), so its compiler can't
+    build `doom-bugfixes` directly. When `make` fails, the script chains
+    through `dc5a321` → `cac7bac` → `1b3e18f` (about 70 s each). Pushing a
+    fresh `boot/` to a `nucleus-boot` `doom-bugfixes` branch would remove the
+    chain. The setup script already prefers that branch, but a session was
+    denied `add_repo` push access to `nucleus-boot`.
+  - The setup script itself runs with no permission prompt.
+- **Toolchain.** The image ships LLVM/clang 18 as the default `llvm-config` and
+  `clang`; Nucleus needs 19+. `. scripts/env.sh` puts LLVM 20's `bin/` and
+  `$NUCLEUS_HOME/build` first on `PATH` and sets `NUCLEUS_HOME` (default
+  `../nucleus`). Source it in every shell that builds. On the host, set
+  `NUCLEUS_HOME` first.
+- **Compiler changes.** `make` in `../nucleus` is fine here. It's the
+  container's own clone, built against the container's LLVM, so there's no
+  host binary to protect.
+  - Gates: `make -k test bootstrap` (`-k` so a test failure still runs the
+    bootstrap). Baseline 2026-11-05 (LLVM 20, nucleus `cb17330`): 1672
+    passed, 4 failed, 6 skipped, bootstrap PASS. The four failures are
+    `mt1`/`mt2`/`mt5`/`mt6` in `suite-build`, which need `avr-gcc`. Compare
+    against the baseline, not against zero. The suite takes about 25 minutes.
+  - **A fix that changes the compiler's own codegen moves the bootstrap.** See
+    nucleus `context/build.md`, "After a codegen change". Converge with
+    `make update-bootstrap`, then commit the new `boot/*.ll` to
+    `nucleus-boot` on a branch `doom-bugfixes`. Never commit them to
+    `main`. The setup script prefers that branch, so later sessions boot from
+    it.
+- **Pushing to the Nucleus repos.** The session's GitHub scope starts as this
+  repo only. Before pushing a compiler fix, call `add_repo`
+  (`zakwilson/nucleus`, and `zakwilson/nucleus-boot` if needed) with
+  `access: "push"`. Push only to `doom-bugfixes`.
+  - **On 2026-11-05 the push was refused** (the Claude GitHub App has no
+    access to `zakwilson/nucleus`). Until that changes, commit each fix in
+    `../nucleus` as usual, then `git format-patch -1 <sha> -o nucleus-patches/`
+    here and push this repo. `setup-cloud.sh` applies any patch in
+    `nucleus-patches/` that isn't already in `../nucleus` and rebuilds. The
+    user applies them with `git am` on their machine. Once the patches reach
+    `doom-bugfixes`, delete them here.
+- **The container is reclaimed when idle.** Uncommitted or unpushed work is
+  lost, and so are the compiler build and `reference/build/`. Push after every
+  commit. Before any long step, make sure `PROGRESS.md` says what's in flight.
+- **Building the reference engines.** Iron Doom builds with `cargo` (Rust 1.97
+  is preinstalled; the crate needs edition 2024). Its `sdl2` dependency uses
+  the `bundled` feature, which builds SDL2 from source with `cmake`, so the
+  first build is slow. Chocolate Doom builds with autotools. Both go into
+  `reference/build/` (gitignored) through `scripts/build-reference.sh`, with
+  patches kept in `reference/`. **Auto mode denied `cargo build` of Iron Doom
+  from a session** (2026-11-05). Recording the reference frames needs the user
+  to approve `scripts/build-reference.sh`, or to run it from the environment's
+  setup script.
 - **No display.** Run everything with
-  `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`. The user playtests on the host.
+  `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`. The user playtests on their
+  own machine.
 - **SDL2 needs an explicit package mapping.** `SDL2/SDL.h` resolves through
-  clang's default include path, so the build tool never consults pkg-config and
-  the link fails with undefined `SDL_*` symbols (ISSUE-001). `build.edn` must
-  carry `:pkg-config {"SDL2/SDL.h" ["sdl2"] "SDL2/SDL_mixer.h" ["SDL2_mixer"]}`.
-- **Installed:** SDL2 2.32, SDL2_mixer 2.8, SDL2_net 2.2, clang 19 (the link
-  driver) and rsync.
-- **The reference engine** is built by `scripts/build-reference.sh` (it skips
-  the build if the binary exists, so delete `reference/build/src/chocolate-doom`
-  after editing the patch). Always pass `-nosound`, which is much faster and
-  hashes the same. A `-framedump` run exits by itself after its last dump. A
-  `-timedemo` run ends in `I_Error` (exit 255) on the demo's end marker.
-- **SIGTERM doesn't stop the port** (nor the reference): SDL turns it into a
-  window-close event, which opens the quit prompt as in vanilla. Use
-  `timeout -k 5 N`, never a bare `timeout`.
+  clang's default include path, so the build tool never consults pkg-config,
+  and the link fails with undefined `SDL_*` symbols (nuc-doom ISSUE-001). Put
+  `:pkg-config {"SDL2/SDL.h" ["sdl2"] "SDL2/SDL_mixer.h" ["SDL2_mixer"]}` in
+  `build.edn`.
+- **Installed by setup:** SDL2 2.30, SDL2_mixer 2.8, SDL2_net 2.2, LLVM and
+  clang 20 (clang is the link driver) and `rsync`. The image already has
+  `cmake`, `python3`, `cargo`, `make` and `gcc`.
+- **SIGTERM doesn't stop an SDL game.** SDL turns it into a window-close event.
+  Use `timeout -k 5 N`, never a bare `timeout`.
 - **Audio can be checked headless.** `SDL_AUDIODRIVER=disk
   SDL_DISKAUDIOFILE=<file>` writes the mixer's output as raw S16LE stereo at
-  44.1kHz. The container has no MIDI soundfont (`timidity.cfg`), so music
-  always fails to load here. `src/tests/music.nuc` checks the MIDI bytes
-  instead.
+  44.1kHz. There's no MIDI soundfont, so music can't play here; check the MIDI
+  bytes in a unit test instead.
 - **Probes** state their own pass condition on a `; fixed-when:` header line
   (see `scripts/check-probes.sh`).
-- **The port writes into `$XDG_DATA_HOME/nuc-doom`** (else
-  `~/.local/share/nuc-doom`): savegames, and `config.edn` on a menu quit.
-  Pass `-savedir DIR` and `-config FILE` in scratch runs. The gates already
-  pass a `-config` that doesn't exist, so the defaults apply. `-savetest N`
-  writes slot 7 of the save dir. A `-framedump` or `-timedemo` run exits
-  without saving the config, so the config's write path is reachable only
-  from the menu, which a headless run can't drive.
-- **`nucleus build` scans imports first** (`nucleusc --list-imports`). Before
-  nucleus 6518d10, that scan blamed a syntax error in an imported file on the
-  importer's path (ISSUE-044). If a host error names a balanced line, compile
-  the entry with `nucleusc -I src` to find the right file.
-- **Commits** need an identity the container lacks: pass
-  `-c user.name="Zak Wilson" -c user.email="zak.wilson@gmail.com"` (the
-  repos' existing author) on each `git commit`, in both repos.
-- **Tables are generated once:** `scripts/gen-tables.py` writes
-  `src/doom/tables.nuc`. `scripts/convert-info.py` wrote `info.nuc` and
-  `sounds.nuc`, and rerunning it overwrites any hand edits.
+- **`nucleus build` scans imports first** (`nucleusc --list-imports`). If an
+  error names a line that looks fine, compile the entry with `nucleusc -I src`
+  to find the right file.
+- **Commits** use the container's configured git identity. End each message
+  with the session's attribution trailer. Work on the branch the session names,
+  and push to that branch with `git push -u origin <branch>`.
 - **Keep Bash calls small.** A big compound command (edits plus `rm` of a
   wildcard plus runs) gets denied by the permission policy. Use Edit for
   source changes and run steps separately.
@@ -110,33 +135,41 @@ Other environment facts:
 
 ```
 . scripts/env.sh
-nucleus build               # → build/nuc-doom
-SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy build/nuc-doom -iwad /home/zak/code/chocolate-doom/src/DOOM1.WAD
-scripts/check-demos.sh      # demo-sync gate against reference/data/
-scripts/run-tests.sh        # unit tests (nucleus test: :tests in build.edn → build/nuc-doom-tests)
+nucleus build               # → build/nuc-iron-doom
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy build/nuc-iron-doom -iwad /usr/share/games/doom/doom1.wad
+scripts/run-tests.sh        # unit tests (nucleus test: :tests in build.edn)
 scripts/check-probes.sh     # which ISSUES.md probes still reproduce
-scripts/check-frames.sh     # framedump gate against reference/data/frames/
-scripts/check-savegames.sh  # demos again with -savetest: save/reload/restore every 37 tics
-scripts/count-lines.py      # C vs Nucleus line counts per subsystem (ISSUES.md table)
-scripts/build-compiler.sh && scripts/build-compiler.sh -k test bootstrap   # after a Nucleus fix
+scripts/check-frames.sh     # framedumps against reference/data/frames/
+scripts/check-demos.sh      # phase B: tic hashes against reference/data/tichash/ (--record writes them)
+build/nuc-iron-doom -iwad /usr/share/games/doom/doom1.wad -timedemo demo1 -tichash FILE   # one demo, headless
+make -C ../nucleus -j4 && make -C ../nucleus -k test bootstrap   # after a Nucleus fix (env.sh sourced)
 ```
 
-Under `-timedemo`, the reference engine plays demo1/2/3 in 5658, 13980 and 13605
-gametics. A desynced demo still runs to its end, so only the tic-hash diff proves
-sync.
+Written so far: `env.sh`, `setup-cloud.sh`, `run-tests.sh`, `check-probes.sh`,
+`build-reference.sh` (`[iron-doom] [chocolate-doom]`; auto mode denied running
+it again on 2026-11-05, so the user runs it or adds it to the setup script).
+`check-demos.sh` (exit 2 when a demo has no reference). `check-maps.sh`
+(each shareware map loads and runs). `mus2mid-ref.sh` builds Chocolate Doom's
+`mus2mid.c` with gcc into `build/mus2mid-ref`, for regenerating
+`reference/data/mus2mid/`. `check-frames.sh` comes once there are reference
+frames. Update this list as scripts are added or renamed.
+- **Savegame test output:** the `demo3-survives-a-load` test leaves
+  `build/savetest/doomsav0.nsg`, so `-config build/savetest/config.edn
+  -loadgame 0` runs a loaded game headless (add `-framedump TICS DIR`).
+- **Demo lengths** on doom1.wad v1.9: demo1 5026 gametics, demo2 3836, demo3
+  2134; `-timedemo` runs all three in about 40 s here, drawing every tic.
 
 ## Layout
 
 - `src/` holds the Nucleus sources, organized by subsystem namespace
-  (`doom.wad`, `doom.render.*`, `doom.play.*`, …), not one file per C file.
+  (`doom.wad`, `doom.render.*`, `doom.play.*`, …), not one file per Rust
+  crate.
 - `probes/` holds minimal standalone repros, one per bug-kind issue
   (`issue-NNN.nuc`).
-- `reference/` holds the reference-engine instrumentation patch and the recorded
-  per-tic hashes and framedumps. `reference/build/` is a patched copy of
-  Chocolate Doom (gitignored).
-- `scripts/` holds the environment, gate and probe scripts.
-- `.toolchain/` (gitignored) holds the libLLVM shim and the private compiler
-  build.
+- `reference/` holds the patches for the reference engines and the recorded
+  framedumps and tic hashes. `reference/build/` holds the patched copies
+  (gitignored).
+- `scripts/` holds the setup, environment, gate and probe scripts.
 
 ## Rules
 
@@ -144,16 +177,24 @@ sync.
   after a session limit, but not a subagent.
 - **Language problems go to `ISSUES.md`** when you hit them, in the format
   `PROMPT.md` §7 defines. Each bug needs a probe, and each workaround site is
-  tagged `; ISSUE-NNN`. Before calling something new, check `nucleus/docs` and
-  `nucleus/design` for whether it's already known.
-- **The playsim is fixed-point and must stay in demo sync** (`PROMPT.md` §6.1).
-  No floats in `doom.play.*`; keep the RNG, thinker order and blockmap order
-  exact. If that constraint gets in the way, record it as an issue.
+  tagged `; ISSUE-NNN`. Before calling something new, check `nucleus/docs`,
+  `nucleus/design` (especially `design/doom-port-fixes/`) for whether it's
+  already known.
+- **Port the design, not Bevy.** Iron Doom's ECS, plugins, schedules and states
+  are Rust idioms. Rebuild what they accomplish in idiomatic Nucleus
+  (`PROMPT.md` §8). Record a finding wherever Nucleus can't express the
+  structure cleanly.
+- **Phase B's playsim is fixed-point and must stay in demo sync** with Chocolate
+  Doom (`PROMPT.md` §6.1). No floats in `doom.play.*` from then on. Keep the
+  RNG, thinker order and blockmap order exact. Iron Doom's float movement gets
+  replaced, not extended.
 - **Nothing may hardcode container paths.** The port must also build on the
-  host.
-- **Never discard work with git** in either repo (`restore`, `checkout <file>`,
+  user's machine.
+- **Never discard work with git** in any repo (`restore`, `checkout <file>`,
   `reset --hard`, `clean`). Fix the source instead.
-- The code is GPLv2: keep `COPYING` and the upstream copyright headers.
+- **License.** The code is GPLv3 (Iron Doom), and Chocolate Doom's GPLv2+ code
+  is compatible with it. Keep `COPYING` (Iron Doom's `LICENSE`) and the
+  copyright header on each ported file.
 - Comments say *why*, in one or two lines. Never restate what the code does.
 - When you discover a non-obvious environment or workflow fact, add it here.
   Language findings go to `ISSUES.md`, not here.

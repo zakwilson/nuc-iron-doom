@@ -1,0 +1,22 @@
+(ns tests.bytes)
+
+(import-use nucleus.test)
+(import-use nucleus.slice)
+(import-use nucleus.fmt)
+(import-use nucleus.string)
+(import-use doom.bytes)
+
+(deftest little-endian-reads
+  (let (raw:&ui8 (array ui8 0x34 0x12 0xfe 0xff 0xff 0x7f)
+        b:Bytes (slice-of raw 6))
+    (try (check-eq-int (as i64 (le-i16 &b 0)) 0x1234 "le-i16"))
+    (try (check-eq-int (as i64 (le-i16 &b 2)) -2 "negative le-i16"))
+    (try (check-eq-int (as i64 (le-i32 &b 2)) 0x7ffffffe "le-i32"))))
+
+(deftest names-ignore-case-and-padding
+  (let (raw:&ui8 (array ui8 0x74 0x69 0x74 0x6c 0x65 0 0x41 0x42)
+        b:Bytes (slice-of raw 8))
+    (try (check (= (name-at &b 0) (name "TITLE")) "name-at stops at NUL"))
+    (try (check (!= (name "TITLE") (name "TITLEPIC")) "distinct names"))
+    (let (s (str (name "w94_1")))
+      (try (check-eq (string-as-view &s) "W94_1")))))

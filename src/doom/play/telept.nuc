@@ -1,0 +1,63 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_telept.c); this port is GPLv3, see COPYING.
+;
+; Teleporters.
+
+(ns doom.play.telept)
+
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.info)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.mobj)
+(import-use doom.play.move)
+
+; The first teleport destination in a sector, in thinker order.
+(defn- destination-in (w:&World sec:usize):?&Mobj
+  (let (cap (w 'thinker-cap) th (unwrap (cap 'next)) l (ref w 'level))
+    (while (not (same? th cap))
+      (when (not (th 'removed))
+        (match (th 'think)
+          ((mobj m)
+           (when (and (= (m 'type) MT-TELEPORTMAN)
+                      (= ((sub-sector-at l (m 'sub-sector)) 'sector) sec))
+             (return (some m))))
+          (_ 0)))
+      (set! th (unwrap (th 'next))))
+    (return none)))
+
+; EV_Teleport: to the destination in the first tagged sector that has one.
+; Missiles don't teleport, and nothing does from the line's back.
+(defn teleport (w:&World li:usize side:i32 thing:&Mobj):(Fallible bool)
+  (when (!= (bit-and (thing 'flags) MF-MISSILE) 0) (return (ok false)))
+  (when (= side 1) (return (ok false)))
+  (let (l (ref w 'level) tag ((line-at l li) 'tag))
+    (dotimes (i:usize (count (ref l 'sectors)))
+      (when (= ((sector-at l i) 'tag) tag)
+        (when-some (m (destination-in w i))
+          (let (oldx (thing 'x) oldy (thing 'y) oldz (thing 'z))
+            (when (not (try (teleport-move w thing (m 'x) (m 'y)))) (return (ok false)))
+            ; Final Doom's executables keep z.
+            (set! (thing 'z) (thing 'floor-z))
+            (when-some (p (mobj-player w thing))
+              (set! (p 'view-z) (wrap-add (thing 'z) (p 'view-height))))
+            (let (fog (spawn-mobj w oldx oldy oldz MT-TFOG))
+              (start-sound w (some fog) SFX-TELEPT))
+            (let (an (fine-index (m 'angle))
+                  fog (spawn-mobj w (wrap-add (m 'x) (* 20 (finecosine an)))
+                                  (wrap-add (m 'y) (* 20 (finesine an)))
+                                  (thing 'z) MT-TFOG))
+              (start-sound w (some fog) SFX-TELEPT))
+            ; Don't move for a bit.
+            (when (some? (thing 'player)) (set! (thing 'reaction-time) 18))
+            (set! (thing 'angle) (m 'angle))
+            (set! (thing 'mom-x) 0)
+            (set! (thing 'mom-y) 0)
+            (set! (thing 'mom-z) 0)
+            (return (ok true)))))))
+  (return (ok false)))

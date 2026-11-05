@@ -1,0 +1,151 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; The SDL window (Iron Doom crates/window: sdl_window.rs, palette.rs): an 8-bit
+; paletted surface, blitted to RGBA, streamed into a texture, upscaled by
+; "nearest" to an integer multiple, then drawn "linear" into a 320x240 logical
+; view, so the 320x200 picture gets the 4:3 CRT stretch.
+
+(ns doom.video)
+
+(import-use "SDL2/SDL.h")
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.gamma)
+
+(defconst SCREEN-WIDTH 320)
+(defconst SCREEN-HEIGHT 200)
+; Vanilla's 320x200 filled a 4:3 CRT, so each pixel was 20% taller than wide.
+(defconst SCREEN-HEIGHT-4-3 240)
+
+(defstruct Video
+  window:(ptr SDL_Window)
+  renderer:(ptr SDL_Renderer)
+  paletted:(ptr SDL_Surface)
+  rgba:(ptr SDL_Surface)
+  rgba-texture:(ptr SDL_Texture)
+  upscaled:(ptr SDL_Texture))
+
+(defn- sdl-fail (what:CStr):Failure
+  (return (Failure doom-failed (str what ": " (strview-from-cstr (SDL_GetError))))))
+
+(defmacro- sdl-check (what call)
+  `(when (!= ~call 0) (return (err (sdl-fail ~what)))))
+
+(defmacro- sdl-non-null (what call)
+  `(let (p ~call)
+     (when (= p null) (return (err (sdl-fail ~what))))
+     p))
+
+; The next integer multiple of 320x200 at least as big as the area the
+; 4:3 picture fills in the window.
+(defn- upscale-factors (r:(ptr SDL_Renderer) w:&i32 h:&i32):(Fallible void)
+  (let (ow:i32 0 oh:i32 0)
+    (sdl-check "SDL_GetRendererOutputSize" (SDL_GetRendererOutputSize r &ow &oh))
+    (if (< (* ow SCREEN-HEIGHT-4-3) (* oh SCREEN-WIDTH))
+      (set! oh (/ (* ow SCREEN-HEIGHT-4-3) SCREEN-WIDTH))
+      (set! ow (/ (* oh SCREEN-WIDTH) SCREEN-HEIGHT-4-3)))
+    (set! @w (max 1 (/ (+ ow (- SCREEN-WIDTH 1)) SCREEN-WIDTH)))
+    (set! @h (max 1 (/ (+ oh (- SCREEN-HEIGHT 1)) SCREEN-HEIGHT)))
+    (return (ok))))
+
+(defn- create-surface (format:ui32):(Fallible (ptr SDL_Surface))
+  (let (s (sdl-non-null "SDL_CreateRGBSurfaceWithFormat"
+                        (SDL_CreateRGBSurfaceWithFormat 0 SCREEN-WIDTH SCREEN-HEIGHT 32 format)))
+    (sdl-check "SDL_FillRect" (SDL_FillRect s null 0))
+    (return (ok s))))
+
+(defn video-open ():(Fallible Video)
+  (sdl-check "SDL_Init" (SDL_Init SDL_INIT_VIDEO))
+  (let (bounds (alloca SDL_Rect) mode (alloca SDL_DisplayMode))
+    (sdl-check "SDL_GetDisplayBounds" (SDL_GetDisplayBounds 0 bounds))
+    (sdl-check "SDL_GetCurrentDisplayMode" (SDL_GetCurrentDisplayMode 0 mode))
+    (let (window (sdl-non-null "SDL_CreateWindow"
+                   (SDL_CreateWindow "" (+ (bounds 'x) (/ (bounds 'w) 2)) (+ (bounds 'y) (/ (bounds 'h) 2))
+                                     0 0 (bit-or SDL_WINDOW_RESIZABLE SDL_WINDOW_ALLOW_HIGHDPI
+                                                 SDL_WINDOW_FULLSCREEN_DESKTOP)))
+          flags (if (> (mode 'refresh_rate) 0)
+                  (bit-or SDL_RENDERER_TARGETTEXTURE SDL_RENDERER_PRESENTVSYNC)
+                  SDL_RENDERER_TARGETTEXTURE)
+          renderer (sdl-non-null "SDL_CreateRenderer" (SDL_CreateRenderer window -1 flags))
+          format (SDL_GetWindowPixelFormat window))
+      (SDL_SetWindowMinimumSize window SCREEN-WIDTH SCREEN-HEIGHT-4-3)
+      ; The logical size is also the aspect ratio kept while scaling to the window.
+      (sdl-check "SDL_RenderSetLogicalSize" (SDL_RenderSetLogicalSize renderer SCREEN-WIDTH SCREEN-HEIGHT-4-3))
+      (sdl-check "SDL_RenderSetIntegerScale" (SDL_RenderSetIntegerScale renderer SDL_FALSE))
+      (SDL_SetRenderDrawColor renderer 0 0 0 255)
+      (SDL_RenderClear renderer)
+      (SDL_RenderPresent renderer)
+      (let (paletted (sdl-non-null "SDL_CreateRGBSurfaceWithFormat"
+                                   (SDL_CreateRGBSurfaceWithFormat 0 SCREEN-WIDTH SCREEN-HEIGHT 8
+                                                                   SDL_PIXELFORMAT_INDEX8))
+            rgba (try (create-surface format)))
+        (sdl-check "SDL_FillRect" (SDL_FillRect paletted null 0))
+        ; "nearest" for the 320x200 texture: gritty, like software scaling.
+        (SDL_SetHint "SDL_RENDER_SCALE_QUALITY" "nearest")
+        (let (tex (sdl-non-null "SDL_CreateTexture"
+                    (SDL_CreateTexture renderer format SDL_TEXTUREACCESS_STREAMING SCREEN-WIDTH SCREEN-HEIGHT))
+              uw:i32 1 uh:i32 1)
+          ; "linear" for the upscaled one, which is only ever scaled down.
+          (SDL_SetHint "SDL_RENDER_SCALE_QUALITY" "linear")
+          (try (upscale-factors renderer &uw &uh))
+          (let (up (sdl-non-null "SDL_CreateTexture"
+                     (SDL_CreateTexture renderer format SDL_TEXTUREACCESS_TARGET
+                                        (* uw SCREEN-WIDTH) (* uh SCREEN-HEIGHT))))
+            (SDL_SetRelativeMouseMode SDL_TRUE)
+            (return (ok (Video window renderer paletted rgba tex up)))))))))
+
+(defn video-close (v:&Video):void
+  (SDL_DestroyTexture (v 'upscaled))
+  (SDL_DestroyTexture (v 'rgba-texture))
+  (SDL_FreeSurface (v 'rgba))
+  (SDL_FreeSurface (v 'paletted))
+  (SDL_DestroyRenderer (v 'renderer))
+  (SDL_DestroyWindow (v 'window))
+  (SDL_Quit))
+
+; A palette as the screen shows it: gamma-corrected, then cut to the 6 bits
+; per channel the VGA DAC had.
+(defn palette-color (p:&Palette gamma-level:usize c:usize ch:usize):ui8
+  (return (bit-and (gamma gamma-level @(p (+ (* 3 c) ch))) 0xfc)))
+
+(defn video-set-palette (v:&Video p:&Palette gamma-level:usize):(Fallible void)
+  (let (colors:&SDL_Color (alloca SDL_Color 256)
+        pal (((v 'paletted) 'format) 'palette))
+    (dotimes (c:usize 256)
+      (let (col (unsafe/cast &SDL_Color (unsafe/ptr+ colors (as-checked i64 c))))
+        (set! (col 'r) (palette-color p gamma-level c 0))
+        (set! (col 'g) (palette-color p gamma-level c 1))
+        (set! (col 'b) (palette-color p gamma-level c 2))
+        (set! (col 'a) 255)))
+    (sdl-check "SDL_SetPaletteColors" (SDL_SetPaletteColors pal colors 0 256))
+    (return (ok))))
+
+(defn video-present (v:&Video screen:&Buffer):(Fallible void)
+  (let (r (v 'renderer) pal (v 'paletted) px (cells screen))
+    ; Keep the pillarboxes clear.
+    (SDL_RenderClear r)
+    (sdl-check "SDL_LockSurface" (SDL_LockSurface pal))
+    (let (pitch (as usize (pal 'pitch)) dst (unsafe/cast &ui8 (pal 'pixels)))
+      (dotimes (y:usize SCREEN-HEIGHT)
+        (memcpy (unsafe/ptr+ dst (as-checked i64 (* y pitch)))
+                (unsafe/ptr+ (px 'data) (as-checked i64 (* y SCREEN-WIDTH)))
+                SCREEN-WIDTH)))
+    (SDL_UnlockSurface pal)
+    ; SDL_BlitSurface is a macro over SDL_UpperBlit, and header macros aren't imported.
+    (sdl-check "SDL_UpperBlit" (SDL_UpperBlit pal null (v 'rgba) null))
+    (sdl-check "SDL_UpdateTexture"
+               (SDL_UpdateTexture (v 'rgba-texture) null ((v 'rgba) 'pixels) ((v 'rgba) 'pitch)))
+    (sdl-check "SDL_SetRenderTarget" (SDL_SetRenderTarget r (v 'upscaled)))
+    (sdl-check "SDL_RenderCopy" (SDL_RenderCopy r (v 'rgba-texture) null null))
+    (sdl-check "SDL_SetRenderTarget" (SDL_SetRenderTarget r null))
+    (sdl-check "SDL_RenderCopy" (SDL_RenderCopy r (v 'upscaled) null null))
+    (SDL_RenderPresent r)
+    (return (ok))))

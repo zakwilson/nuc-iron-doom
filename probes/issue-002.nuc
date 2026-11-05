@@ -1,0 +1,8 @@
+; ISSUE-002: an unquote can't appear inside colon type sugar in a template.
+; Expected: compiles; `p:&~name` in a quasiquote names the type the macro was given.
+; Actual: unknown type: ~name (the whole atom is read before unquote applies).
+; fixed-when: compiles
+(defstruct Pt x:i32)
+(defmacro getter (name) `(defn get-x (p:&~name):i32 (p 'x)))
+(getter Pt)
+(defn main ():i32 (get-x (Pt 0)))

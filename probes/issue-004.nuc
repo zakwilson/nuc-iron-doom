@@ -1,0 +1,10 @@
+; ISSUE-004: dotimes over a literal count binds an i32 index, which then can't
+; index or offset anything usize.
+; Expected: compiles (the index adapts as the literal count would).
+; Actual: _+: mixed signed/unsigned operands -- use explicit cast.
+; fixed-when: compiles
+(defn sum-from (base:usize):usize
+  (let (s:usize 0)
+    (dotimes (i 8) (set! s (+ s (+ base i))))
+    s))
+(defn main ():i32 (if (= (sum-from 0) 28) 0 1))

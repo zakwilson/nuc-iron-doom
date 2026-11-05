@@ -1,0 +1,39 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; -framedump: each tic's screen as a 320x200 binary PPM, coloured exactly as
+; the window shows it, so frames compare byte for byte with the reference
+; engines' (reference/iron-doom.patch writes the same format).
+
+(ns doom.framedump)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.file)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.video)
+
+(defn- pad5 (n:i32):String
+  (let (s (str n))
+    (while (< (count (ref s 'bytes)) 5)
+      (set! s (str "0" (string-as-view &s))))
+    (return s)))
+
+(defn framedump-write (dir:StrView tic:i32 screen:&Buffer p:&Palette gamma-level:usize):(Fallible void)
+  (let (num (pad5 tic)
+        path (str dir "/tic" (string-as-view &num) ".ppm")
+        out (str "P6\n" SCREEN-WIDTH " " SCREEN-HEIGHT "\n255\n")
+        px (cells screen))
+    (dotimes (i:usize (count &px))
+      (let (c (as usize @(&px i)))
+        (dotimes (ch:usize 3)
+          (let (b (palette-color p gamma-level c ch))
+            (string-push-bytes-raw &out &b 1)))))
+    (with (f (try (file-create &(string-as-view &path))))
+      (try (write-str f (string-as-view &out))))
+    (return (ok))))

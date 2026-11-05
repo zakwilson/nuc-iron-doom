@@ -1,0 +1,70 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom doomkeys.h, i_input.c); this port is GPLv3,
+; see COPYING.
+;
+; SDL key events as Doom's event_t: vanilla's key codes, so the menu, the
+; cheats and the automap read the keys their C reads.
+
+(ns doom.input)
+
+(import-use "SDL2/SDL.h")
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+
+(defconst KEY-RIGHTARROW 0xae)
+(defconst KEY-LEFTARROW 0xac)
+(defconst KEY-UPARROW 0xad)
+(defconst KEY-DOWNARROW 0xaf)
+(defconst KEY-ESCAPE 27)
+(defconst KEY-ENTER 13)
+(defconst KEY-TAB 9)
+(defconst KEY-BACKSPACE 0x7f)
+(defconst KEY-PAUSE 0xff)
+(defconst KEY-F1 0xbb)
+(defconst KEY-F11 0xd7)
+(defconst KEY-F12 0xd8)
+(defconst KEY-RSHIFT 0xb6)
+(defconst KEY-RCTRL 0x9d)
+(defconst KEY-RALT 0xb8)
+
+(defenum EventType EV-KEYDOWN EV-KEYUP EV-QUIT)
+
+; `key` is the Doom key code, `ch` the character it types (0 for none).
+(defstruct Event type:i32 key:i32 ch:i32)
+
+; i_input.c's TranslateKey, for the keys vanilla binds.
+(defn- translate-key (sc:i32 sym:i32):i32
+  (cond (= sc SDL_SCANCODE_RIGHT) (return KEY-RIGHTARROW)
+        (= sc SDL_SCANCODE_LEFT) (return KEY-LEFTARROW)
+        (= sc SDL_SCANCODE_UP) (return KEY-UPARROW)
+        (= sc SDL_SCANCODE_DOWN) (return KEY-DOWNARROW)
+        (= sc SDL_SCANCODE_ESCAPE) (return KEY-ESCAPE)
+        (or (= sc SDL_SCANCODE_RETURN) (= sc SDL_SCANCODE_KP_ENTER)) (return KEY-ENTER)
+        (= sc SDL_SCANCODE_TAB) (return KEY-TAB)
+        (= sc SDL_SCANCODE_BACKSPACE) (return KEY-BACKSPACE)
+        (= sc SDL_SCANCODE_PAUSE) (return KEY-PAUSE)
+        (and (>= sc SDL_SCANCODE_F1) (<= sc SDL_SCANCODE_F10)) (return (+ KEY-F1 (- sc SDL_SCANCODE_F1)))
+        (= sc SDL_SCANCODE_F11) (return KEY-F11)
+        (= sc SDL_SCANCODE_F12) (return KEY-F12)
+        (or (= sc SDL_SCANCODE_LSHIFT) (= sc SDL_SCANCODE_RSHIFT)) (return KEY-RSHIFT)
+        (or (= sc SDL_SCANCODE_LCTRL) (= sc SDL_SCANCODE_RCTRL)) (return KEY-RCTRL)
+        (or (= sc SDL_SCANCODE_LALT) (= sc SDL_SCANCODE_RALT)) (return KEY-RALT)
+        ; Printable keys are their lower-case ASCII, as SDL's keycodes are.
+        (and (> sym 0) (< sym 127)) (return sym)
+        true (return 0)))
+
+; The pending SDL events, in order.
+(defn poll-events ():(Vector Event)
+  (let (out (make (Vector Event)) ev (alloca SDL_Event))
+    (while (!= (SDL_PollEvent ev) 0)
+      (let (t (ev 'type))
+        (cond (= t SDL_QUIT) (conj &out (Event EV-QUIT 0 0))
+              (or (= t SDL_KEYDOWN) (= t SDL_KEYUP))
+              (let (ks ((ref ev 'key) 'keysym)
+                    key (translate-key (unsafe/cast i32 (ks 'scancode)) (unsafe/cast i32 (ks 'sym))))
+                (when (!= key 0)
+                  (conj &out (Event (if (= t SDL_KEYDOWN) EV-KEYDOWN EV-KEYUP) key
+                                    (if (< key 127) key 0))))))))
+    (return out)))

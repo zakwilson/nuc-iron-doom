@@ -1,0 +1,31 @@
+; ISSUE-028: a struct derived :edn-keep-absent inside another one releases
+; the inner struct's replaced fields twice: once in the inner decode's
+; commit and again when the outer commit releases its old copy of the field.
+; One level alone reads fine.
+; fixed-when: output-contains read ok
+; Actual: a segmentation fault in free(), from edn-release of the old
+; Vector's Strings.
+
+(import-use "stdio.h")
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.read)
+(import-use nucleus.edn)
+
+(defstruct Inner (names (Vector String)))
+(defstruct Outer n:i32 (inner Inner))
+(derive-edn (Inner :edn-keep-absent) (Outer :edn-keep-absent))
+
+(defn main ():i32
+  (let (v (make (Vector String)))
+    (conj &v (str "a"))
+    (let (o (Outer 1 (Inner v)))
+      (match (edn-parse "#user/Outer {:inner #user/Inner {:names [\"b\"]}}")
+        ((err e) (puts "parse error"))
+        ((ok n) (match (edn-read &o n)
+                  ((err e) (puts "read error"))
+                  ((ok x) (puts "read ok")))))))
+  (return 0))

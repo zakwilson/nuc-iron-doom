@@ -1,0 +1,33 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; Iron Doom reports failures through anyhow with a formatted message (the lump
+; name, the bad count). `Err` is a bare code, so a failure that must say which
+; lump carries its message in a `Failure`, and `(Fallible T)` is the `!T` of
+; this port.
+
+(ns doom.error)
+
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+
+(deferror doom-failed "doom failed")
+
+(defstruct Failure code:Err msg:String)
+
+(defn failure-code (e:Failure):Err (return (e 'code)))
+(defcast Failure Err failure-code)
+
+; A stdlib `!T` (a failed open, a failed read) keeps its code's name as the text.
+(defn failure-of (e:Err):Failure
+  (return (Failure e (str (err-name e) ": " (err-message e)))))
+(defcast Err Failure failure-of)
+
+(deftype (Fallible T) (Result T Failure))
+
+; (fail "Lump " name " is too short"): the `bail!` of this port.
+(defmacro fail (:rest parts)
+  `(return (err (Failure doom-failed (str ~@parts)))))
+
+(defn failure-text (e:&Failure):StrView
+  (return (string-as-view (ref e 'msg))))

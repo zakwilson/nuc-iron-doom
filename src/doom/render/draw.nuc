@@ -1,0 +1,106 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom r_draw.c); this port is GPLv3, see COPYING.
+;
+; The inner loops: a vertical run of a texture column, and a horizontal span
+; of a flat, each through a colormap. Vanilla passes their arguments in dc_*
+; and ds_* globals; here they are arguments.
+
+(ns doom.render.draw)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use doom.bytes)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.fixed)
+(import-use doom.render.state)
+
+; One column of source pixels: `len` of them, `stride` apart from `start`.
+(defstruct ColSource data:Bytes start:usize stride:usize len:usize)
+
+(defn- source-at (s:&ColSource i:i32):ui8
+  ; Vanilla reads past a short column into whatever follows it (the
+  ; "tutti-frutti" effect); wrapping keeps it inside the column instead.
+  (let (k (% (as usize i) (s 'len)))
+    (return @((ref s 'data) (+ (s 'start) (* k (s 'stride)))))))
+
+(defn- colormap-at (cm:&Bytes map:i32 c:ui8):ui8
+  (return @(cm (+ (* (as usize map) 256) (as usize c)))))
+
+(defn- put (r:&Renderer screen:&Buffer x:i32 y:i32 c:ui8):void
+  (set screen (as usize (+ x (r 'view-window-x))) (as usize (+ y (r 'view-window-y))) c))
+
+(defn- get (r:&Renderer screen:&Buffer x:i32 y:i32):ui8
+  (return (screen (as usize (+ x (r 'view-window-x))) (as usize (+ y (r 'view-window-y))))))
+
+; R_DrawColumn: rows yl..yh of view column x. The texture repeats every 128
+; rows.
+(defn draw-column (r:&Renderer screen:&Buffer cm:&Bytes x:i32 yl:i32 yh:i32
+                   texture-mid:Fixed iscale:Fixed src:&ColSource map:i32):void
+  (when (< yh yl) (return))
+  (let (frac (wrap-add texture-mid (wrap-mul (- yl (r 'center-y)) iscale)) y yl)
+    (while (<= y yh)
+      (put r screen x y (colormap-at cm map (source-at src (bit-and (bit-shr frac FRACBITS) 127))))
+      (set! frac (wrap-add frac iscale))
+      (inc! y))))
+
+; R_DrawTranslatedColumn: as draw-column through a colour translation, and
+; without the 128-row repeat.
+(defn draw-translated-column (r:&Renderer screen:&Buffer cm:&Bytes x:i32 yl:i32 yh:i32
+                              texture-mid:Fixed iscale:Fixed src:&ColSource map:i32
+                              translation:&Bytes):void
+  (when (< yh yl) (return))
+  (let (frac (wrap-add texture-mid (wrap-mul (- yl (r 'center-y)) iscale)) y yl)
+    (while (<= y yh)
+      (let (c (source-at src (bit-shr frac FRACBITS)))
+        (put r screen x y (colormap-at cm map @(translation (as usize c)))))
+      (set! frac (wrap-add frac iscale))
+      (inc! y))))
+
+(defconst FUZZTABLE 50)
+(defconst FUZZ-OFFSETS (array i32
+  1 -1 1 -1 1 1 -1 1 1 -1 1 1 1 -1 1 1 1 -1 -1 -1 -1 1 -1 -1 1 1 1 1 -1
+  1 -1 1 1 -1 -1 1 1 -1 -1 -1 -1 1 1 1 1 -1 1 1 -1 1))
+
+; R_DrawFuzzColumn: the spectre's shimmer, darkening the pixel a row above or
+; below each one with colormap 6. Never the view's first or last row.
+(defn draw-fuzz-column (r:&Renderer screen:&Buffer cm:&Bytes x:i32 yl:i32 yh:i32):void
+  (let (lo (if (= yl 0) 1 yl)
+        hi (if (= yh (- (r 'view-height) 1)) (- (r 'view-height) 2) yh)
+        y lo)
+    (while (<= y hi)
+      (let (off (aref FUZZ-OFFSETS (as i64 (r 'fuzz-pos))))
+        (put r screen x y (colormap-at cm 6 (get r screen x (+ y off)))))
+      (set! (r 'fuzz-pos) (+ (r 'fuzz-pos) 1))
+      (when (= (r 'fuzz-pos) FUZZTABLE) (set! (r 'fuzz-pos) 0))
+      (inc! y))))
+
+; R_DrawSpan: columns x1..x2 of view row y from a 64x64 flat. Position and
+; step pack x and y as 6.10 fixed point into one word each.
+(defn draw-span (r:&Renderer screen:&Buffer cm:&Bytes flat:&Bytes y:i32 x1:i32 x2:i32
+                 xfrac:Fixed yfrac:Fixed xstep:Fixed ystep:Fixed map:i32):void
+  (let (pos (bit-or (bit-and (bit-shl (unsafe/cast ui32 xfrac) 10) 0xffff0000)
+                    (bit-and (unsafe/cast ui32 (bit-shr yfrac 6)) 0xffff))
+        step (bit-or (bit-and (bit-shl (unsafe/cast ui32 xstep) 10) 0xffff0000)
+                     (bit-and (unsafe/cast ui32 (bit-shr ystep 6)) 0xffff))
+        x x1)
+    (while (<= x x2)
+      (let (spot (bit-or (bit-shr pos 26) (bit-and (bit-shr pos 4) 0x0fc0)))
+        (put r screen x y (colormap-at cm map @(flat (as usize spot)))))
+      (set! pos (+ pos step))
+      (inc! x))))
+
+; R_GetColumn: column `col` of a wall texture, which repeats at the largest
+; power of two that fits its width.
+(defn texture-column (tx:&WallTextures tex:usize col:i32):ColSource
+  (let (px (ref (texture-at tx tex) 'pixels)
+        w (width px)
+        mask:usize 1)
+    (while (<= (* mask 2) w) (set! mask (* mask 2)))
+    ; A negative column wraps through the mask, as C's `col &= mask` does.
+    (return (ColSource (cells px) (bit-and (unsafe/cast usize col) (- mask 1)) w (height px)))))
+
+; textureheight[tex], in fixed point.
+(defn texture-height (tx:&WallTextures tex:usize):Fixed
+  (return (int-to-fixed (as-checked i32 (height (ref (texture-at tx tex) 'pixels))))))
