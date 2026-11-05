@@ -75,7 +75,9 @@
   finale:Finale
   ; F_Ticker's forced wipes (wipegamestate = -1), for the game layer.
   forced-wipes:i32
-  hud:Hud)
+  hud:Hud
+  ; The game layer's: pause, and the menu being up (which pauses too).
+  paused:bool menu-active:bool)
 
 (defn session-new (a:&Assets mode:i32):(Fallible &Session)
   (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
@@ -83,7 +85,7 @@
                        (single-player-in-game) (new-game-players) (random-new)
                        none 0 none false false none none (status-bar-new)
                        GS-LEVEL GA-NOTHING false (intermission-empty) 0
-                       (finale-empty) 0 (hud-new)))))
+                       (finale-empty) 0 (hud-new) false false))))
 
 ; D_IdentifyVersion: told apart by which maps the IWAD has.
 (defn game-mode (a:&Assets):i32
@@ -425,7 +427,7 @@
     (when (s 'demo-ended) (return (ok)))
     (case (s 'gamestate)
       GS-LEVEL
-      (do (try (ticker w))
+      (do (try (ticker w (s 'paused) (s 'menu-active)))
           (st-ticker (ref s 'st) w (player-at w cp) (m-random (ref w 'random)))
           (hud-ticker (ref s 'hud) w (player-at w cp))
           ; G_ExitLevel and G_SecretExitLevel, which the playsim flags.

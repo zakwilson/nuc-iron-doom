@@ -54,7 +54,8 @@ it.
 | 3. Level and walls | done except the framedump gate (blocked like milestone 2's): E1M1 renders; movement matches an independent f32 model of Iron Doom's bit for bit over 80 tics; playtest requested below |
 | 4. Planes and things | done except the framedump gate: Chocolate Doom's renderer (`doom.render.*`) draws walls, visplanes, sky, light, sprites and masked middle textures, and the game draws from the playsim's console player. The weapon sprites remain (below) |
 | 5. Playsim | in progress, playable: all of p_*.c is in `doom.play.*` (thinkers, map utilities, movement and collision, mobjs, player, weapons, sight, monster AI and attacks, damage and pickups, every sector special). `doom.session` is G_InitNew, G_DoLoadLevel and G_Ticker, and `doom.ticcmd` is G_BuildTiccmd. `-playdemo` and `-timedemo` play v1.9 demos, and `-tichash` writes the sync hash. All three doom1.wad demos play to their end (5026, 3836 and 2134 tics), and the player dies 50–60 tics before each ends, as in the originals: good evidence of sync, but the gate (`scripts/check-demos.sh`) waits on the reference build |
-| 6–8 | not started |
+| 6. Playable | in progress: done are the status bar (`doom.statusbar`), HUD messages (`doom.hud`), gamestates with G_Ticker's game actions, the intermission (`doom.intermission`, single player), the finale (`doom.finale`, no Doom 2 cast), Chocolate's wipe (`doom.wipe`), `-warp`, `-skill`, `-record` and `scripts/check-maps.sh` (all nine maps pass). Next: menus and the new-game flow, the attract loop, the automap, cheats |
+| 7–8 | not started |
 
 ## Reference frames and tic hashes
 
@@ -126,10 +127,13 @@ Please check:
 - `build/nuc-iron-doom -playdemo demo1` (and `demo2`, `demo3`): each should
   play exactly as in Chocolate Doom, ending with the player's death.
 
-Known problems: no weapon on screen, no status bar, HUD, menu, automap,
-intermission or sound yet (milestones 6–8). Textures and flats don't animate
-on screen yet (the playsim animates them, the renderer doesn't apply it).
-Fast monsters (`-fast`, nightmare) don't change state durations yet.
+Since this request was written the weapon, status bar, HUD messages, the
+intermission, the finale and the screen melt have been added; `-warp E M`,
+`-skill N` and `-record NAME` work as in Chocolate Doom.
+
+Known problems: no menu, automap, attract loop, cheats or sound yet. The
+game starts at E1M1 on skill 3 after the title (`-warp` and `-skill`
+choose otherwise).
 
 ## In flight
 
@@ -139,10 +143,11 @@ Fast monsters (`-fast`, nightmare) don't change state durations yet.
 
 - The gates for milestones 2–5 wait on `scripts/build-reference.sh` (frames
   from Iron Doom and Chocolate Doom, tic hashes from Chocolate Doom).
-- Milestone 5's rest: the renderer applies texture and flat translations,
-  draws the weapon (R_DrawPlayerSprites), extralight and the fixed colormap;
-  `-fast` state tics; old levels' arenas are freed.
-- Milestone 6 (status bar, HUD, menu, intermission, finale, sound).
+- Milestone 6's rest: menus (m_menu.c) with SDL key events, the attract
+  loop (D_DoAdvanceDemo, GS_DEMOSCREEN), the automap (am_map.c), cheats.
+- Gaps: Doom 2's cast call; netgame and deathmatch intermission stats; the
+  bunny scroll's drawer-side pistol sounds; the sound queue is cleared each
+  tic, and M_Random isn't drawn for sound pitches yet (rndindex only).
 - Known gaps: freed mobjs are reused last-freed first, which only
   approximates the zone allocator for stale `target` pointers; the tichash
   comparison leaves out `rndindex` until the wipe and sound draw from it

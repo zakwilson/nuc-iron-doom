@@ -55,8 +55,14 @@
         (set! cur next))))
   (return (ok)))
 
-; P_Ticker.
-(defn ticker (w:&World):(Fallible void)
+; P_Ticker. `menu-active` pauses a single-player game once the console
+; player has had a tic, as vanilla does.
+(defn ticker (w:&World paused:bool menu-active:bool):(Fallible void)
+  (let (r (ref w 'rules))
+    (when paused (return (ok)))
+    (when (and (not (r 'netgame)) menu-active (not (r 'demo-playback))
+               (!= ((player-at w (unsafe/cast usize (r 'console-player))) 'view-z) 1))
+      (return (ok))))
   (dotimes (i:usize MAXPLAYERS)
     (when ((ref w 'player-in-game) i)
       (try (player-think w i))))
