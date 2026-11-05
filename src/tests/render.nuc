@@ -54,7 +54,8 @@
                                   (new-game-players) &in-game (random-new) pics))
               screen (array2d (as usize 320) (as usize 200) (as ui8 0))
               r (renderer-new 11)
-              sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats) (ref a 'colormaps)
+              sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats)
+                        (ref w 'texture-translation) (ref w 'flat-translation) (ref a 'colormaps)
                         (ref a 'sprites) (ref w 'sector-things) &screen))
           ; Things spawned on skill 3; the P_Random index after spawning (143)
           ; and the one light flash (special 1) taking one more.

@@ -257,12 +257,18 @@
   level:&Level
   textures:&WallTextures
   flats:&Flats
+  ; The playsim's animation: what each texture and flat number draws as now.
+  tex-trans:&(Vector i32)
+  flat-trans:&(Vector i32)
   ; The COLORMAP lump: 34 maps of 256 bytes.
   colormaps:&Bytes
   sprites:&Sprites
   ; Each sector's things, as the playsim links them.
   things:&(Vector ?&Mobj)
   screen:&Buffer)
+
+(defn translated-texture (sc:&Scene i:i32):i32 (return ((sc 'tex-trans) (unsafe/cast usize i))))
+(defn translated-flat (sc:&Scene i:i32):i32 (return ((sc 'flat-trans) (unsafe/cast usize i))))
 
 ; --- small accessors --------------------------------------------------------------
 

@@ -21,6 +21,7 @@
 (import-use doom.info)
 (import-use doom.play.map)
 (import-use doom.play.world)
+(import-use doom.play.defs)
 (import-use doom.render.state)
 (import-use doom.render.draw)
 (import-use doom.render.sprites)
@@ -158,7 +159,7 @@
         back (sector-at l (unwrap-or (s 'back-sector) (s 'front-sector)))
         side (side-at l (s 'side))
         line (line-at l (s 'line))
-        tex (unsafe/cast usize (side 'mid-texture))
+        tex (unsafe/cast usize (translated-texture sc (side 'mid-texture)))
         lights (seg-light r l s front)
         scale (wrap-add (ds 'scale1) (wrap-mul (- x1 (ds 'x1)) (ds 'scale-step)))
         mid (wrap-add (if (!= (bit-and (line 'flags) ML-DONTPEGBOTTOM) 0)
@@ -260,3 +261,53 @@
       (let (ds (draw-seg-at r i))
         (when (not (clip-ref-none? (ds 'masked-texture-col)))
           (render-masked-seg-range r sc ds (ds 'x1) (ds 'x2)))))))
+
+(defconst BASEYCENTER 100)
+
+; R_DrawPSprite: a weapon sprite, unclipped but for the view's edges.
+(defn- draw-psprite (r:&Renderer sc:&Scene p:&Player psp:&PspDef):void
+  (let (st (state-at (psp 'state))
+        def (sprite-def (sc 'sprites) (st 'sprite))
+        fs (view (ref def 'frames))
+        f (&fs (unsafe/cast usize (bit-and (st 'frame) FF-FRAMEMASK)))
+        lump (aref (f 'patch) 0)
+        flip (aref (f 'flip) 0)
+        sp (sprite-patch (sc 'sprites) lump)
+        tx (wrap-sub (wrap-sub (psp 'sx) (* (/ SCREENWIDTH 2) FRACUNIT)) (sp 'offset))
+        x1 (bit-shr (wrap-add (r 'center-x-frac) (fixed-mul tx (r 'pspritescale))) FRACBITS))
+    (when (> x1 (r 'view-width)) (return))
+    (let (x2 (- (bit-shr (wrap-add (r 'center-x-frac) (fixed-mul (wrap-add tx (sp 'width)) (r 'pspritescale)))
+                         FRACBITS)
+                1))
+      (when (< x2 0) (return))
+      (let (vx1 (if (< x1 0) 0 x1)
+            vx2 (if (>= x2 (r 'view-width)) (- (r 'view-width) 1) x2)
+            xiscale (if flip (- 0 (r 'pspriteiscale)) (r 'pspriteiscale))
+            start (wrap-add (if flip (- (sp 'width) 1) 0)
+                            (if (> vx1 x1) (wrap-mul xiscale (- vx1 x1)) 0))
+            invis (aref (p 'powers) (as i64 PW-INVISIBILITY))
+            colormap (cond (or (> invis (* 4 32)) (!= (bit-and invis 8) 0)) -1
+                           (>= (r 'fixed-colormap) 0) (r 'fixed-colormap)
+                           (!= (bit-and (st 'frame) FF-FULLBRIGHT) 0) 0
+                           true (scale-light r (r 'sprite-lights) (- MAXLIGHTSCALE 1)))
+            v (VisSprite vx1 vx2 0 0 0 0 start (r 'pspritescale) xiscale
+                         (wrap-sub (+ (bit-shl BASEYCENTER FRACBITS) (/ FRACUNIT 2))
+                                   (wrap-sub (psp 'sy) (sp 'top-offset)))
+                         lump colormap 0))
+        ; mfloorclip and mceilingclip are the whole view.
+        (let (bot (ref r 'clip-bot) top (ref r 'clip-top) x vx1)
+          (while (<= x vx2)
+            (set bot (as usize x) (unsafe/cast i16 (r 'view-height)))
+            (set top (as usize x) (as i16 -1))
+            (inc! x)))
+        (draw-vis-sprite r sc &v)))))
+
+; R_DrawPlayerSprites: the weapon and its flash, lit by the player's sector.
+(defn draw-player-sprites (r:&Renderer sc:&Scene p:&Player):void
+  (let (l (sc 'level) mo (unwrap (p 'mo))
+        sector (sector-at l ((sub-sector-at l (mo 'sub-sector)) 'sector))
+        n (+ (bit-shr (sector 'light-level) LIGHTSEGSHIFT) (r 'extra-light)))
+    (set! (r 'sprite-lights) (cond (< n 0) 0 (>= n LIGHTLEVELS) (- LIGHTLEVELS 1) true n))
+    (dotimes (i:usize 2)
+      (let (psp (ref (aref (p 'psprites) (as i64 i))))
+        (when (!= (psp 'state) 0) (draw-psprite r sc p psp))))))

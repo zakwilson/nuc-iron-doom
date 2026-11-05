@@ -135,7 +135,7 @@
       (when (<= (p 'min-x) (p 'max-x))
         (if (= (p 'pic) ((sc 'level) 'sky-flat))
           (draw-sky r sc p)
-          (let (flat ((flat-at (sc 'flats) (as usize (p 'pic))) 'data)
+          (let (flat ((flat-at (sc 'flats) (unsafe/cast usize (translated-flat sc (p 'pic)))) 'data)
                 light (+ (bit-shr (p 'light-level) LIGHTSEGSHIFT) (r 'extra-light)))
             (set! (r 'plane-height) (iabs (wrap-sub (p 'height) (r 'view-z))))
             (set! (r 'plane-z-light) (cond (>= light LIGHTLEVELS) (- LIGHTLEVELS 1) (< light 0) 0 true light))

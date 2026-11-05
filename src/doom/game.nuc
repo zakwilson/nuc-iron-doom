@@ -42,6 +42,7 @@
 (import-use doom.play.spec)
 (import-use doom.render.state)
 (import-use doom.render.view)
+(import-use doom.render.things)
 (import-use doom.session)
 (import-use doom.ticcmd)
 ; Its Level and level-load would clash with phase A's doom.level.
@@ -157,7 +158,9 @@
 ; The eye at the console player, as R_SetupFrame places it.
 (defn- player-eye (p:&Player):Eye
   (let (mo (unwrap (p 'mo)))
-    (return (Eye (mo 'x) (mo 'y) (p 'view-z) (mo 'angle) (p 'extra-light) (p 'fixed-colormap)))))
+    ; The renderer's "no fixed colormap" is -1; the playsim's is 0.
+    (return (Eye (mo 'x) (mo 'y) (p 'view-z) (mo 'angle) (p 'extra-light)
+                 (if (= (p 'fixed-colormap) 0) -1 (p 'fixed-colormap))))))
 
 (defn- draw-level (g:&Game):(Fallible void)
   (when-some (l (g 'level))
@@ -168,10 +171,13 @@
     (when-some (w (s 'world))
       (set-sky g ((ref w 'rules) 'episode))
       (let (a (ref g 'assets)
-            sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats) (ref a 'colormaps)
+            sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats)
+                        (ref w 'texture-translation) (ref w 'flat-translation) (ref a 'colormaps)
                       (ref a 'sprites) (ref w 'sector-things) (ref g 'screen))
-            e (player-eye (player-at w (unsafe/cast usize ((ref w 'rules) 'console-player)))))
-        (try (render-player-view (ref g 'renderer) &sc &e)))))
+            p (player-at w (unsafe/cast usize ((ref w 'rules) 'console-player)))
+            e (player-eye p))
+        (try (render-player-view (ref g 'renderer) &sc &e))
+        (draw-player-sprites (ref g 'renderer) &sc p))))
   (return (ok)))
 
 (defn game-tic (g:&Game):(Fallible void)
