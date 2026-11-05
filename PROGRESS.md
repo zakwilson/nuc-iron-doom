@@ -132,13 +132,17 @@ here), so a misplaced texture or sprite is worth reporting.
 
 ## Next steps
 
-- Milestone 4, rest:
-  - `game.nuc` on the new renderer, with the f32 player converted to a fixed
-    eye and a world spawned from the map. The phase-A float renderer stays
-    as `doom.render` (Iron Doom parity) until the playsim replaces the float
-    player.
-  - The weapon sprites (psprites) come with the player in milestone 5:
-    spawning a player runs weapon state actions.
+- Milestone 4's gate (reference frames from Chocolate Doom) waits on
+  `scripts/build-reference.sh`, like milestones 2 and 3.
+- Milestone 5 (playsim), ported file by file into `doom.play.*`, which may
+  import each other (Nucleus allows import cycles):
+  `tick` (P_Ticker, thinkers), `maputl` (geometry, blockmap iterators, path
+  traversal), `move` (p_map.c), `mobj`, `player` (d_player.h, p_user.c),
+  `pspr` (weapons), `sight`, `enemy`, `inter`, the sector specials (`spec`,
+  `doors`, `floors`, `ceilings`, `plats`, `lights`, `switch`, `telept`),
+  then `doom.game`'s ticcmd and demo playback (g_game.c) and the action
+  dispatch. The tichash harness needs the reference build, so until then
+  demos are checked by playing them and watching the frames.
 - Known gaps: no texture or flat animation (texturetranslation), and freed
   mobjs are reused last-freed first, which only approximates the zone
   allocator for stale `target` pointers.

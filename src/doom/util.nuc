@@ -16,3 +16,7 @@
   (let (n (count v) x (v (- n 1)))
     (truncate! v (- n 1))
     (return x)))
+
+; Whether two references are to the same object.
+(defn same? (a:ptr b:ptr):bool
+  (return (= (unsafe/cast usize a) (unsafe/cast usize b))))

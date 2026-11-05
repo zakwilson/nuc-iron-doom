@@ -1,0 +1,22 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_setup.c); this port is GPLv3, see COPYING.
+;
+; P_SetupLevel, from a loaded map to a world ready for its first tic.
+
+(ns doom.play.setup)
+
+(import-use nucleus.vector)
+(import-use doom.error)
+(import-use doom.mapdata)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.mobj)
+(import-use doom.play.spec)
+
+(defn level-setup (l:Level m:&Map rules:Rules players:(Vector Player) in-game:&(Vector bool)
+                   random:Random):(Fallible &World)
+  (let (w (world-new l rules players in-game random))
+    (try (load-things w m))
+    (try (spawn-specials w))
+    (return (ok w))))

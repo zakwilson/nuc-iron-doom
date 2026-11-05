@@ -13,10 +13,12 @@ provisional until milestone 8.)
 | ISSUE-021 | A `let` typed `&T` silently binds a copy of a `T` value | major | bug |
 | ISSUE-011 | A macro-defined struct can't appear in any other function's signature | major | design |
 | ISSUE-006 | A struct defined by a macro can't be a field type | major | bug |
+| ISSUE-023 | A program is capped at 128 unions (every `Maybe` counts) and 128 enums | major | bug |
 | ISSUE-009 | `(some v)`/`none` aren't target-typed through a `deref` or `aref` place | minor | bug |
 | ISSUE-013 | Float `!=` was ordered, so NaN != NaN was false | minor | bug |
 | ISSUE-015 | A float constant doesn't adapt to an overload's `f32` parameter | minor | design |
 | ISSUE-019 | A struct literal passed to a generic binds `T` to `&S` | minor | bug |
+| ISSUE-022 | `none` passed to a generic method isn't typed from its other arguments | minor | bug |
 | ISSUE-010 | A macro template can't call `count` where two collection namespaces are imported | minor | design |
 | ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature |
 | ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature |
@@ -146,8 +148,11 @@ diagnosed at emission.
 - **Probe:** `probes/issue-007.nuc` — expected `(Outer 1 (inner 2))` to fail
   with a message naming the designated reading; actual `struct literal: type
   mismatch for field 'inner'`
-- **Port sites:** `src/doom/mapdata.nuc` (`read-block-map`)
-- **Workaround:** name the function differently from the field.
+- **Port sites:** `src/doom/mapdata.nuc` (`read-block-map`),
+  `src/doom/play/world.nuc` (`stop-sound`: a field read `(origin 'x)` on a
+  parameter named like the field, which fails as "field 'origin' specified
+  twice")
+- **Workaround:** name the function or variable differently from the field.
 - **Suggestion:** when a designated `(name v)` fails to type-check and `name`
   is also a function, add a note: "read as a designated initializer for field
   'name'; bind the call first to pass it positionally".
@@ -476,6 +481,54 @@ the same conversion with no diagnostic, and a call result does too:
 Every rotation written through `f` was lost, and the only symptom would have
 been "No patches found" at startup. I found it only because I went to check
 whether `(v i)` returned a reference.
+
+## ISSUE-022: `none` passed to a generic method isn't typed from its other arguments
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-022.nuc` — expected `(conj &v none)` with `v` a
+  `(Vector ?&P)` to append an empty slot; actual `no matching method for
+  overloaded 'conj' ... argument 2: ?ptr is not ?&P`
+- **Port sites:** `src/doom/play/world.nuc` (`world-new`, the
+  active-ceiling and active-plat slots)
+- **Workaround:** bind `none` to a typed local (`nc:?&Ceiling none`) and
+  pass that.
+- **Suggestion:** once `self` fixes `T`, type a bare `none` (and `(some x)`)
+  argument from the parameter `?T`, as a non-generic call already does.
+
+Context: the note gives the instantiated signature, `(conj self:&(Vector
+?&P) elem:?&P)`. So the compiler has already found `T` from the first
+argument, but it still matches `none` as an untyped `?ptr`. A non-generic
+function taking `?&P` accepts the same `none`. Related to ISSUE-009, fixed for
+`deref` and `aref` places, but this is the argument path. Vanilla's fixed
+tables of nullable pointers (activeceilings, activeplats, blocklinks) all
+start out filled with null.
+
+## ISSUE-023: a program is capped at 128 unions and 128 enums
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed-in-compiler (nucleus `d13384a`, carried as
+  `nucleus-patches/0005-*.patch`)
+- **Probe:** `probes/issue-023.nuc` — expected 140 `defunion`s and 140
+  `defenum`s to compile, with the last enum's members usable as `match`
+  patterns; actual `error: too many defunions`, and with the unions removed,
+  `'E139-A' is not a defenum member`
+- **Port sites:** none left. It stopped the whole game build when the playsim
+  modules came in.
+- **Workaround:** none possible from the port. The fix raises `MAX-UNIONS` and
+  `MAX-ENUMS` to 8192.
+- **Suggestion:** (done) treat both as runaway guards on a `Vector`, as
+  `MAX-STRUCTS` already is.
+
+Context: every `Maybe`, `Result` and `Fallible` instantiation stamps a union.
+A port that returns `(Fallible T)` for many `T` and keeps `?&T` links for
+every kind of object reaches 128 without writing many `defunion`s itself.
+`MAX-STRUCTS` was raised from 1024 to 16384 for GTK for the same reason
+(nucleus `design/progress.md`). The enum cap failed worse: past it, the
+`defenum` still compiled, but its members silently dropped out of the table
+`match` checks, so the error named the pattern, not the cap.
 
 ## What worked well
 

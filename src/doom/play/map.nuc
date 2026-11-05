@@ -21,6 +21,7 @@
 (import-use doom.fixed)
 
 (defconst ML-BLOCKING 1)
+(defconst ML-BLOCKMONSTERS 2)
 (defconst ML-TWOSIDED 4)
 (defconst ML-DONTPEGTOP 8)
 (defconst ML-DONTPEGBOTTOM 16)

@@ -1,0 +1,77 @@
+From d13384a08b5f4e8a4726bbc7c57ce831826ee9a0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 03:15:31 +0000
+Subject: [PATCH] Raise the union and enum caps to growth guards (nuc-iron-doom
+ ISSUE-023)
+
+MAX-UNIONS and MAX-ENUMS were 128. Every Maybe, Result and Fallible
+instantiation takes a union slot, so a game port ran out with "too many
+defunions". Past the enum cap an enum's members silently stopped being
+match patterns. Both registries are Vectors, so the caps are only
+runaway guards, as MAX-STRUCTS already is.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8hzrZakM3KWb32SpqKh
+---
+ src/compiler-types.nuc | 10 +++++++---
+ tests/suite-doom.nuc   | 19 +++++++++++++++++++
+ 2 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/src/compiler-types.nuc b/src/compiler-types.nuc
+index e16bb24..a341473 100644
+--- a/src/compiler-types.nuc
++++ b/src/compiler-types.nuc
+@@ -11,8 +11,10 @@
+ (import-use nucleus.string)
+ (defconst MAX-STRUCTS 16384)
+ (defconst MAX-CAST-RULES 256)
+-; Stage 10 unions (design/stage10/unions.md)
+-(defconst MAX-UNIONS 128)
++; Stage 10 unions (design/stage10/unions.md). A guard on a Vector count, like
++; MAX-STRUCTS: every Maybe/Result instantiation takes a slot, and a game port
++; passed 128 (nuc-iron-doom ISSUE-023).
++(defconst MAX-UNIONS 8192)
+ (defconst MAX-UNION-TEMPLATES 64)
+ ; Stage 11 parametric structs (design/stage11/parametric-structs.md §1)
+ (defconst MAX-STRUCT-TEMPLATES 64)
+@@ -22,7 +24,9 @@
+ ; A depth cap rather than a visited set — expansion is a plain recursive descent
+ ; with nowhere natural to hang set state, and no honest chain is deep.
+ (defconst MAX-TYPE-ALIAS-DEPTH 32)
+-(defconst MAX-ENUMS 128)
++; Also a guard on a Vector count; past it an enum's members stop being match
++; patterns (nuc-iron-doom ISSUE-023).
++(defconst MAX-ENUMS 8192)
+ (defconst MAX-UNION-ARMS 64)
+ ; Stage 10 errors (design/stage10/errors.md §8): global error-id cap. Ids are
+ ; dense from 1 (0 reserved), so the descriptor table has MAX-DEFERRORS+1 slots.
+diff --git a/tests/suite-doom.nuc b/tests/suite-doom.nuc
+index f86455a..abde72d 100644
+--- a/tests/suite-doom.nuc
++++ b/tests/suite-doom.nuc
+@@ -754,3 +754,22 @@ missing key :sens for #user/Opt"))
+         ov:StrView (string-as-view &out))
+     (try (check-eq (strview-trim-end &ov) "1 -2"))
+     (drop &out)))
++
++; nuc-iron-doom ISSUE-023: past 128 unions or 128 enums, a program still
++; compiles, and the last enum's members are still match patterns.
++(deftest doom-many-unions-and-enums
++  (let (h:String (str "(import-use \"stdio.h\")\n") i:i64 0)
++    (while (< i 300)
++      (str-into &h "(defunion U" i " (a) (b x:i32))\n(defenum E" i " E" i "-A E" i "-B)\n")
++      (set! i (+ i 1)))
++    (str-into &h "(defn f (e:i32):i32 (match e (E299-A (return 1)) (E299-B (return 2))))
++(defn g (u:U299):i32 (match u ((a) (return 0)) ((b x) (return x))))
++(defn main ():i32
++  (printf \"%d %d\\n\" (f E299-B) (g (U299-b 3)))
++  0)
++")
++    (let (out:String (try (build-run-source (string-as-view &h)))
++          ov:StrView (string-as-view &out))
++      (try (check-eq (strview-trim-end &ov) "2 3"))
++      (drop &out))
++    (drop &h)))
+-- 
+2.43.0
+

@@ -19,13 +19,13 @@
 (import-use doom.fixed)
 (import-use doom.rand)
 (import-use doom.mapdata)
+(import-use doom.play.defs)
 (import-use doom.info)
 (import-use doom.play.map)
 
 (defconst MAXPLAYERS 4)
 (defconst ONFLOORZ -2147483648)
 (defconst ONCEILINGZ 2147483647)
-(defconst MAPBLOCKSHIFT 23)
 (defconst MTF-AMBUSH 8)
 
 (defenum Skill SK-BABY SK-EASY SK-MEDIUM SK-HARD SK-NIGHTMARE)
@@ -50,17 +50,143 @@
   spawn-point:MapThing
   tracer:?&Mobj)
 
-; What a thinker runs. Sector movers join this in the playsim.
-(defunion Think (cap) (mobj m:&Mobj))
+; --- sector movers (p_spec.h) ----------------------------------------------------
+; Each keeps its thinker, to remove it when done.
+
+(defstruct VlDoor th:?&Thinker type:i32 sector:usize top-height:Fixed speed:Fixed
+  direction:i32 top-wait:i32 top-countdown:i32)
+(defstruct FloorMove th:?&Thinker type:i32 crush:bool sector:usize direction:i32
+  new-special:i32 texture:i32 floor-dest-height:Fixed speed:Fixed)
+(defstruct Ceiling th:?&Thinker type:i32 sector:usize bottom-height:Fixed top-height:Fixed
+  speed:Fixed crush:bool direction:i32 tag:i32 old-direction:i32)
+(defstruct Plat th:?&Thinker sector:usize speed:Fixed low:Fixed high:Fixed wait:i32 count:i32
+  status:i32 old-status:i32 crush:bool tag:i32 type:i32)
+(defstruct LightFlash th:?&Thinker sector:usize count:i32 max-light:i32 min-light:i32
+  max-time:i32 min-time:i32)
+(defstruct Strobe th:?&Thinker sector:usize count:i32 min-light:i32 max-light:i32
+  dark-time:i32 bright-time:i32)
+(defstruct Glow th:?&Thinker sector:usize min-light:i32 max-light:i32 direction:i32)
+(defstruct FireFlicker th:?&Thinker sector:usize count:i32 max-light:i32 min-light:i32)
+
+; What a thinker runs.
+(defunion Think
+  (cap)
+  (mobj m:&Mobj)
+  (door d:&VlDoor)
+  (floor f:&FloorMove)
+  (ceiling c:&Ceiling)
+  (plat p:&Plat)
+  (flash l:&LightFlash)
+  (strobe s:&Strobe)
+  (glow g:&Glow)
+  (flicker f:&FireFlicker))
 
 ; A removed thinker stays linked, and is unlinked and freed when the thinker
-; loop reaches it (P_RemoveThinker's function = -1).
-(defstruct Thinker prev:?&Thinker next:?&Thinker removed:bool think:Think)
+; loop reaches it (P_RemoveThinker's function = -1). An idle one stays and
+; is skipped: a plat or ceiling in stasis (function = NULL).
+(defstruct Thinker prev:?&Thinker next:?&Thinker removed:bool idle:bool think:Think)
+
+; A switch waiting to flip back (button_t). `where` is a ButtonWhere.
+(defstruct Button line:usize where:i32 texture:i32 timer:i32 sound-x:Fixed sound-y:Fixed)
+
+; --- players (d_player.h, d_ticcmd.h) -------------------------------------------
+
+; One tic of input. Moves are signed bytes, the turn a 16-bit angle delta.
+(defstruct TicCmd forward-move:i32 side-move:i32 angle-turn:i32 chat-char:i32
+  buttons:i32 consistancy:i32)
+
+; A weapon sprite: `state` 0 means none.
+(defstruct PspDef state:i32 tics:i32 sx:Fixed sy:Fixed)
+
+(defstruct Player
+  mo:?&Mobj
+  state:i32
+  cmd:TicCmd
+  view-z:Fixed view-height:Fixed delta-view-height:Fixed bob:Fixed
+  health:i32 armor-points:i32 armor-type:i32
+  powers:(array i32 6)
+  cards:(array bool 6)
+  backpack:bool
+  frags:(array i32 4)
+  ready-weapon:i32 pending-weapon:i32
+  weapon-owned:(array bool 9)
+  ammo:(array i32 4) max-ammo:(array i32 4)
+  attack-down:bool use-down:bool
+  cheats:i32 refire:i32
+  kill-count:i32 item-count:i32 secret-count:i32
+  message:?CStr
+  damage-count:i32 bonus-count:i32
+  attacker:?&Mobj
+  extra-light:i32 fixed-colormap:i32 colormap:i32
+  psprites:(array PspDef 2)
+  did-secret:bool)
+
+; --- scratch state of the map searches ----------------------------------------
+; Vanilla's p_map.c, p_maputl.c and p_sight.c pass state to their iterator
+; callbacks in globals; these structs hold it.
+
+(defstruct Divline x:Fixed y:Fixed dx:Fixed dy:Fixed)
+
+(defunion InterceptOf (thing m:&Mobj) (line l:usize))
+(defstruct Intercept frac:Fixed of:InterceptOf)
+
+; P_LineOpening's results.
+(defstruct Opening top:Fixed bottom:Fixed range:Fixed low-floor:Fixed)
+
+(defstruct MapScratch
+  ; P_CheckPosition and P_TryMove.
+  tm-bbox:BBox tm-thing:?&Mobj tm-flags:i32 tm-x:Fixed tm-y:Fixed
+  float-ok:bool tm-floor-z:Fixed tm-ceiling-z:Fixed tm-dropoff-z:Fixed
+  ceiling-line:?usize
+  spechit:(Vector usize) num-spechit:i32
+  ; P_SlideMove.
+  best-slide-frac:Fixed second-slide-frac:Fixed
+  best-slide-line:?usize second-slide-line:?usize
+  slide-mo:?&Mobj tm-xmove:Fixed tm-ymove:Fixed
+  ; Aiming and shooting.
+  line-target:?&Mobj shoot-thing:?&Mobj shoot-z:Fixed la-damage:i32
+  attack-range:Fixed aim-slope:Fixed top-slope:Fixed bottom-slope:Fixed
+  use-thing:?&Mobj
+  ; P_RadiusAttack and P_ChangeSector.
+  bomb-source:?&Mobj bomb-spot:?&Mobj bomb-damage:i32
+  crush-change:bool no-fit:bool
+  ; P_PathTraverse.
+  opening:Opening
+  intercepts:(Vector Intercept)
+  trace:Divline
+  early-out:bool
+  ; P_CheckSight.
+  sight-z-start:Fixed t2x:Fixed t2y:Fixed strace:Divline)
+
+(defn- map-scratch-new ():MapScratch
+  (return (MapScratch (bbox-clear) none 0 0 0 false 0 0 0 none (make (Vector usize)) 0
+                      0 0 none none none 0 0
+                      none none 0 0 0 0 0 0 none
+                      none none 0 false false
+                      (Opening 0 0 0 0) (make (Vector Intercept)) (Divline 0 0 0 0) false
+                      0 0 0 (Divline 0 0 0 0))))
+
+; A sound the playsim started: the game layer plays and then clears them.
+; `located` is false for a sound at no place, which the whole level hears;
+; `origin` is the mobj it follows, if any.
+(defstruct SoundEvent sfx:i32 origin:?&Mobj located:bool x:Fixed y:Fixed stop:bool)
+
+; --- the world -------------------------------------------------------------------
+
+; How the game is being played (vanilla's globals of the same names).
+(defstruct Rules skill:i32 deathmatch:i32 netgame:bool no-monsters:bool respawn-monsters:bool
+  fast:bool mode:i32 episode:i32 map:i32 console-player:i32 demo-playback:bool
+  ; Ultimate Doom's executable or later (gameversion >= exe_ultimate).
+  ultimate:bool)
+
+; The playsim's per-sector state beside the map's (sector_t's other fields).
+(defstruct SectorPlay sound-traversed:i32 sound-target:?&Mobj valid-count:i32
+  special-data:?&Thinker)
 
 (defstruct World
   level:Level
   arena:Arena
-  skill:i32 deathmatch:i32 netgame:bool no-monsters:bool commercial:bool
+  rules:Rules
   random:Random
   thinker-cap:&Thinker
   ; Freed objects, reused last-freed first as the zone allocator tends to.
@@ -68,22 +194,49 @@
   ; Each sector's things and each blockmap cell's, most recent first.
   sector-things:(Vector ?&Mobj)
   block-links:(Vector ?&Mobj)
+  sector-play:(Vector SectorPlay)
+  ; Each line's validcount, and the counter.
+  line-valid:(Vector i32)
+  valid-count:i32
+  players:(Vector Player)
   player-in-game:(Vector bool)
   player-starts:(Vector MapThing) player-start-in-game:(Vector bool)
   deathmatch-starts:(Vector MapThing)
-  player-mobjs:(Vector ?&Mobj)
   total-kills:i32 total-items:i32 total-secret:i32
-  level-time:i32)
+  level-time:i32
+  ; 0 while playing; 1 when the exit is used, 2 the secret exit.
+  exit:i32
+  active-ceilings:(Vector ?&Ceiling)
+  active-plats:(Vector ?&Plat)
+  buttons:(Vector Button)
+  scratch:MapScratch
+  sounds:(Vector SoundEvent)
+  ; Deathmatch's item respawns (itemrespawnque).
+  item-respawn-que:(Vector MapThing) item-respawn-time:(Vector i32)
+  ique-head:i32 ique-tail:i32
+  ; Deathmatch's body queue.
+  body-que:(Vector ?&Mobj) body-que-slot:i32
+  ; An error raised inside an iterator callback, raised again once the
+  ; iteration ends (callbacks return a plain bool, as vanilla's do).
+  pending-error:?Failure)
 
 (defn mobj-info-of (m:&Mobj):MobjInfo (return (mobj-info (m 'type))))
+
+(defn sector-play-at (w:&World i:usize):&SectorPlay
+  (let (s (view (ref w 'sector-play))) (return (&s i))))
+
+(defn player-at (w:&World i:usize):&Player
+  (let (s (view (ref w 'players))) (return (&s i))))
+
+(defn p-random (w:&World):i32 (return (p-random (ref w 'random))))
 
 ; --- the thinker list (p_tick.c) ---------------------------------------------
 
 (defn- new-thinker (w:&World t:Think):&Thinker
   (when (= (count (ref w 'free-thinkers)) 0)
-    (return (new Thinker (ref w 'arena) none none false t)))
+    (return (new Thinker (ref w 'arena) none none false false t)))
   (let (th (pop-last (ref w 'free-thinkers)))
-    (set! @th (Thinker none none false t))
+    (set! @th (Thinker none none false false t))
     (return th)))
 
 ; P_AddThinker: to the end of the list, before the cap.
@@ -147,132 +300,7 @@
          (set (ref w 'block-links) b (some m))))
       ((none) (set! (m 'bnext) none) (set! (m 'bprev) none)))))
 
-; --- spawning (p_mobj.c) -----------------------------------------------------
-
-(defn- blank-mobj (w:&World):&Mobj
-  (let (z:Mobj (Mobj none 0 0 0 none none 0 0 0 none none 0 0 0 0 0 0 0 0
-                     0 0 0 0 0 0 0 0 none 0 0 none 0 (MapThing 0 0 0 0 0) none))
-    (let (m (if (= (count (ref w 'free-mobjs)) 0)
-              (new Mobj (ref w 'arena)) ; ISSUE-020: new can't copy z in
-              (pop-last (ref w 'free-mobjs))))
-      (set! @m z)
-      (return m))))
-
-; P_SpawnMobj. The spawn state's action doesn't run: nothing is set up for
-; it yet.
-(defn spawn-mobj (w:&World x:Fixed y:Fixed z:Fixed type:i32):&Mobj
-  (let (m (blank-mobj w) info (mobj-info type) st (state-at (info 'spawn-state)))
-    (set! (m 'type) type)
-    (set! (m 'x) x)
-    (set! (m 'y) y)
-    (set! (m 'radius) (info 'radius))
-    (set! (m 'height) (info 'height))
-    (set! (m 'flags) (info 'flags))
-    (set! (m 'health) (info 'spawn-health))
-    (when (!= (w 'skill) SK-NIGHTMARE)
-      (set! (m 'reaction-time) (info 'reaction-time)))
-    (set! (m 'last-look) (% (p-random (ref w 'random)) MAXPLAYERS))
-    (set! (m 'state) (info 'spawn-state))
-    (set! (m 'tics) (st 'tics))
-    (set! (m 'sprite) (st 'sprite))
-    (set! (m 'frame) (st 'frame))
-    (set-thing-position w m)
-    (let (sec (sector-at (ref w 'level) (sector-of w m)))
-      (set! (m 'floor-z) (sec 'floor-height))
-      (set! (m 'ceiling-z) (sec 'ceiling-height)))
-    (set! (m 'z) (cond (= z ONFLOORZ) (m 'floor-z)
-                       (= z ONCEILINGZ) (- (m 'ceiling-z) (info 'height))
-                       true z))
-    (set! (m 'thinker) (some (add-thinker w (Think-mobj m))))
-    (return m)))
-
-(defn- thing-angle (mt:&MapThing):Angle
-  (return (wrap-mul ANG45 (unsafe/cast ui32 (/ (as i32 (mt 'angle)) 45)))))
-
-; P_SpawnPlayer, as far as the mobj goes. The player's own state (weapons,
-; view height) comes with the playsim.
-(defn- spawn-player (w:&World mt:&MapThing):void
-  (when (not ((ref w 'player-in-game) (unsafe/cast usize (- (as i32 (mt 'thing-type)) 1)))) (return))
-  (let (n (as i32 (mt 'thing-type))
-        m (spawn-mobj w (int-to-fixed (as i32 (mt 'x))) (int-to-fixed (as i32 (mt 'y))) ONFLOORZ MT-PLAYER))
-    ; Players 2 to 4 are recoloured green, grey and brown.
-    (when (> n 1)
-      (set! (m 'flags) (bit-or (m 'flags) (bit-shl (- n 1) MF-TRANSSHIFT))))
-    (set! (m 'angle) (thing-angle mt))
-    (set! (m 'player) (some (unsafe/cast usize (- n 1))))
-    (set (ref w 'player-mobjs) (unsafe/cast usize (- n 1)) (some m))))
-
-(defn- mobj-type-of (doomednum:i32):?i32
-  (dotimes (i:i32 NUMMOBJTYPES)
-    (when (= ((mobj-info i) 'doomednum) doomednum) (return (some i))))
-  (return none))
-
-(defn- skill-bit (skill:i32):i32
-  (cond (= skill SK-BABY) (return 1)
-        (= skill SK-NIGHTMARE) (return 4)
-        ; doom.exe reduces the shift mod 32 (Chocolate Doom issue 1677).
-        true (return (unsafe/cast i32 (bit-shl (as ui32 1) (unsafe/cast ui32 (bit-and (- skill 1) 31)))))))
-
-; P_SpawnMapThing.
-(defn spawn-map-thing (w:&World mt:&MapThing):(Fallible void)
-  (let (n (as i32 (mt 'thing-type)) options (as i32 (mt 'options)))
-    (when (= n 11)
-      (when (< (count (ref w 'deathmatch-starts)) 10)
-        (conj (ref w 'deathmatch-starts) @mt))
-      (return (ok)))
-    ; Type 0 is "player -1 start", which vanilla ignores.
-    (when (<= n 0) (return (ok)))
-    (when (<= n 4)
-      (set (ref w 'player-starts) (unsafe/cast usize (- n 1)) @mt)
-      (set (ref w 'player-start-in-game) (unsafe/cast usize (- n 1)) true)
-      (when (= (w 'deathmatch) 0) (spawn-player w mt))
-      (return (ok)))
-    (when (and (not (w 'netgame)) (!= (bit-and options 16) 0)) (return (ok)))
-    (when (= (bit-and options (skill-bit (w 'skill))) 0) (return (ok)))
-    (let (type (match (mobj-type-of n)
-                 ((some t) t)
-                 ((none) (fail "P_SpawnMapThing: Unknown type " n " at (" (as i32 (mt 'x)) ", " (as i32 (mt 'y)) ")")))
-          info (mobj-info type))
-      (when (and (!= (w 'deathmatch) 0) (!= (bit-and (info 'flags) MF-NOTDMATCH) 0)) (return (ok)))
-      (when (and (w 'no-monsters) (or (= type MT-SKULL) (!= (bit-and (info 'flags) MF-COUNTKILL) 0)))
-        (return (ok)))
-      (let (m (spawn-mobj w (int-to-fixed (as i32 (mt 'x))) (int-to-fixed (as i32 (mt 'y)))
-                          (if (!= (bit-and (info 'flags) MF-SPAWNCEILING) 0) ONCEILINGZ ONFLOORZ)
-                          type))
-        (set! (m 'spawn-point) @mt)
-        (when (> (m 'tics) 0)
-          (set! (m 'tics) (+ 1 (% (p-random (ref w 'random)) (m 'tics)))))
-        (when (!= (bit-and (m 'flags) MF-COUNTKILL) 0) (set! (w 'total-kills) (+ (w 'total-kills) 1)))
-        (when (!= (bit-and (m 'flags) MF-COUNTITEM) 0) (set! (w 'total-items) (+ (w 'total-items) 1)))
-        (set! (m 'angle) (thing-angle mt))
-        (when (!= (bit-and options MTF-AMBUSH) 0)
-          (set! (m 'flags) (bit-or (m 'flags) MF-AMBUSH))))))
-  (return (ok)))
-
-; Doom II's monsters, which a non-commercial game doesn't spawn.
-(defn- doom2-only? (n:i32):bool
-  (return (or (= n 68) (= n 64) (= n 88) (= n 89) (= n 69)
-              (= n 67) (= n 71) (= n 65) (= n 66) (= n 84))))
-
-; P_LoadThings.
-(defn- load-things (w:&World m:&Map):(Fallible void)
-  (let (things (view (ref m 'things)) stop false i:usize 0)
-    (while (and (not stop) (< i (count &things)))
-      (let (mt (&things i))
-        ; Vanilla stops loading here rather than skipping the one thing.
-        (if (and (not (w 'commercial)) (doom2-only? (as i32 (mt 'thing-type))))
-          (set! stop true)
-          (try (spawn-map-thing w mt))))
-      (inc! i)))
-  (when (= (w 'deathmatch) 0)
-    (dotimes (i:usize MAXPLAYERS)
-      (when (and ((ref w 'player-in-game) i) (not ((ref w 'player-start-in-game) i)))
-        (fail "P_LoadThings: Player " (+ (unsafe/cast i32 i) 1) " start missing (vanilla crashes here)"))
-      (set (ref w 'player-start-in-game) i false)))
-  (return (ok)))
-
-(defstruct WorldOptions skill:i32 deathmatch:i32 netgame:bool no-monsters:bool commercial:bool
-  players:(array bool 4))
+; --- creation ----------------------------------------------------------------------
 
 (defn- filled (n:usize v:?&Mobj):(Vector ?&Mobj)
   (let (out (make (Vector ?&Mobj)))
@@ -284,25 +312,92 @@
     (dotimes (i:usize n) (conj &out false))
     (return out)))
 
-; The part of P_SetupLevel after the map is loaded: the thinkers and things.
-; `random` carries on from the previous level, as vanilla's indices do.
-(defn world-new (l:Level m:&Map o:&WorldOptions random:Random):(Fallible &World)
+(defn- ints (n:usize):(Vector i32)
+  (let (out (make (Vector i32)))
+    (dotimes (i:usize n) (conj &out 0))
+    (return out)))
+
+(defn ticcmd-zero ():TicCmd (return (TicCmd 0 0 0 0 0 0)))
+
+; memset(p, 0, sizeof *p).
+(defn player-zero ():Player
+  (let (psp:PspDef (PspDef 0 0 0 0))
+    (return (Player none 0 (ticcmd-zero) 0 0 0 0 0 0 0
+                    (array i32 0 0 0 0 0 0) (array bool false false false false false false) false
+                    (array i32 0 0 0 0) 0 0
+                    (array bool false false false false false false false false false)
+                    (array i32 0 0 0 0) (array i32 0 0 0 0)
+                    false false 0 0 0 0 0 none 0 0 none 0 0 0
+                    (array PspDef psp psp) false))))
+
+; A level's world before its things: P_SetupLevel up to P_LoadThings.
+; `players` and `random` carry over from the previous level, as vanilla's
+; globals do.
+(defn world-new (l:Level rules:Rules players:(Vector Player) in-game:&(Vector bool)
+                 random:Random):&World
   (let (arena (make Arena)
-        cap (new Thinker &arena none none false (Think-cap))
+        cap (new Thinker &arena none none false false (Think-cap))
         nsec (count (ref l 'sectors))
+        nlines (count (ref l 'lines))
         nblocks (unsafe/cast usize (* (l 'bmap-width) (l 'bmap-height)))
-        w (new World heap l arena (o 'skill) (o 'deathmatch) (o 'netgame) (o 'no-monsters)
-               (o 'commercial) random cap
+        play (make (Vector SectorPlay))
+        w (new World heap l arena rules random cap
                (make (Vector &Mobj)) (make (Vector &Thinker))
-               (filled nsec none) (filled nblocks none)
-               (bools MAXPLAYERS) (make (Vector MapThing)) (bools MAXPLAYERS)
-               (make (Vector MapThing)) (filled MAXPLAYERS none)
-               0 0 0 0))
+               (filled nsec none) (filled nblocks none) play
+               (ints nlines) 0
+               players (bools MAXPLAYERS) (make (Vector MapThing)) (bools MAXPLAYERS)
+               (make (Vector MapThing))
+               0 0 0 0 0
+               (make (Vector ?&Ceiling)) (make (Vector ?&Plat)) (make (Vector Button))
+               (map-scratch-new) (make (Vector SoundEvent))
+               (make (Vector MapThing)) (ints 128) 0 0
+               (filled 32 none) 0 none))
     ; P_InitThinkers: the cap alone is a circular list.
     (set! (cap 'prev) (some cap))
     (set! (cap 'next) (some cap))
+    (dotimes (i:usize nsec) (conj (ref w 'sector-play) (SectorPlay 0 none 0 none)))
+    (dotimes (i:usize 128) (conj (ref w 'item-respawn-que) (MapThing 0 0 0 0 0)))
     (dotimes (i:usize MAXPLAYERS)
       (conj (ref w 'player-starts) (MapThing 0 0 0 0 0))
-      (set (ref w 'player-in-game) i (aref (o 'players) (as i64 i))))
-    (try (load-things w m))
-    (return (ok w))))
+      (set (ref w 'player-in-game) i (in-game i)))
+    ; ISSUE-022: conj can't take a bare none.
+    (let (nc:?&Ceiling none np:?&Plat none)
+      (dotimes (i:usize MAXCEILINGS) (conj (ref w 'active-ceilings) nc))
+      (dotimes (i:usize MAXPLATS) (conj (ref w 'active-plats) np)))
+    (return w)))
+
+; Sounds go to the game layer through the world's queue (S_StartSound).
+(defn start-sound (w:&World origin:?&Mobj sfx:i32):void
+  (match origin
+    ((some m) (conj (ref w 'sounds) (SoundEvent sfx origin true (m 'x) (m 'y) false)))
+    ((none) (conj (ref w 'sounds) (SoundEvent sfx none false 0 0 false)))))
+
+; A sound from a sector's sound origin (its bounding box centre).
+(defn start-sector-sound (w:&World sector:usize sfx:i32):void
+  (let (s (sector-at (ref w 'level) sector))
+    (conj (ref w 'sounds) (SoundEvent sfx none true (s 'sound-x) (s 'sound-y) false))))
+
+; S_StopSound.
+; ISSUE-007: a parameter named `origin` would make (origin 'x) the field's
+; designated initializer.
+(defn stop-sound (w:&World mo:&Mobj):void
+  (conj (ref w 'sounds) (SoundEvent 0 (some mo) true (mo 'x) (mo 'y) true)))
+
+; G_InitNew's players: all reborn, so each is set up at its first spawn.
+(defn new-game-players ():(Vector Player)
+  (let (out (make (Vector Player)))
+    (dotimes (i:usize MAXPLAYERS)
+      (let (p (player-zero))
+        (set! (p 'state) PST-REBORN)
+        (conj &out p)))
+    (return out)))
+
+; A single-player game's rules.
+(defn single-player-rules (skill:i32 mode:i32 episode:i32 m:i32):Rules
+  (return (Rules skill 0 false false false false mode episode m 0 false false)))
+
+; Only player 1 in the game.
+(defn single-player-in-game ():(Vector bool)
+  (let (out (make (Vector bool)))
+    (dotimes (i:usize MAXPLAYERS) (conj &out (= i 0)))
+    (return out)))
