@@ -30,7 +30,7 @@ performance or gameplay. The goal is **a playable Doom in idiomatic Nucleus,
 plus a report on the language issues that made it hard to write**.
 
 This is not a transliteration exercise. A previous Nucleus Doom port
-(`zakwilson/nuc-doom`) was a close, bit-exact transliteration of Chocolate
+(which is not available online) was a close, bit-exact transliteration of Chocolate
 Doom's C, and its findings are already reported, and most of them fixed.
 Starting from Rust changes the question: Iron Doom already uses modern
 structure (enums with data, traits, `Result`, iterators, an ECS). This port
