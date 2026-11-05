@@ -193,7 +193,9 @@
   ; Ultimate Doom's executable or later (gameversion >= exe_ultimate).
   ultimate:bool
   ; Deathmatch's -timer, in minutes; 0 for none.
-  time-limit:i32)
+  time-limit:i32
+  ; -respawn, or the demo's flag: respawn-monsters is this or nightmare.
+  respawn-parm:bool)
 
 ; The playsim's per-sector state beside the map's (sector_t's other fields).
 (defstruct SectorPlay sound-traversed:i32 sound-target:?&Mobj valid-count:i32
@@ -431,7 +433,7 @@
 
 ; A single-player game's rules.
 (defn single-player-rules (skill:i32 mode:i32 episode:i32 m:i32):Rules
-  (return (Rules skill 0 false false false false mode episode m 0 false false 0)))
+  (return (Rules skill 0 false false false false mode episode m 0 false (= mode RETAIL) 0 false)))
 
 ; Only player 1 in the game.
 (defn single-player-in-game ():(Vector bool)

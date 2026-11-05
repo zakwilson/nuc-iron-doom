@@ -98,6 +98,23 @@
          (set! (s 'world) (some w))))))
   (return (ok)))
 
+; Vanilla's gameskill outlives a game, and -fast halves the tics again at
+; each new one, so this is global too. It starts as sk_baby, zero.
+(defvar GAME-SKILL:i32 SK-BABY)
+
+; G_InitNew's -fast: demons, spectres and three missiles speed up or back down.
+(defn- set-fast-monsters (fast:bool slow:bool):void
+  (when (or fast slow)
+    (let (i S-SARG-RUN1)
+      (while (<= i S-SARG-PAIN2)
+        (let (st (ref (aref STATES (as i64 i))))
+          (set! (st 'tics) (if fast (bit-shr (st 'tics) 1) (bit-shl (st 'tics) 1))))
+        (inc! i)))
+    (dotimes (k:usize 3)
+      (let (t (case k 0 MT-BRUISERSHOT 1 MT-HEADSHOT MT-TROOPSHOT)
+            mi (ref (aref MOBJINFO (as i64 t))))
+        (set! (mi 'speed) (* FRACUNIT (cond fast 20 (= t MT-BRUISERSHOT) 15 true 10)))))))
+
 ; G_InitNew: a new game at this skill, episode and map.
 (defn session-init-new (s:&Session a:&Assets skill:i32 episode:i32 m:i32):(Fallible void)
   (let (r (ref s 'rules) sk (min skill SK-NIGHTMARE)
@@ -107,7 +124,10 @@
     (when (and (> mp 9) (!= (r 'mode) COMMERCIAL)) (set! mp 9))
     ; M_ClearRandom.
     (set! (s 'random) (random-new))
-    (set! (r 'respawn-monsters) (or (= sk SK-NIGHTMARE) (r 'respawn-monsters)))
+    (set! (r 'respawn-monsters) (or (= sk SK-NIGHTMARE) (r 'respawn-parm)))
+    (set-fast-monsters (or (r 'fast) (and (= sk SK-NIGHTMARE) (!= GAME-SKILL SK-NIGHTMARE)))
+                       (and (!= sk SK-NIGHTMARE) (= GAME-SKILL SK-NIGHTMARE)))
+    (set! GAME-SKILL sk)
     (set! (s 'players) (new-game-players))
     (set! (s 'world) none)
     (set! (r 'demo-playback) false)
@@ -134,7 +154,7 @@
        (let (skill (try (demo-byte &d)) episode (try (demo-byte &d)) mp (try (demo-byte &d))
              r (ref s 'rules))
          (set! (r 'deathmatch) (try (demo-byte &d)))
-         (set! (r 'respawn-monsters) (!= (try (demo-byte &d)) 0))
+         (set! (r 'respawn-parm) (!= (try (demo-byte &d)) 0))
          (set! (r 'fast) (!= (try (demo-byte &d)) 0))
          (set! (r 'no-monsters) (!= (try (demo-byte &d)) 0))
          (set! (r 'console-player) (try (demo-byte &d)))

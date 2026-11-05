@@ -308,7 +308,8 @@
 (defconst FF-FULLBRIGHT 0x8000)
 (defconst FF-FRAMEMASK 0x7fff)
 
-(defconst STATES (array State
+; Variables, as in vanilla: G_InitNew rewrites some tics and speeds for -fast.
+(defvar STATES:(array State NUMSTATES) (array State
   (State 0 0 -1 0 0 0 0) ; S-NULL
   (State 1 4 0 1 0 0 0) ; S-LIGHTDONE
   (State 2 0 1 2 2 0 0) ; S-PUNCH
@@ -1284,7 +1285,7 @@
   speed:i32 radius:i32 height:i32 mass:i32 damage:i32
   active-sound:i32 flags:i32 raise-state:i32)
 
-(defconst MOBJINFO (array MobjInfo
+(defvar MOBJINFO:(array MobjInfo NUMMOBJTYPES) (array MobjInfo
   (MobjInfo -1 149 100 150 0 0 0 156 255 25 0 154 158 165 57 0 1048576 3670016 100 0 0 33557510 0) ; MT-PLAYER
   (MobjInfo 3004 174 20 176 36 8 1 187 200 27 0 184 189 194 59 8 1310720 3670016 100 0 75 4194310 203) ; MT-POSSESSED
   (MobjInfo 9 207 30 209 37 8 0 220 170 27 0 217 222 227 60 8 1310720 3670016 100 0 75 4194310 236) ; MT-SHOTGUY
