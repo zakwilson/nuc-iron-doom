@@ -59,7 +59,7 @@
        (try (check (= (s 'gametic) 2134) "2134 gametics"))
        (when-some (t (s 'tichash))
          (let (v (string-as-view &t))
-           (try (check (strview-has-suffix v (strview-from-cstr "2133 86 207 8f22bba2 254 0/68/2/20/9/0\n"))
+           (try (check (strview-has-suffix v (strview-from-cstr "2133 107 207 8f22bba2 254 0/68/2/20/9/0\n"))
                        "demo3's last tic"))))))))
 
 ; The intermission after E1M3, part way through counting, drawn to

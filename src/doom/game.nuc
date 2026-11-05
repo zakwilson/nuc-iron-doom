@@ -56,6 +56,7 @@
 (import-use doom.input)
 (import-use doom.cheats)
 (import-use doom.automap)
+(import-use doom.mixer)
 (import-use doom.wad)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
@@ -121,6 +122,9 @@
   demo-sequence:i32 page:?CStr page-tic:i32 advance-demo:bool
   ; M_Random for a wipe with no game to draw it from.
   page-random:Random
+  mixer:Mixer
+  ; The session's level loads when the sound layer last looked (S_Start).
+  snd-loads:i32
   tic:i32
   quit:bool)
 
@@ -129,7 +133,7 @@
         menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL)))
     (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
                   (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) false 0 -1 none 0 false (random-new) 0 false))))
+                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) false 0 -1 none 0 false (random-new) (mixer-new) 0 0 false))))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -230,10 +234,19 @@
              (set! ((player-at w (unsafe/cast usize ((ref w 'rules) 'console-player))) 'message)
                    (some (unsafe/cast CStr (t 'data)))))))
         ((view-size) (set-view-size (ref g 'renderer) (m 'screenblocks)))
-        ; The sound layer is milestone 7's.
-        ((sound n) 0)))
+        ((sound n) (menu-sound g n))))
     (clear! (ref m 'requests)))
   (return (ok)))
+
+; S_StartSound from nowhere, for the menus: M_Random is the game's if one is
+; running.
+(defn- menu-sound (g:&Game sfx:i32):void
+  (let (volume (* 8 ((ref g 'menu) 'sfx-volume))
+        r (match (g 'session)
+            ((some s) (match (s 'world) ((some w) (ref w 'random)) ((none) (ref s 'random))))
+            ((none) (ref g 'page-random)))
+        ev (SoundEvent sfx none none volume NORM-SEP (vary-pitch r sfx NORM-PITCH) false))
+    (mixer-start (ref g 'mixer) (ref (ref g 'assets) 'wad) &ev)))
 
 (defn- new-session (g:&Game):(Fallible &Session)
   (let (a (ref g 'assets) s (try (session-new a (game-mode a))))
@@ -326,6 +339,10 @@
       (set! (g 'camera) (some (camera-new (player &ll))))))
   (when-some (s (g 'session))
     (set! (s 'menu-active) ((ref g 'menu) 'active))
+    ; snd_SfxVolume, which decides what S_StartSound draws.
+    (let (v (* 8 ((ref g 'menu) 'sfx-volume)))
+      (set! ((ref s 'rules) 'sfx-volume) v)
+      (when-some (w (s 'world)) (set! ((ref w 'rules) 'sfx-volume) v)))
     (let (cmd (if ((ref g 'menu) 'active) (ticcmd-zero)
                 (build-ticcmd (ref g 'cmd-turn-held) (not (automap-panning? (ref g 'automap))))))
       (when (g 'send-pause)
@@ -333,6 +350,10 @@
         (set! (cmd 'buttons) (bit-or BT-SPECIAL BTS-PAUSE)))
       (when (some? (s 'record)) (lowres-turn &cmd (ref g 'turn-carry)))
       (try (session-tic s (ref g 'assets) cmd))
+      (when (!= (s 'loads) (g 'snd-loads))
+        (set! (g 'snd-loads) (s 'loads))
+        (mixer-stop-all (ref g 'mixer)))
+      (when-some (w (s 'world)) (mixer-events (ref g 'mixer) (ref (ref g 'assets) 'wad) w))
       (automap-tic g s))
     ; G_CheckDemoStatus: -playdemo and -timedemo quit, the attract loop goes on.
     (when (s 'demo-ended)
@@ -482,6 +503,8 @@
       (when (!= (s 'forced-wipes) (g 'seen-forced-wipes))
         (set! (g 'seen-forced-wipes) (s 'forced-wipes))
         (set! (g 'wipe-state) -1))))
+  ; S_UpdateSounds, between the tics and the drawing.
+  (mixer-update (ref g 'mixer) (match (g 'session) ((some s) (s 'world)) ((none) none)))
   (let (gs (match (g 'page) ((some p) GS-DEMOSCREEN)
              ((none) (match (g 'session) ((some s) (s 'gamestate)) ((none) GS-DEMOSCREEN))))
         start:?Buffer (if (!= gs (g 'wipe-state)) (some (copy-of (ref g 'screen))) none))

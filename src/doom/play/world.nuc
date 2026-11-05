@@ -14,6 +14,7 @@
 (import-use nucleus.slice)
 (import-use nucleus.vector)
 (import-use nucleus.coll)
+(import-use nucleus.math)
 (import-use doom.error)
 (import-use doom.util)
 (import-use doom.fixed)
@@ -88,9 +89,9 @@
 (defstruct Thinker prev:?&Thinker next:?&Thinker removed:bool idle:bool think:Think)
 
 ; A switch waiting to flip back (button_t). `where` is a ButtonWhere.
-; `sound-org` is false where vanilla's soundorg pointer is null.
-(defstruct Button line:usize where:i32 texture:i32 timer:i32
-  sound-org:bool sound-x:Fixed sound-y:Fixed)
+; `sound-sector` is the sector whose sound origin vanilla's soundorg points
+; at, none where it is null.
+(defstruct Button line:usize where:i32 texture:i32 timer:i32 sound-sector:?usize)
 
 ; An animated flat or texture range (anim_t).
 (defstruct Anim is-texture:bool pic-num:i32 base-pic:i32 num-pics:i32 speed:i32)
@@ -183,12 +184,18 @@
 ; A sound the playsim started: the game layer plays and then clears them.
 ; `located` is false for a sound at no place, which the whole level hears;
 ; `origin` is the mobj it follows, if any.
-(defstruct SoundEvent sfx:i32 origin:?&Mobj located:bool x:Fixed y:Fixed stop:bool)
+; A sound for the game layer's channels: S_StartSound's decision, made where
+; vanilla makes it, or S_StopSound. The origin is a mobj, a sector's sound
+; origin, or neither.
+(defstruct SoundEvent sfx:i32 origin:?&Mobj sector:?usize volume:i32 sep:i32 pitch:i32
+  stop:bool)
 
 ; --- the world -------------------------------------------------------------------
 
 ; How the game is being played (vanilla's globals of the same names).
-(defstruct Rules skill:i32 deathmatch:i32 netgame:bool no-monsters:bool respawn-monsters:bool
+; `sfx-volume` is snd_SfxVolume (the menu's 0-15, times 8): S_StartSound
+; reads it, and it decides whether a sound draws from M_Random.
+(defstruct Rules sfx-volume:i32 skill:i32 deathmatch:i32 netgame:bool no-monsters:bool respawn-monsters:bool
   fast:bool mode:i32 episode:i32 map:i32 console-player:i32 demo-playback:bool
   ; Ultimate Doom's executable or later (gameversion >= exe_ultimate).
   ultimate:bool
@@ -411,22 +418,86 @@
       (dotimes (i:usize MAXPLATS) (conj (ref w 'active-plats) np)))
     (return w)))
 
-; Sounds go to the game layer through the world's queue (S_StartSound).
+; --- sounds (s_sound.c) ----------------------------------------------------------
+; S_StartSound decides a sound's volume and separation, and draws M_Random for
+; its pitch, in the middle of the tic. It's done here, where the positions are
+; the ones vanilla sees, and the channels are left to the game layer.
+
+(defconst S-CLIPPING-DIST (* 1200 65536))
+(defconst S-CLOSE-DIST (* 200 65536))
+(defconst S-ATTENUATOR 1000)
+(defconst S-STEREO-SWING (* 96 65536))
+(defconst NORM-SEP 128)
+(defconst NORM-PITCH 128)
+
+(defstruct SoundParams volume:i32 sep:i32)
+
+; S_AdjustSoundParams: none when out of earshot. E1M8 (and every map 8)
+; carries its sounds across the whole map.
+(defn sound-params (w:&World listener:&Mobj x:Fixed y:Fixed volume:i32):?SoundParams
+  (let (adx (iabs (- (listener 'x) x)) ady (iabs (- (listener 'y) y))
+        dist (- (+ adx ady) (bit-shr (if (< adx ady) adx ady) 1))
+        map8 (= ((ref w 'rules) 'map) 8)
+        sfxv ((ref w 'rules) 'sfx-volume))
+    (when (and (not map8) (> dist S-CLIPPING-DIST)) (return none))
+    (let (angle (point-to-angle2 (listener 'x) (listener 'y) x y)
+          la (listener 'angle))
+      (set! angle (if (> angle la) (- angle la) (+ angle (- 0xffffffff la))))
+      (let (sep (- 128 (bit-shr (fixed-mul S-STEREO-SWING (finesine (fine-index angle))) FRACBITS))
+            vol (cond (< dist S-CLOSE-DIST) sfxv
+                      map8 (+ 15 (/ (* (- sfxv 15) (bit-shr (- S-CLIPPING-DIST (min dist S-CLIPPING-DIST)) FRACBITS))
+                                    S-ATTENUATOR))
+                      true (/ (* sfxv (bit-shr (- S-CLIPPING-DIST dist) FRACBITS)) S-ATTENUATOR)))
+        (return (if (> vol 0) (some (SoundParams vol sep)) none))))))
+
+; The console player's body, which hears.
+(defn listener (w:&World):?&Mobj
+  (return ((player-at w (unsafe/cast usize ((ref w 'rules) 'console-player))) 'mo)))
+
+; S_StartSound's pitch variation, from M_Random: the chainsaw's a little, the
+; rest more, the item pickup and tink not at all.
+(defn vary-pitch (r:&Random sfx:i32 pitch:i32):i32
+  (let (p pitch)
+    (cond (and (>= sfx SFX-SAWUP) (<= sfx SFX-SAWHIT)) (set! p (+ p (- 8 (bit-and (m-random r) 15))))
+          (and (!= sfx SFX-ITEMUP) (!= sfx SFX-TINK)) (set! p (+ p (- 16 (bit-and (m-random r) 31))))
+          true 0)
+    (return (max 0 (min p 255)))))
+
+(defn- start-sound-at (w:&World origin:?&Mobj sector:?usize x:Fixed y:Fixed sfx:i32):void
+  (let (volume ((ref w 'rules) 'sfx-volume) pitch NORM-PITCH sep NORM-SEP
+        lmo (listener w)
+        positioned (or (some? sector)
+                       (match origin
+                         ((some m) (match lmo ((some l) (not (same? m l))) ((none) true)))
+                         ((none) false))))
+    ; chgun is the one link: the pistol at pitch 150, and silent at volume 0.
+    (when (= sfx SFX-CHGUN)
+      (set! pitch 150)
+      (when (< volume 1) (return)))
+    (when positioned
+      (match lmo
+        ((some l)
+         (match (sound-params w l x y volume)
+           ((some sp) (set! volume (sp 'volume))
+                      (set! sep (if (and (= x (l 'x)) (= y (l 'y))) NORM-SEP (sp 'sep))))
+           ((none) (return))))
+        ((none) 0)))
+    (conj (ref w 'sounds) (SoundEvent sfx origin sector volume sep (vary-pitch (ref w 'random) sfx pitch) false))))
+
+; S_StartSound from a mobj, or from nowhere.
 (defn start-sound (w:&World origin:?&Mobj sfx:i32):void
   (match origin
-    ((some m) (conj (ref w 'sounds) (SoundEvent sfx origin true (m 'x) (m 'y) false)))
-    ((none) (conj (ref w 'sounds) (SoundEvent sfx none false 0 0 false)))))
+    ((some m) (start-sound-at w origin none (m 'x) (m 'y) sfx))
+    ((none) (start-sound-at w none none 0 0 sfx))))
 
-; A sound from a sector's sound origin (its bounding box centre).
+; S_StartSound from a sector's sound origin (its bounding box centre).
 (defn start-sector-sound (w:&World sector:usize sfx:i32):void
   (let (s (sector-at (ref w 'level) sector))
-    (conj (ref w 'sounds) (SoundEvent sfx none true (s 'sound-x) (s 'sound-y) false))))
+    (start-sound-at w none (some sector) (s 'sound-x) (s 'sound-y) sfx)))
 
 ; S_StopSound.
-; ISSUE-007: a parameter named `origin` would make (origin 'x) the field's
-; designated initializer.
 (defn stop-sound (w:&World mo:&Mobj):void
-  (conj (ref w 'sounds) (SoundEvent 0 (some mo) true (mo 'x) (mo 'y) true)))
+  (conj (ref w 'sounds) (SoundEvent 0 (some mo) none 0 0 0 true)))
 
 ; G_InitNew's players: all reborn, so each is set up at its first spawn.
 (defn new-game-players ():(Vector Player)
@@ -439,7 +510,7 @@
 
 ; A single-player game's rules.
 (defn single-player-rules (skill:i32 mode:i32 episode:i32 m:i32):Rules
-  (return (Rules skill 0 false false false false mode episode m 0 false (= mode RETAIL) 0 false)))
+  (return (Rules 64 skill 0 false false false false mode episode m 0 false (= mode RETAIL) 0 false)))
 
 ; Only player 1 in the game.
 (defn single-player-in-game ():(Vector bool)

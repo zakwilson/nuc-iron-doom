@@ -27,8 +27,7 @@
     (dotimes (i:usize MAXBUTTONS)
       (let (b (&buttons i))
         (when (= (b 'timer) 0)
-          (let (s (sector-at l (unwrap-or ((line-at l li) 'front-sector) 0)))
-            (set! @b (Button li where texture time true (s 'sound-x) (s 'sound-y))))
+          (set! @b (Button li where texture time ((line-at l li) 'front-sector)))
           (return (ok))))))
   (fail "P_StartButton: no button slots left!"))
 
@@ -48,9 +47,9 @@
       (dotimes (i:usize (count switches))
         (let (t (switches i) where (cond (= t top) BW-TOP (= t mid) BW-MIDDLE (= t bot) BW-BOTTOM true -1))
           (when (>= where 0)
-            (if (b0 'sound-org)
-              (conj (ref w 'sounds) (SoundEvent sound none true (b0 'sound-x) (b0 'sound-y) false))
-              (start-sound w none sound))
+            (match (b0 'sound-sector)
+              ((some sec) (start-sector-sound w sec sound))
+              ((none) (start-sound w none sound)))
             (let (other (switches (bit-xor i 1)))
               (case where
                 BW-TOP (set! (side 'top-texture) other)

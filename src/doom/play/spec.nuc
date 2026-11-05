@@ -504,10 +504,10 @@
                   BW-MIDDLE (set! (side 'mid-texture) (b 'texture))
                   BW-BOTTOM (set! (side 'bottom-texture) (b 'texture))
                   0))
-              (if (b 'sound-org)
-                (conj (ref w 'sounds) (SoundEvent SFX-SWTCHN none true (b 'sound-x) (b 'sound-y) false))
-                (start-sound w none SFX-SWTCHN))
-              (set! @b (Button 0 0 0 0 false 0 0))))))))
+              (match (b 'sound-sector)
+                ((some sec) (start-sector-sound w sec SFX-SWTCHN))
+                ((none) (start-sound w none SFX-SWTCHN)))
+              (set! @b (Button 0 0 0 0 none))))))))
   (return (ok)))
 
 ; EV_DoDonut: the pillar sinks while the slime around it rises.
@@ -575,5 +575,5 @@
       (dotimes (i:usize MAXCEILINGS) (set (ref w 'active-ceilings) i nc))
       (dotimes (i:usize MAXPLATS) (set (ref w 'active-plats) i np)))
     (truncate! (ref w 'buttons) 0)
-    (dotimes (i:usize MAXBUTTONS) (conj (ref w 'buttons) (Button 0 0 0 0 false 0 0))))
+    (dotimes (i:usize MAXBUTTONS) (conj (ref w 'buttons) (Button 0 0 0 0 none))))
   (return (ok)))

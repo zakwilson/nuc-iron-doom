@@ -1,0 +1,65 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom sounds.c, sounds.h); this port is GPLv3,
+; see COPYING.
+;
+; The sound effects' lump names and priorities, and the music's. The SFX-*
+; numbers are doom.info's.
+
+(ns doom.sounds)
+
+(defenum MusicNum
+  MUS-NONE MUS-E1M1 MUS-E1M2 MUS-E1M3 MUS-E1M4 MUS-E1M5 MUS-E1M6 MUS-E1M7
+  MUS-E1M8 MUS-E1M9 MUS-E2M1 MUS-E2M2 MUS-E2M3 MUS-E2M4 MUS-E2M5 MUS-E2M6
+  MUS-E2M7 MUS-E2M8 MUS-E2M9 MUS-E3M1 MUS-E3M2 MUS-E3M3 MUS-E3M4 MUS-E3M5
+  MUS-E3M6 MUS-E3M7 MUS-E3M8 MUS-E3M9 MUS-INTER MUS-INTRO MUS-BUNNY MUS-VICTOR
+  MUS-INTROA MUS-RUNNIN MUS-STALKS MUS-COUNTD MUS-BETWEE MUS-DOOM MUS-THE-DA MUS-SHAWN
+  MUS-DDTBLU MUS-IN-CIT MUS-DEAD MUS-STLKS2 MUS-THEDA2 MUS-DOOM2 MUS-DDTBL2 MUS-RUNNI2
+  MUS-DEAD2 MUS-STLKS3 MUS-ROMERO MUS-SHAWN2 MUS-MESSAG MUS-COUNT2 MUS-DDTBL3 MUS-AMPIE
+  MUS-THEDA3 MUS-ADRIAN MUS-MESSG2 MUS-ROMER2 MUS-TENSE MUS-SHAWN3 MUS-OPENIN MUS-EVIL
+  MUS-ULTIMA MUS-READ-M MUS-DM2TTL MUS-DM2INT NUMMUSIC)
+
+; Lump names without their DS prefix.
+(defvar SFX-NAMES:(array CStr 109) (array CStr
+  "none" "pistol" "shotgn" "sgcock" "dshtgn" "dbopn" "dbcls" "dbload"
+  "plasma" "bfg" "sawup" "sawidl" "sawful" "sawhit" "rlaunc" "rxplod"
+  "firsht" "firxpl" "pstart" "pstop" "doropn" "dorcls" "stnmov" "swtchn"
+  "swtchx" "plpain" "dmpain" "popain" "vipain" "mnpain" "pepain" "slop"
+  "itemup" "wpnup" "oof" "telept" "posit1" "posit2" "posit3" "bgsit1"
+  "bgsit2" "sgtsit" "cacsit" "brssit" "cybsit" "spisit" "bspsit" "kntsit"
+  "vilsit" "mansit" "pesit" "sklatk" "sgtatk" "skepch" "vilatk" "claw"
+  "skeswg" "pldeth" "pdiehi" "podth1" "podth2" "podth3" "bgdth1" "bgdth2"
+  "sgtdth" "cacdth" "skldth" "brsdth" "cybdth" "spidth" "bspdth" "vildth"
+  "kntdth" "pedth" "skedth" "posact" "bgact" "dmact" "bspact" "bspwlk"
+  "vilact" "noway" "barexp" "punch" "hoof" "metal" "chgun" "tink"
+  "bdopn" "bdcls" "itmbk" "flame" "flamst" "getpow" "bospit" "boscub"
+  "bossit" "bospn" "bosdth" "manatk" "mandth" "sssit" "ssdth" "keenpn"
+  "keendt" "skeact" "skesit" "skeatk" "radio"))
+
+(defvar SFX-PRIORITY:(array i32 109) (array i32
+  0 64 64 64 64 64 64 64 64 64 64 118
+  64 64 64 70 70 70 100 100 100 100 119 78
+  78 96 96 96 96 96 96 78 78 78 96 32
+  98 98 98 98 98 98 98 94 92 90 90 90
+  90 90 90 70 70 70 70 70 70 32 32 70
+  70 70 70 70 70 70 70 32 32 32 32 32
+  32 32 32 120 120 120 100 100 100 78 60 64
+  70 70 64 60 100 100 100 32 32 60 70 70
+  70 70 70 70 70 70 70 70 70 70 70 70
+  60))
+
+; The one link: chgun plays the pistol at pitch 150.
+(defconst SFX-CHGUN-LINK-PITCH 150)
+(defconst SFX-CHGUN-LINK-VOLUME 0)
+
+; Lump names without their D_ prefix; the first is none.
+(defvar MUSIC-NAMES:(array CStr 68) (array CStr
+  "" "e1m1" "e1m2" "e1m3" "e1m4" "e1m5" "e1m6" "e1m7"
+  "e1m8" "e1m9" "e2m1" "e2m2" "e2m3" "e2m4" "e2m5" "e2m6"
+  "e2m7" "e2m8" "e2m9" "e3m1" "e3m2" "e3m3" "e3m4" "e3m5"
+  "e3m6" "e3m7" "e3m8" "e3m9" "inter" "intro" "bunny" "victor"
+  "introa" "runnin" "stalks" "countd" "betwee" "doom" "the_da" "shawn"
+  "ddtblu" "in_cit" "dead" "stlks2" "theda2" "doom2" "ddtbl2" "runni2"
+  "dead2" "stlks3" "romero" "shawn2" "messag" "count2" "ddtbl3" "ampie"
+  "theda3" "adrian" "messg2" "romer2" "tense" "shawn3" "openin" "evil"
+  "ultima" "read_m" "dm2ttl" "dm2int"))

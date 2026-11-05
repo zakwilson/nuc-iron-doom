@@ -2,4 +2,4 @@
  :tests "src/tests/main.nuc"
  ; SDL's headers sit on clang's default include path, so the header index never
  ; maps them to a package (old nuc-doom ISSUE-001).
- :pkg-config {"SDL2/SDL.h" ["sdl2"]}}
+ :pkg-config {"SDL2/SDL.h" ["sdl2"] "SDL2/SDL_mixer.h" ["SDL2_mixer"]}}
