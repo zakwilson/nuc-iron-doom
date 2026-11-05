@@ -59,3 +59,10 @@
     (set! (cmd 'forward-move) (max (- 0 MAXPLMOVE) (min forward MAXPLMOVE)))
     (set! (cmd 'side-move) (max (- 0 MAXPLMOVE) (min side MAXPLMOVE)))
     (return cmd)))
+
+; Chocolate Doom's lowres_turn while recording: the turn rounds to the demo's
+; one byte, and what that loses carries to the next tic.
+(defn lowres-turn (cmd:&TicCmd carry:&i32):void
+  (let (desired (unsafe/cast i32 (unsafe/cast i16 (+ (cmd 'angle-turn) @carry))))
+    (set! (cmd 'angle-turn) (unsafe/cast i32 (unsafe/cast i16 (bit-and (+ desired 128) 0xff00))))
+    (set! @carry (unsafe/cast i32 (unsafe/cast i16 (- desired (cmd 'angle-turn)))))))

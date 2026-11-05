@@ -16,6 +16,7 @@
 (import-use nucleus.string)
 (import-use nucleus.fmt)
 (import-use nucleus.io)
+(import-use nucleus.parse)
 (import-use nucleus.create)
 (import-use doom.error)
 (import-use doom.util)
@@ -84,12 +85,14 @@
   turn-held:ui32
   ; The same for G_BuildTiccmd's turnheld.
   cmd-turn-held:i32
+  ; lowres_turn's carry, while recording.
+  turn-carry:i32
   tic:i32
   quit:bool)
 
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
   (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
-                (Mode-setup) none none none none (view-new) none (renderer-new 11) 0 0 0 false)))
+                (Mode-setup) none none none none (view-new) none (renderer-new 11) 0 0 0 0 false)))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -110,17 +113,42 @@
     (when (some? ((ref g 'cl) 'tichash)) (set! (s 'tichash) (some (make String))))
     (return (ok s))))
 
+; Phase A's level: Iron Doom's float player on its own map.
 (defn- load-level (g:&Game episode:i32 m:i32):(Fallible void)
   (let (a (ref g 'assets))
-    (if ((ref g 'cl) 'iron-render)
-      (if-some (mp (find-map a episode m))
-        (let (l (try (level-load &mp (ref a 'flats) (ref a 'textures))))
-          (set! (g 'camera) (some (camera-new (player &l))))
-          (set! (g 'level) (some l)))
-        (fail "Tried to load invalid map: E" episode "M" m))
-      (let (s (try (new-session g)))
-        (try (session-init-new s a SK-MEDIUM episode m))
-        (set! (g 'session) (some s)))))
+    (if-some (mp (find-map a episode m))
+      (let (l (try (level-load &mp (ref a 'flats) (ref a 'textures))))
+        (set! (g 'camera) (some (camera-new (player &l))))
+        (set! (g 'level) (some l)))
+      (fail "Tried to load invalid map: E" episode "M" m)))
+  (return (ok)))
+
+; -warp, -skill and -record start a game at once, without the title.
+(defn- autostart? (cl:&CommandLine):bool
+  (return (or (some? (cl 'warp)) (some? (cl 'skill)) (some? (cl 'record)))))
+
+; D_DoomMain reads a Doom 1 warp's episode and map as one digit each.
+(defn- first-digit (v:StrView):i32
+  (return (if (= (v 'len) 0) 0 (- (as i32 @(unsafe/cast &ui8 (v 'data))) 48))))
+
+; G_InitNew with the command line's skill, map and monster options.
+(defn- start-game (g:&Game):(Fallible void)
+  (let (a (ref g 'assets) cl (ref g 'cl) s (try (new-session g)) r (ref s 'rules)
+        skill (if-some (k (cl 'skill)) (- k 1) SK-MEDIUM)
+        ep 1 mp 1)
+    (when-some (w (cl 'warp))
+      (if (= (r 'mode) COMMERCIAL)
+        (match (parse i32 (ref w 'first))
+          ((ok n) (set! mp n))
+          ((err e) (set! mp 0)))
+        (do (set! ep (first-digit (w 'first)))
+            (when-some (m (w 'second)) (set! mp (first-digit m))))))
+    (set! (r 'fast) (cl 'fast))
+    (set! (r 'respawn-parm) (cl 'respawn))
+    (set! (r 'no-monsters) (cl 'no-monsters))
+    (try (session-init-new s a skill ep mp))
+    (when (some? (cl 'record)) (session-begin-recording s))
+    (set! (g 'session) (some s)))
   (return (ok)))
 
 ; -playdemo and -timedemo start at once, without the title.
@@ -146,7 +174,9 @@
       (player-tic (player &ll) &a (ref g 'turn-held))
       (set! (g 'camera) (some (camera-new (player &ll))))))
   (when-some (s (g 'session))
-    (try (session-tic s (ref g 'assets) (build-ticcmd (ref g 'cmd-turn-held))))
+    (let (cmd (build-ticcmd (ref g 'cmd-turn-held)))
+      (when (some? (s 'record)) (lowres-turn &cmd (ref g 'turn-carry)))
+      (try (session-tic s (ref g 'assets) cmd)))
     ; G_CheckDemoStatus quits after a -playdemo or -timedemo, and without a
     ; finale yet so does the episode's end.
     (when (or (s 'demo-ended) (s 'finished)) (set! (g 'quit) true)))
@@ -213,10 +243,13 @@
          (if-some (d (demo-lump (ref g 'cl)))
            (do (try (start-demo g d))
                (set! (g 'pending) (some (Mode-level))))
-           (set! (g 'pending) (some (Mode-intro 0)))))
+           (if (and (autostart? (ref g 'cl)) (not ((ref g 'cl) 'iron-render)))
+             (do (try (start-game g))
+                 (set! (g 'pending) (some (Mode-level))))
+             (set! (g 'pending) (some (Mode-intro 0))))))
         ((intro e) 0) ((level) 0) ((melt) 0))
       (when title-done
-        (try (load-level g 1 1))
+        (if ((ref g 'cl) 'iron-render) (try (load-level g 1 1)) (try (start-game g)))
         (set! (g 'pending) (some (Mode-level))))
       ; A scene change other than into or out of the melt starts one: the old
       ; screen is kept, the new scene drawn, and the melt shows the old screen first.
@@ -254,5 +287,10 @@
       (when (some? (cl 'timedemo))
         (println "timed " (s 'gametic) " gametics in " (- (SDL_GetTicks64) start-ms) " ms"))
       (when-some (path (cl 'tichash))
-        (try (session-write-tichash s path)))))
+        (try (session-write-tichash s path)))
+      (when-some (name (cl 'record))
+        (let (path (make String))
+          (str-into &path name)
+          (str-into &path (strview-from-cstr ".lmp"))
+          (try (session-end-recording s (string-as-view &path)))))))
   (return (ok)))

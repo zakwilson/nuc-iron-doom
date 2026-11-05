@@ -37,8 +37,9 @@
 (defconst DOOM-VERSION 109)
 (defconst DEMOMARKER 0x80)
 
-; A demo being played back: the lump and the read position.
-(defstruct Demo data:Bytes pos:usize)
+; A demo being played back: the lump and the read position. A demo from a
+; file keeps the file's bytes in `file`, which `data` views.
+(defstruct Demo data:Bytes pos:usize file:?String)
 
 (defstruct Session
   pics:PicData
@@ -55,13 +56,15 @@
   ; The game ended: the shareware episode's last map was finished.
   finished:bool
   ; -tichash's lines, written when the session ends.
-  tichash:?String)
+  tichash:?String
+  ; The demo being recorded, header first; written out at the end.
+  record:?(Vector ui8))
 
 (defn session-new (a:&Assets mode:i32):(Fallible &Session)
   (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
                        (single-player-rules SK-MEDIUM mode 1 1)
                        (single-player-in-game) (new-game-players) (random-new)
-                       none 0 none false false none))))
+                       none 0 none false false none none))))
 
 ; D_IdentifyVersion: told apart by which maps the IWAD has.
 (defn game-mode (a:&Assets):i32
@@ -142,28 +145,42 @@
     (set! (d 'pos) (+ (d 'pos) 1))
     (return (ok b))))
 
+; Chocolate Doom's -playdemo NAME: NAME.lmp (or NAME, ending in .lmp) from
+; disk if there is one, else the lump NAME.
+(defn- find-demo (a:&Assets arg:StrView):(Fallible Demo)
+  (let (path (make String) lmp (strview-from-cstr ".lmp"))
+    (str-into &path arg)
+    (when (not (strview-has-suffix arg lmp)) (str-into &path lmp))
+    (let (pv (string-as-view &path))
+      (match (file-open-read &pv)
+        ((ok f)
+         (with (ff f)
+           (let (bytes (try (file-read-to-string ff)) v (string-as-view &bytes))
+             (return (ok (Demo (slice-of (v 'data) (v 'len)) 0 (some bytes)))))))
+        ((err e) 0))))
+  (match (lump-index (ref a 'wad) (name arg))
+    ((none) (fail "no demo file or lump " arg))
+    ((some li) (return (ok (Demo ((lump-at (ref a 'wad) li) 'data) 0 none))))))
+
 ; G_DoPlayDemo: the header, then G_InitNew. Only the v1.9 format.
-(defn session-play-demo (s:&Session a:&Assets lump:StrView):(Fallible void)
-  (match (lump-index (ref a 'wad) (name lump))
-    ((none) (fail "no demo lump " lump))
-    ((some li)
-     (let (d (Demo ((lump-at (ref a 'wad) li) 'data) 0)
-           version (try (demo-byte &d)))
-       (when (!= version DOOM-VERSION)
-         (fail "Demo is from a different game version! (read " version ", should be " DOOM-VERSION ")"))
-       (let (skill (try (demo-byte &d)) episode (try (demo-byte &d)) mp (try (demo-byte &d))
-             r (ref s 'rules))
-         (set! (r 'deathmatch) (try (demo-byte &d)))
-         (set! (r 'respawn-parm) (!= (try (demo-byte &d)) 0))
-         (set! (r 'fast) (!= (try (demo-byte &d)) 0))
-         (set! (r 'no-monsters) (!= (try (demo-byte &d)) 0))
-         (set! (r 'console-player) (try (demo-byte &d)))
-         (dotimes (i:usize MAXPLAYERS)
-           (set (ref s 'in-game) i (!= (try (demo-byte &d)) 0)))
-         (when ((ref s 'in-game) 1) (set! (r 'netgame) true))
-         (try (session-init-new s a skill episode mp))
-         (set! (r 'demo-playback) true)
-         (set! (s 'demo) (some d))))))
+(defn session-play-demo (s:&Session a:&Assets arg:StrView):(Fallible void)
+  (let (d (try (find-demo a arg))
+        version (try (demo-byte &d)))
+    (when (!= version DOOM-VERSION)
+      (fail "Demo is from a different game version! (read " version ", should be " DOOM-VERSION ")"))
+    (let (skill (try (demo-byte &d)) episode (try (demo-byte &d)) mp (try (demo-byte &d))
+          r (ref s 'rules))
+      (set! (r 'deathmatch) (try (demo-byte &d)))
+      (set! (r 'respawn-parm) (!= (try (demo-byte &d)) 0))
+      (set! (r 'fast) (!= (try (demo-byte &d)) 0))
+      (set! (r 'no-monsters) (!= (try (demo-byte &d)) 0))
+      (set! (r 'console-player) (try (demo-byte &d)))
+      (dotimes (i:usize MAXPLAYERS)
+        (set (ref s 'in-game) i (!= (try (demo-byte &d)) 0)))
+      (when ((ref s 'in-game) 1) (set! (r 'netgame) true))
+      (try (session-init-new s a skill episode mp))
+      (set! (r 'demo-playback) true)
+      (set! (s 'demo) (some d))))
   (return (ok)))
 
 ; G_ReadDemoTiccmd: the end marker ends playback and leaves cmd alone.
@@ -185,6 +202,51 @@
          (set! (cmd 'buttons) buttons))
        (set! (s 'demo) (some d))
        (return (ok))))))
+
+; G_BeginRecording: the v1.9 header for the game just started.
+(defn session-begin-recording (s:&Session):void
+  (let (r (ref s 'rules) d (make (Vector ui8)))
+    (push-byte &d DOOM-VERSION)
+    (push-byte &d (r 'skill))
+    (push-byte &d (r 'episode))
+    (push-byte &d (r 'map))
+    (push-byte &d (r 'deathmatch))
+    (push-byte &d (if (r 'respawn-parm) 1 0))
+    (push-byte &d (if (r 'fast) 1 0))
+    (push-byte &d (if (r 'no-monsters) 1 0))
+    (push-byte &d (r 'console-player))
+    (dotimes (i:usize MAXPLAYERS) (conj &d (if ((ref s 'in-game) i) (as ui8 1) (as ui8 0))))
+    (set! (s 'record) (some d))))
+
+; G_WriteDemoTiccmd: the cmd as the demo keeps it, then read back so play
+; goes on from exactly what was recorded.
+(defn- write-demo-ticcmd (s:&Session cmd:&TicCmd):void
+  (when-some (rec (s 'record))
+    (let (d rec)
+      (push-byte &d (cmd 'forward-move))
+      (push-byte &d (cmd 'side-move))
+      (push-byte &d (bit-shr (cmd 'angle-turn) 8))
+      (push-byte &d (cmd 'buttons))
+      (set! (s 'record) (some d))
+      (let (n (count &d))
+        (set! (cmd 'forward-move) (signed-byte (as i32 (&d (- n 4)))))
+        (set! (cmd 'side-move) (signed-byte (as i32 (&d (- n 3)))))
+        (set! (cmd 'angle-turn) (unsafe/cast i32 (unsafe/cast i16 (bit-shl (as i32 (&d (- n 2))) 8))))
+        (set! (cmd 'buttons) (as i32 (&d (- n 1))))))))
+
+; G_CheckDemoStatus's end of recording: the marker, then the file.
+(defn session-end-recording (s:&Session path:StrView):(Fallible void)
+  (when-some (rec (s 'record))
+    (let (d rec)
+      (conj &d (as ui8 DEMOMARKER))
+      (with (f (try (file-create &path)))
+        (try (file-write-bytes f (unsafe/cast &ui8 ((view &d) 'data)) (count &d))))
+      (set! (s 'record) none)))
+  (return (ok)))
+
+(defn- push-byte (d:&(Vector ui8) b:i32):void (conj d (unsafe/cast ui8 (bit-and b 255))))
+
+(defn- signed-byte (b:i32):i32 (return (if (> b 127) (- b 256) b)))
 
 ; G_PlayerFinishLevel: what doesn't carry to the next level.
 (defn- player-finish-level (p:&Player):void
@@ -283,7 +345,8 @@
         (let (p (player-at w i))
           (set! (p 'cmd) (if (= i cp) cmd (ticcmd-zero)))
           (when ((ref s 'rules) 'demo-playback)
-            (try (read-demo-ticcmd s (ref p 'cmd)))))))
+            (try (read-demo-ticcmd s (ref p 'cmd))))
+          (write-demo-ticcmd s (ref p 'cmd)))))
     (when (s 'demo-ended) (return (ok)))
     (try (ticker w))
     ; ST_Ticker's st_randomnumber.

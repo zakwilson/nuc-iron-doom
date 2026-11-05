@@ -168,6 +168,20 @@
     (set! @dst (some (Framedump tics (try (value-arg a i flag)))))
     (return (ok))))
 
+; -warp: "E M" or "M", read once the IWAD says which (D_DoomMain). Unlike
+; vanilla, a following flag isn't taken as the map.
+(defstruct Warp first:StrView second:?StrView)
+
+(defn read-option (dst:&?Warp a:&(Slice StrView) i:&usize flag:StrView):(Fallible void)
+  (let (f (try (value-arg a i flag)) second:?StrView none)
+    (when (< (+ @i 1) (count a))
+      (let (nx @(a (+ @i 1)))
+        (when (not (param? &nx))
+          (inc! @i)
+          (set! second (some nx)))))
+    (set! @dst (some (Warp f second)))
+    (return (ok))))
+
 (defn last-tic (fd:&Framedump):i32
   (let (m 0 v (view (ref fd 'tics)))
     (dotimes (i:usize (count &v)) (set! m (max m @(&v i))))
@@ -211,7 +225,8 @@
                     "Load extra command line arguments from the given response file")))))
 
 (defstruct CommandLine iwad:?StrView framedump:?Framedump iron-render:bool
-  playdemo:?StrView timedemo:?StrView tichash:?StrView)
+  playdemo:?StrView timedemo:?StrView tichash:?StrView
+  warp:?Warp skill:?i32 record:?StrView fast:bool respawn:bool no-monsters:bool)
 
 (defoptions CommandLine
   (iwad "-iwad" "FILE" "Specify an IWAD file to use")
@@ -219,13 +234,19 @@
   (iron-render "-ironrender" "" "Draw levels with Iron Doom's renderer (walls and sky only), for comparing frames with it")
   (playdemo "-playdemo" "LUMP" "Play back the demo in this lump, then exit")
   (timedemo "-timedemo" "LUMP" "Play back the demo as fast as possible, then print the gametics it took")
-  (tichash "-tichash" "FILE" "Write one line of the playsim's state per gametic to FILE"))
+  (tichash "-tichash" "FILE" "Write one line of the playsim's state per gametic to FILE")
+  (warp "-warp" "[E] M" "Start a game at once on this map (episode and map for Doom 1)")
+  (skill "-skill" "N" "Start a game at once at this skill, 1 to 5")
+  (record "-record" "NAME" "Record a demo to NAME.lmp")
+  (fast "-fast" "" "Fast monsters")
+  (respawn "-respawn" "" "Monsters respawn")
+  (no-monsters "-nomonsters" "" "No monsters"))
 
 (defn command-line-from (args:&Args):(Fallible CommandLine)
   (let (a1 (try (legacy-response-files args))
         a2 (try (load-response-files &a1))
         s (view &a2)
-        cl (CommandLine none none false none none none))
+        cl (CommandLine none none false none none none none none none false false false))
     (try (parse-options &cl &s))
     (return (ok cl))))
 
