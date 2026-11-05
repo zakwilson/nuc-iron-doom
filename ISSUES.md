@@ -761,6 +761,37 @@ screen's timer ran at double speed. It surfaced only when the savegame
 loader's `(case (get-word l) 0 … 1 …)` read a second word whenever a body
 wasn't a thinker, and the file seemed corrupt.
 
+## ISSUE-032: `as` refuses a narrowing and points only at `unsafe/cast`, not `as-checked`
+
+- **Severity:** major
+- **Kind:** diagnostics
+- **Status:** worked-around (the port now uses `as-checked`)
+- **Probe:** `probes/issue-032.nuc` — expected the refusal of `(as usize x)`
+  with `x:i32` to mention `as-checked`; actual `as: lossy conversion from i32
+  to usize -- use unsafe/cast`
+- **Port sites:** none left as workarounds. The idiom pass turned 198
+  integer conversions from `unsafe/cast` into `as-checked` (144 to `usize`,
+  54 to `i32`) across 39 files; 158 `unsafe/cast`s remain, each a deliberate
+  reinterpretation (fixed-point and angle wraparound, sign extension through
+  `i16`, pointers, floats)
+- **Workaround:** none needed once you know `as-checked` exists; the cost was
+  two milestones of unchecked conversions.
+- **Suggestion:** name both in the message: "use as-checked to check the
+  value fits, or unsafe/cast to reinterpret its bits". `docs/types.md` says
+  the same thing in prose ("a narrowing or a reinterpretation is refused
+  and routed to `unsafe/cast`"), and `as-checked` appears only in the
+  special-forms table.
+
+Context: indexing a `Vector` with an `i32` sector or state number is the
+commonest conversion in a Doom port, and every one of them hit this refusal.
+The message names one fix, so the port wrote `(unsafe/cast usize secnum)` 156
+times, which asserts instead of checks: a negative index from a bad map
+would have read out of bounds silently. Switched to `as-checked`, the three
+demos and nine maps run unchanged, and the one negative value the checks
+found (a texture column below zero, which C's `col & mask` wraps on
+purpose) shows that the distinction is real: that site keeps `unsafe/cast`,
+now with a comment saying why.
+
 ## What worked well
 
 - Computing the 256-byte RNG table from its LCG in a macro body (ordinary

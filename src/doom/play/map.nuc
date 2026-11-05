@@ -125,7 +125,7 @@
 
 (defn- texture-num (tx:&WallTextures n:Name):(Fallible i32)
   (if-some (i (texture-index tx n))
-    (return (ok (unsafe/cast i32 i)))
+    (return (ok (as-checked i32 i)))
     (fail "R_TextureNumForName: " n " not found")))
 
 (defn- load-sides (m:&Map l:&Level tx:&WallTextures):(Fallible (Vector Side))
@@ -199,14 +199,14 @@
             ld (line-at l li)
             side (as usize (bit-and (as i32 (s 'side)) 1))
             sn (aref (ld 'side-num) (as i64 side)))
-        (when (or (< sn 0) (>= sn (unsafe/cast i32 (count (ref l 'sides)))))
+        (when (or (< sn 0) (>= sn (as-checked i32 (count (ref l 'sides)))))
           (fail "P_LoadSegs: linedef " li " for seg " i " references a non-existent sidedef " sn))
         (let (sd (side-at l (as usize sn))
               other (aref (ld 'side-num) (as i64 (bit-xor side 1)))
               ; Vanilla reads a missing back side's sector from address 0;
               ; Chocolate fakes that, and the shareware maps never need it.
               back:?usize (if (!= (bit-and (ld 'flags) ML-TWOSIDED) 0)
-                     (if (or (< other 0) (>= other (unsafe/cast i32 (count (ref l 'sides)))))
+                     (if (or (< other 0) (>= other (as-checked i32 (count (ref l 'sides)))))
                        none
                        (some ((side-at l (as usize other)) 'sector)))
                      none))

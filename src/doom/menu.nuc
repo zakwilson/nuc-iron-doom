@@ -164,12 +164,12 @@
                        (make (Vector i32)) commercial shareware ultimate))))
 
 (defn- menu-at (m:&MenuState id:i32):&Menu
-  (let (s (view (ref m 'menus))) (return (&s (unsafe/cast usize id)))))
+  (let (s (view (ref m 'menus))) (return (&s (as-checked usize id)))))
 
 (defn- item-at (mn:&Menu i:i32):MenuItem
-  (let (s (view (ref mn 'items))) (return @(&s (unsafe/cast usize i)))))
+  (let (s (view (ref mn 'items))) (return @(&s (as-checked usize i)))))
 
-(defn- item-count (mn:&Menu):i32 (return (unsafe/cast i32 (count (ref mn 'items)))))
+(defn- item-count (mn:&Menu):i32 (return (as-checked i32 (count (ref mn 'items)))))
 
 (defn- request (m:&MenuState r:MenuRequest):void (conj (ref m 'requests) r))
 
@@ -252,14 +252,14 @@
 ; --- loading and saving --------------------------------------------------------
 
 (defn- slot-text (m:&MenuState i:i32):&String
-  (let (s (view (ref m 'slots))) (return (&s (unsafe/cast usize i)))))
+  (let (s (view (ref m 'slots))) (return (&s (as-checked usize i)))))
 
 (defn slot-text-of (m:&MenuState i:i32):&String (return (slot-text m i)))
 
 ; The game's answer to read-saves: a slot's description, or none for an empty
 ; one, which can't be loaded.
 (defn menu-set-slot (m:&MenuState i:i32 text:?StrView):void
-  (let (t (slot-text m i) items (view (ref (menu-at m LOAD-MENU) 'items)) it (&items (unsafe/cast usize i)))
+  (let (t (slot-text m i) items (view (ref (menu-at m LOAD-MENU) 'items)) it (&items (as-checked usize i)))
     (clear! t)
     (match text
       ((some v) (str-into t v) (set! (it 'status) 1))
@@ -267,15 +267,15 @@
 
 (defn menu-set-font (m:&MenuState font:&HuFont):void
   (clear! (ref m 'char-widths))
-  (dotimes (i:i32 HU-FONTSIZE) (conj (ref m 'char-widths) (unsafe/cast i32 ((font-patch font i) 'width)))))
+  (dotimes (i:i32 HU-FONTSIZE) (conj (ref m 'char-widths) (as-checked i32 ((font-patch font i) 'width)))))
 
 ; M_StringWidth from the game's widths.
 (defn- text-width (m:&MenuState s:StrView):i32
   (let (w 0)
     (dotimes (i:usize (s 'len))
       (let (k (font-index (byte-of s i)))
-        (set! w (+ w (if (or (< k 0) (>= (unsafe/cast usize k) (count (ref m 'char-widths)))) 4
-                       ((ref m 'char-widths) (unsafe/cast usize k)))))))
+        (set! w (+ w (if (or (< k 0) (>= (as-checked usize k) (count (ref m 'char-widths)))) 4
+                       ((ref m 'char-widths) (as-checked usize k)))))))
     (return w)))
 
 ; A message to dismiss, from the game: a save that couldn't be read or written.
@@ -525,7 +525,7 @@
 
 (defn- draw-named (w:&Wad buf:&Buffer x:i32 y:i32 n:CStr):(Fallible void)
   (let (p (try (lump-patch w (strview-from-cstr n))))
-    (try (draw-patch buf (unsafe/cast usize x) (unsafe/cast usize y) &p)))
+    (try (draw-patch buf (as-checked usize x) (as-checked usize y) &p)))
   (return (ok)))
 
 ; M_StringWidth of one line.
@@ -533,7 +533,7 @@
   (let (w 0 i from)
     (while (< i to)
       (let (k (font-index (byte-of s i)))
-        (set! w (+ w (if (< k 0) 4 (unsafe/cast i32 ((font-patch font k) 'width))))))
+        (set! w (+ w (if (< k 0) 4 (as-checked i32 ((font-patch font k) 'width))))))
       (set! i (+ i 1)))
     (return w)))
 
@@ -544,9 +544,9 @@
       (let (k (font-index (byte-of s i)))
         (if (< k 0)
           (set! cx (+ cx 4))
-          (let (p (font-patch font k) w (unsafe/cast i32 (p 'width)))
+          (let (p (font-patch font k) w (as-checked i32 (p 'width)))
             (when (> (+ cx w) 320) (return (ok)))
-            (try (draw-patch buf (unsafe/cast usize cx) (unsafe/cast usize y) p))
+            (try (draw-patch buf (as-checked usize cx) (as-checked usize y) p))
             (set! cx (+ cx w)))))
       (set! i (+ i 1))))
   (return (ok)))
@@ -603,7 +603,7 @@
 ; M_Drawer: a message centred, or the menu with its items and the skull.
 (defn menu-drawer (m:&MenuState w:&Wad font:&HuFont buf:&Buffer):(Fallible void)
   (when (m 'to-print)
-    (let (s (string-as-view (ref m 'message)) lh (unsafe/cast i32 ((font-patch font 0) 'height))
+    (let (s (string-as-view (ref m 'message)) lh (as-checked i32 ((font-patch font 0) 'height))
           lines 1 i:usize 0)
       (while (< i (s 'len))
         (when (= (byte-of s i) 10) (set! lines (+ lines 1)))
@@ -623,7 +623,7 @@
       (let (it (item-at cur i))
         (when (and (> ((it 'name) 'len) 0) (some? (lump-index w (name (it 'name)))))
           (let (p (try (lump-patch w (it 'name))))
-            (try (draw-patch buf (unsafe/cast usize x) (unsafe/cast usize (+ y (* i LINEHEIGHT))) &p))))))
+            (try (draw-patch buf (as-checked usize x) (as-checked usize (+ y (* i LINEHEIGHT))) &p))))))
     (try (draw-named w buf (+ x SKULLXOFF) (+ (- y 5) (* (m 'item-on) LINEHEIGHT))
                      (if (= (m 'which-skull) 0) "M_SKULL1" "M_SKULL2"))))
   (return (ok)))

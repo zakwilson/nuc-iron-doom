@@ -42,5 +42,5 @@
     (return (if (or (< i 0) (>= i HU-FONTSIZE)) -1 i))))
 
 (defn font-patch (f:&HuFont i:i32):&Patch
-  (let (s (view (ref f 'patches))) (return (&s (unsafe/cast usize i)))))
+  (let (s (view (ref f 'patches))) (return (&s (as-checked usize i)))))
 

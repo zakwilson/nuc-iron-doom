@@ -91,7 +91,7 @@
       (activate-in-stasis-ceiling w line))
     (let (secnum (find-sector-from-line-tag w line -1))
       (while (>= secnum 0)
-        (let (si (unsafe/cast usize secnum) sec (sector-at l si))
+        (let (si (as-checked usize secnum) sec (sector-at l si))
           (when (none? (special-data w si))
             (set! rtn true)
             (let (c (new Ceiling (ref w 'arena)))

@@ -99,7 +99,7 @@
     (when (< n 16) (return none))
     (dotimes (i:i64 NUM-CHANNELS) (set! (aref (st 'channel-map) i) -1))
     (set! (st 'out) (make (Vector ui8)))
-    (set! pos (unsafe/cast usize (le-ui16 mus 6)))
+    (set! pos (as-checked usize (le-ui16 mus 6)))
     ; The header: type 0, one track, 70 ticks per quarter note, then the
     ; track's length to fill in.
     (dotimes (i:usize 22)

@@ -36,7 +36,7 @@
 (defn change-switch-texture (w:&World li:usize use-again:bool):(Fallible void)
   (let (l (ref w 'level) line (line-at l li))
     (when (not use-again) (set! (line 'special) 0))
-    (let (side (side-at l (unsafe/cast usize (aref (line 'side-num) 0)))
+    (let (side (side-at l (as-checked usize (aref (line 'side-num) 0)))
           top (side 'top-texture) mid (side 'mid-texture) bot (side 'bottom-texture)
           ; Read after clearing, so a used-up exit switch makes the usual sound.
           sound (if (= (line 'special) 11) SFX-SWTCHX SFX-SWTCHN)

@@ -98,8 +98,9 @@
         w (width px)
         mask:usize 1)
     (while (<= (* mask 2) w) (set! mask (* mask 2)))
+    ; A negative column wraps through the mask, as C's `col &= mask` does.
     (return (ColSource (cells px) (bit-and (unsafe/cast usize col) (- mask 1)) w (height px)))))
 
 ; textureheight[tex], in fixed point.
 (defn texture-height (tx:&WallTextures tex:usize):Fixed
-  (return (int-to-fixed (unsafe/cast i32 (height (ref (texture-at tx tex) 'pixels))))))
+  (return (int-to-fixed (as-checked i32 (height (ref (texture-at tx tex) 'pixels))))))

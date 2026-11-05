@@ -48,8 +48,8 @@
       (when (> (iabs tx) (bit-shl tz 2)) (return))
       (let (def (sprite-def (sc 'sprites) (m 'sprite))
             fi (bit-and (m 'frame) FF-FRAMEMASK))
-        (when (>= (unsafe/cast usize fi) (count (ref def 'frames))) (return))
-        (let (fs (view (ref def 'frames)) f (&fs (unsafe/cast usize fi))
+        (when (>= (as-checked usize fi) (count (ref def 'frames))) (return))
+        (let (fs (view (ref def 'frames)) f (&fs (as-checked usize fi))
               rot:i64 (if (= (f 'rotate) 1)
                         (as i64 (bit-shr (+ (- (point-to-angle r (m 'x) (m 'y)) (m 'angle))
                                             (* (/ ANG45 2) 9))
@@ -128,7 +128,7 @@
   (let (posts (view (ref c 'posts)))
     (dotimes (i:usize (count &posts))
       (let (post (&posts i) d (post 'data) src (ColSource d 0 1 (count &d)))
-        (draw-post r sc p mc &src (unsafe/cast i32 (post 'top-delta)) (unsafe/cast i32 (count &d)))))))
+        (draw-post r sc p mc &src (unsafe/cast i32 (post 'top-delta)) (as-checked i32 (count &d)))))))
 
 ; R_DrawVisSprite.
 (defn- draw-vis-sprite (r:&Renderer sc:&Scene v:&VisSprite):void
@@ -143,11 +143,11 @@
     (while (<= x (v 'x2))
       ; Vanilla's range check is compiled out; a stray column is skipped.
       (let (tc (bit-shr frac FRACBITS))
-        (when (and (>= tc 0) (< (unsafe/cast usize tc) (pt 'width)))
+        (when (and (>= tc 0) (< (as-checked usize tc) (pt 'width)))
           (let (mc (MaskedCol x (v 'texture-mid) (v 'scale) iscale top-screen
                               (as i32 ((ref r 'clip-bot) (as usize x)))
                               (as i32 ((ref r 'clip-top) (as usize x)))))
-            (draw-masked-column r sc &paint &mc (patch-column pt (unsafe/cast usize tc))))))
+            (draw-masked-column r sc &paint &mc (patch-column pt (as-checked usize tc))))))
       (set! frac (wrap-add frac (v 'x-iscale)))
       (inc! x))))
 
@@ -159,7 +159,7 @@
         back (sector-at l (unwrap-or (s 'back-sector) (s 'front-sector)))
         side (side-at l (s 'side))
         line (line-at l (s 'line))
-        tex (unsafe/cast usize (translated-texture sc (side 'mid-texture)))
+        tex (as-checked usize (translated-texture sc (side 'mid-texture)))
         lights (seg-light r l s front)
         scale (wrap-add (ds 'scale1) (wrap-mul (- x1 (ds 'x1)) (ds 'scale-step)))
         mid (wrap-add (if (!= (bit-and (line 'flags) ML-DONTPEGBOTTOM) 0)
@@ -187,7 +187,7 @@
               ((some c) (draw-masked-column r sc &paint &mc &c))
               ; Overlapping patches: vanilla reads the composite's pixels as
               ; post headers. Drawing it as one opaque post keeps it sane.
-              ((none) (draw-post r sc &paint &mc &composite 0 (unsafe/cast i32 (composite 'len)))))
+              ((none) (draw-post r sc &paint &mc &composite 0 (as-checked i32 (composite 'len)))))
             (set-clip-at r (ds 'masked-texture-col) x SHRT-MAX))))
       (set! scale (wrap-add scale (ds 'scale-step)))
       (inc! x))))
@@ -269,7 +269,7 @@
   (let (st (state-at (psp 'state))
         def (sprite-def (sc 'sprites) (st 'sprite))
         fs (view (ref def 'frames))
-        f (&fs (unsafe/cast usize (bit-and (st 'frame) FF-FRAMEMASK)))
+        f (&fs (as-checked usize (bit-and (st 'frame) FF-FRAMEMASK)))
         lump (aref (f 'patch) 0)
         flip (aref (f 'flip) 0)
         sp (sprite-patch (sc 'sprites) lump)

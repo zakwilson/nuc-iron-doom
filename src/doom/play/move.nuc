@@ -62,7 +62,7 @@
     (when (or (>= (iabs (wrap-sub (t 'x) (sc 'tm-x))) blockdist)
               (>= (iabs (wrap-sub (t 'y) (sc 'tm-y))) blockdist))
       (return true))
-    (when (= (unsafe/cast usize t) (unsafe/cast usize tm)) (return true))
+    (when (same? t tm) (return true))
     ; Monsters only telefrag on MAP30.
     (when (and (none? (tm 'player)) (!= ((ref w 'rules) 'map) 30)) (return false))
     (note-error w (damage-mobj w t (some tm) (some tm) 10000))
@@ -153,7 +153,7 @@
     (when (or (>= (iabs (wrap-sub (t 'x) (sc 'tm-x))) blockdist)
               (>= (iabs (wrap-sub (t 'y) (sc 'tm-y))) blockdist))
       (return true))
-    (when (= (unsafe/cast usize t) (unsafe/cast usize tm)) (return true))
+    (when (same? t tm) (return true))
     ; A charging skull slams into it.
     (when (!= (bit-and (tm 'flags) MF-SKULLFLY) 0)
       (let (damage (* (+ (% (p-random w) 8) 1) ((mobj-info (tm 'type)) 'damage)))
@@ -173,7 +173,7 @@
                   (and (= (src 'type) MT-KNIGHT) (= (t 'type) MT-BRUISER))
                   (and (= (src 'type) MT-BRUISER) (= (t 'type) MT-KNIGHT)))
           ; The same species as the shooter: no damage.
-          (when (= (unsafe/cast usize t) (unsafe/cast usize src)) (return true))
+          (when (same? t src) (return true))
           (when (!= (t 'type) MT-PLAYER) (return false))))
       (when (= (bit-and (t 'flags) MF-SHOOTABLE) 0)
         (return (= (bit-and (t 'flags) MF-SOLID) 0)))
@@ -243,7 +243,7 @@
         ; teleport in a special clears it.
         (while (> (sc 'num-spechit) 0)
           (set! (sc 'num-spechit) (- (sc 'num-spechit) 1))
-          (let (li ((ref sc 'spechit) (unsafe/cast usize (sc 'num-spechit)))
+          (let (li ((ref sc 'spechit) (as-checked usize (sc 'num-spechit)))
                 ld (line-at (ref w 'level) li)
                 side (point-on-line-side (ref w 'level) (m 'x) (m 'y) ld)
                 oldside (point-on-line-side (ref w 'level) oldx oldy ld))
@@ -384,7 +384,7 @@
                  (when (< slope (sc 'top-slope)) (set! (sc 'top-slope) slope))))
              (return (> (sc 'top-slope) (sc 'bottom-slope)))))))
       ((thing th)
-       (when (= (unsafe/cast usize th) (unsafe/cast usize (unwrap (sc 'shoot-thing)))) (return true))
+       (when (same? th (unwrap (sc 'shoot-thing))) (return true))
        (when (= (bit-and (th 'flags) MF-SHOOTABLE) 0) (return true))
        (let (dist (fixed-mul (sc 'attack-range) (in 'frac))
              top (fixed-div (wrap-sub (wrap-add (th 'z) (th 'height)) (sc 'shoot-z)) dist))
@@ -442,7 +442,7 @@
            (note-error w (spawn-puff w x y z))
            (return false))))
       ((thing th)
-       (when (= (unsafe/cast usize th) (unsafe/cast usize (unwrap (sc 'shoot-thing)))) (return true))
+       (when (same? th (unwrap (sc 'shoot-thing))) (return true))
        (when (= (bit-and (th 'flags) MF-SHOOTABLE) 0) (return true))
        (let (dist (fixed-mul (sc 'attack-range) (in 'frac))
              top (fixed-div (wrap-sub (wrap-add (th 'z) (th 'height)) (sc 'shoot-z)) dist))

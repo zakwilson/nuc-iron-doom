@@ -60,7 +60,7 @@
   (let (r (ref w 'rules))
     (when paused (return (ok)))
     (when (and (not (r 'netgame)) menu-active (not (r 'demo-playback))
-               (!= ((player-at w (unsafe/cast usize (r 'console-player))) 'view-z) 1))
+               (!= ((player-at w (as-checked usize (r 'console-player))) 'view-z) 1))
       (return (ok))))
   (dotimes (i:usize MAXPLAYERS)
     (when ((ref w 'player-in-game) i)

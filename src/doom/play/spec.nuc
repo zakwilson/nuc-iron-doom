@@ -88,12 +88,12 @@
 
 (defn- texture-num (tx:&WallTextures n:CStr):(Fallible i32)
   (match (texture-index tx (name n))
-    ((some i) (return (ok (unsafe/cast i32 i))))
+    ((some i) (return (ok (as-checked i32 i))))
     ((none) (fail "R_TextureNumForName: " n " not found"))))
 
 (defn- flat-num (fl:&Flats n:CStr):(Fallible i32)
   (match (flat-index fl (name n))
-    ((some i) (return (ok (unsafe/cast i32 i))))
+    ((some i) (return (ok (as-checked i32 i))))
     ((none) (fail "R_FlatNumForName: " n " not found"))))
 
 ; P_InitPicAnims and P_InitSwitchList, once the WAD's textures are known.
@@ -118,7 +118,7 @@
             (conj &switches (try (texture-num tx (d 'off))))
             (conj &switches (try (texture-num tx (d 'on))))))))
     (dotimes (i:usize ntex)
-      (conj &heights (int-to-fixed (unsafe/cast i32 (height (ref (texture-at tx i) 'pixels))))))
+      (conj &heights (int-to-fixed (as-checked i32 (height (ref (texture-at tx i) 'pixels))))))
     (return (ok (PicData anims switches heights ntex (count (ref fl 'list)))))))
 
 ; --- utilities -----------------------------------------------------------------
@@ -139,7 +139,7 @@
 ; getSide's side, for a sector's i-th line.
 (defn side-of-line (w:&World sec:usize i:usize side:usize):&Side
   (let (l (ref w 'level) li (sector-line w (sector-at l sec) i))
-    (return (side-at l (unsafe/cast usize (aref ((line-at l li) 'side-num) (as i64 side)))))))
+    (return (side-at l (as-checked usize (aref ((line-at l li) 'side-num) (as i64 side)))))))
 
 (defn two-sided? (w:&World sec:usize i:usize):bool
   (let (l (ref w 'level) li (sector-line w (sector-at l sec) i))
@@ -189,9 +189,9 @@
 
 ; P_FindSectorFromLineTag: the next sector after `start` with the line's tag.
 (defn find-sector-from-line-tag (w:&World line:&Line start:i32):i32
-  (let (l (ref w 'level) n (unsafe/cast i32 (count (ref l 'sectors))) i (+ start 1))
+  (let (l (ref w 'level) n (as-checked i32 (count (ref l 'sectors))) i (+ start 1))
     (while (< i n)
-      (when (= ((sector-at l (unsafe/cast usize i)) 'tag) (line 'tag)) (return i))
+      (when (= ((sector-at l (as-checked usize i)) 'tag) (line 'tag)) (return i))
       (inc! i))
     (return -1)))
 
@@ -484,13 +484,13 @@
         (while (< i (+ (a 'base-pic) (a 'num-pics)))
           (let (pic (+ (a 'base-pic) (% (+ (/ (w 'level-time) (a 'speed)) i) (a 'num-pics))))
             (set (if (a 'is-texture) (ref w 'texture-translation) (ref w 'flat-translation))
-                 (unsafe/cast usize i) pic))
+                 (as-checked usize i) pic))
           (inc! i)))))
   (let (l (ref w 'level) specials (ref w 'line-specials))
     (dotimes (i:usize (count specials))
       (let (line (line-at l (specials i)))
         (when (= (line 'special) 48)
-          (let (side (side-at l (unsafe/cast usize (aref (line 'side-num) 0))))
+          (let (side (side-at l (as-checked usize (aref (line 'side-num) 0))))
             (set! (side 'texture-offset) (wrap-add (side 'texture-offset) FRACUNIT))))))
     (let (buttons (view (ref w 'buttons)))
       (dotimes (i:usize (count &buttons))
@@ -498,7 +498,7 @@
           (when (!= (b 'timer) 0)
             (set! (b 'timer) (- (b 'timer) 1))
             (when (= (b 'timer) 0)
-              (let (side (side-at l (unsafe/cast usize (aref ((line-at l (b 'line)) 'side-num) 0))))
+              (let (side (side-at l (as-checked usize (aref ((line-at l (b 'line)) 'side-num) 0))))
                 (case (b 'where)
                   BW-TOP (set! (side 'top-texture) (b 'texture))
                   BW-MIDDLE (set! (side 'mid-texture) (b 'texture))
@@ -515,7 +515,7 @@
   (let (l (ref w 'level) line (line-at l li) rtn false
         s1 (find-sector-from-line-tag w line -1) stop false)
     (while (and (>= s1 0) (not stop))
-      (let (sec1 (unsafe/cast usize s1) sector1 (sector-at l sec1))
+      (let (sec1 (as-checked usize s1) sector1 (sector-at l sec1))
         (when (none? (special-data w sec1))
           (set! rtn true)
           (match (get-next-sector w (sector-line w sector1 0) sec1)

@@ -360,7 +360,7 @@
 (defn- do-completed (s:&Session):void
   (let (w (session-world s) r (ref s 'rules) commercial (= (r 'mode) COMMERCIAL)
         players (view (ref w 'players)) ep (r 'episode) mp (r 'map)
-        cp (unsafe/cast usize (r 'console-player)))
+        cp (as-checked usize (r 'console-player)))
     (set! (s 'gameaction) GA-NOTHING)
     (dotimes (i:usize MAXPLAYERS)
       (when ((ref s 'in-game) i) (player-finish-level (&players i))))
@@ -393,7 +393,7 @@
 (defn- world-done (s:&Session):void
   (set! (s 'gameaction) GA-WORLDDONE)
   (when (s 'secret-exit)
-    (set! ((player-at (session-world s) (unsafe/cast usize ((ref s 'rules) 'console-player))) 'did-secret) true))
+    (set! ((player-at (session-world s) (as-checked usize ((ref s 'rules) 'console-player))) 'did-secret) true))
   ; Doom 2's text screens between its chapters.
   (let (r (ref s 'rules) m (r 'map))
     (when (and (= (r 'mode) COMMERCIAL)
@@ -484,7 +484,7 @@
       GA-VICTORY (start-finale s)
       GA-WORLDDONE (try (do-world-done s a))
       (set! (s 'gameaction) GA-NOTHING)))
-  (let (w (session-world s) cp (unsafe/cast usize ((ref s 'rules) 'console-player))
+  (let (w (session-world s) cp (as-checked usize ((ref s 'rules) 'console-player))
         commercial (= ((ref s 'rules) 'mode) COMMERCIAL))
     (set! (w 'game-tic) (s 'gametic))
     (dotimes (i:usize MAXPLAYERS)

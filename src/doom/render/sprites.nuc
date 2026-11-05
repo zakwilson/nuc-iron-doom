@@ -73,7 +73,7 @@
     (let (l first)
       (while (< l end)
         (let (p (try (patch-parse (ref (lump-at w l) 'data))))
-          (conj &patches (SpritePatch p (int-to-fixed (unsafe/cast i32 (p 'width)))
+          (conj &patches (SpritePatch p (int-to-fixed (as-checked i32 (p 'width)))
                                       (int-to-fixed (as i32 (p 'left-offset)))
                                       (int-to-fixed (as i32 (p 'top-offset))))))
         (inc! l)))
@@ -81,7 +81,7 @@
       (let (sn (sprite-name s) frames (make (Vector SpriteFrame)) maxframe:i32 -1 l first)
         (dotimes (i:usize 29) (conj &frames (empty-frame)))
         (while (< l end)
-          (let (ln ((lump-at w l) 'name) patch (unsafe/cast i32 (- l first)))
+          (let (ln ((lump-at w l) 'name) patch (as-checked i32 (- l first)))
             (when (= (name-prefix ln 4) sn)
               (try (install &frames &maxframe sn patch
                             (- (as i32 (name-byte ln 4)) 65) (- (as i32 (name-byte ln 5)) 48) false))
@@ -89,7 +89,7 @@
                 (try (install &frames &maxframe sn patch
                               (- (as i32 (name-byte ln 6)) 65) (- (as i32 (name-byte ln 7)) 48) true)))))
           (inc! l))
-        (truncate! &frames (unsafe/cast usize (+ maxframe 1)))
+        (truncate! &frames (as-checked usize (+ maxframe 1)))
         (let (fs (view &frames))
           (dotimes (f:usize (count &fs))
             (let (fr (&fs f))
@@ -103,7 +103,7 @@
     (return (ok (Sprites patches defs)))))
 
 (defn sprite-def (s:&Sprites i:i32):&SpriteDef
-  (let (v (view (ref s 'defs))) (return (&v (unsafe/cast usize i)))))
+  (let (v (view (ref s 'defs))) (return (&v (as-checked usize i)))))
 
 (defn sprite-patch (s:&Sprites i:i32):&SpritePatch
-  (let (v (view (ref s 'patches))) (return (&v (unsafe/cast usize i)))))
+  (let (v (view (ref s 'patches))) (return (&v (as-checked usize i)))))

@@ -130,9 +130,9 @@
         (return (fire-weapon w pi)))
       (set! (p 'attack-down) false))
     (let (angle (bit-and (* 128 (w 'level-time)) FINEMASK))
-      (set! (psp 'sx) (+ FRACUNIT (fixed-mul (p 'bob) (finecosine (unsafe/cast usize angle)))))
+      (set! (psp 'sx) (+ FRACUNIT (fixed-mul (p 'bob) (finecosine (as-checked usize angle)))))
       (let (a2 (bit-and angle (- (/ FINEANGLES 2) 1)))
-        (set! (psp 'sy) (+ WEAPONTOP (fixed-mul (p 'bob) (finesine (unsafe/cast usize a2))))))))
+        (set! (psp 'sy) (+ WEAPONTOP (fixed-mul (p 'bob) (finesine (as-checked usize a2))))))))
   (return (ok)))
 
 ; A_ReFire: fire again while the trigger is held.
@@ -331,7 +331,7 @@
 ; P_SetupPsprites: at spawn, bring up the ready weapon.
 (defn setup-psprites (w:&World pi:usize):(Fallible void)
   (let (p (player-at w pi))
-    (dotimes (i:usize 2) (set! ((psp-at p (unsafe/cast i32 i)) 'state) 0))
+    (dotimes (i:usize 2) (set! ((psp-at p (as-checked i32 i)) 'state) 0))
     (set! (p 'pending-weapon) (p 'ready-weapon))
     (return (bring-up-weapon w pi))))
 
@@ -339,11 +339,11 @@
 (defn move-psprites (w:&World pi:usize):(Fallible void)
   (let (p (player-at w pi))
     (dotimes (i:usize 2)
-      (let (psp (psp-at p (unsafe/cast i32 i)))
+      (let (psp (psp-at p (as-checked i32 i)))
         (when (and (!= (psp 'state) 0) (!= (psp 'tics) -1))
           (set! (psp 'tics) (- (psp 'tics) 1))
           (when (= (psp 'tics) 0)
-            (try (set-psprite w pi (unsafe/cast i32 i) ((state-at (psp 'state)) 'next)))))))
+            (try (set-psprite w pi (as-checked i32 i) ((state-at (psp 'state)) 'next)))))))
     (let (wp (psp-at p PS-WEAPON) fp (psp-at p PS-FLASH))
       (set! (fp 'sx) (wp 'sx))
       (set! (fp 'sy) (wp 'sy))))

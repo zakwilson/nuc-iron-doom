@@ -303,7 +303,7 @@
         bx (bit-shr (wrap-sub x (l 'bmap-org-x)) MAPBLOCKSHIFT)
         by (bit-shr (wrap-sub y (l 'bmap-org-y)) MAPBLOCKSHIFT))
     (if (and (>= bx 0) (< bx (l 'bmap-width)) (>= by 0) (< by (l 'bmap-height)))
-      (return (some (unsafe/cast usize (+ (* by (l 'bmap-width)) bx))))
+      (return (some (as-checked usize (+ (* by (l 'bmap-width)) bx))))
       (return none))))
 
 (defn- sector-of (w:&World m:&Mobj):usize
@@ -363,7 +363,7 @@
 
 (defn- identity (n:usize):(Vector i32)
   (let (out (make (Vector i32)))
-    (dotimes (i:usize n) (conj &out (unsafe/cast i32 i)))
+    (dotimes (i:usize n) (conj &out (as-checked i32 i)))
     (return out)))
 
 (defn ticcmd-zero ():TicCmd (return (TicCmd 0 0 0 0 0 0)))
@@ -388,7 +388,7 @@
         cap (new Thinker &arena none none false false (Think-cap))
         nsec (count (ref l 'sectors))
         nlines (count (ref l 'lines))
-        nblocks (unsafe/cast usize (* (l 'bmap-width) (l 'bmap-height)))
+        nblocks (as-checked usize (* (l 'bmap-width) (l 'bmap-height)))
         play (make (Vector SectorPlay))
         w (new World heap l arena rules random cap
                (make (Vector &Mobj)) (make (Vector &Thinker))
@@ -452,7 +452,7 @@
 
 ; The console player's body, which hears.
 (defn listener (w:&World):?&Mobj
-  (return ((player-at w (unsafe/cast usize ((ref w 'rules) 'console-player))) 'mo)))
+  (return ((player-at w (as-checked usize ((ref w 'rules) 'console-player))) 'mo)))
 
 ; S_StartSound's pitch variation, from M_Random: the chainsaw's a little, the
 ; rest more, the item pickup and tink not at all.

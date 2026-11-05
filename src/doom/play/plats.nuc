@@ -89,7 +89,7 @@
     (when (= type PERPETUAL-RAISE) (activate-in-stasis w (line 'tag)))
     (let (secnum (find-sector-from-line-tag w line -1))
       (while (>= secnum 0)
-        (let (si (unsafe/cast usize secnum) sec (sector-at l si))
+        (let (si (as-checked usize secnum) sec (sector-at l si))
           (when (none? (special-data w si))
             (set! rtn true)
             (let (p (new Plat (ref w 'arena)))
@@ -101,7 +101,7 @@
               (case type
                 RAISE-TO-NEAREST-AND-CHANGE
                 (do (set! (p 'speed) (/ PLATSPEED 2))
-                    (set! (sec 'floor-pic) ((sector-at l ((side-at l (unsafe/cast usize (aref (line 'side-num) 0))) 'sector)) 'floor-pic))
+                    (set! (sec 'floor-pic) ((sector-at l ((side-at l (as-checked usize (aref (line 'side-num) 0))) 'sector)) 'floor-pic))
                     (set! (p 'high) (try (find-next-highest-floor w si (sec 'floor-height))))
                     (set! (p 'wait) 0)
                     (set! (p 'status) PLAT-UP)
@@ -109,7 +109,7 @@
                     (start-sector-sound w si SFX-STNMOV))
                 RAISE-AND-CHANGE
                 (do (set! (p 'speed) (/ PLATSPEED 2))
-                    (set! (sec 'floor-pic) ((sector-at l ((side-at l (unsafe/cast usize (aref (line 'side-num) 0))) 'sector)) 'floor-pic))
+                    (set! (sec 'floor-pic) ((sector-at l ((side-at l (as-checked usize (aref (line 'side-num) 0))) 'sector)) 'floor-pic))
                     (set! (p 'high) (+ (sec 'floor-height) (* amount FRACUNIT)))
                     (set! (p 'wait) 0)
                     (set! (p 'status) PLAT-UP)

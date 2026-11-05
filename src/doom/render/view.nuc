@@ -38,7 +38,7 @@
   (clear-sprites r sc)
   (let (n (count (ref (sc 'level) 'nodes)))
     ; A map of one subsector has no nodes; -1 is that subsector.
-    (try (render-bsp-node r sc (if (= n 0) -1 (unsafe/cast i32 (- n 1))))))
+    (try (render-bsp-node r sc (if (= n 0) -1 (as-checked i32 (- n 1))))))
   (draw-planes r sc)
   (draw-masked r sc)
   (return (ok)))

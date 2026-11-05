@@ -185,7 +185,7 @@
 
 (defn- me (wi:&Intermission):WbPlayer
   (let (ps (view (ref (ref wi 'wbs) 'plyr)))
-    (return @(&ps (unsafe/cast usize ((ref wi 'wbs) 'pnum))))))
+    (return @(&ps (as-checked usize ((ref wi 'wbs) 'pnum))))))
 
 ; WI_updateStats. The sounds go to the world's queue, as the playsim's do.
 (defn- update-stats (wi:&Intermission w:&World commercial:bool):void
@@ -307,7 +307,7 @@
       (let (frames (make (Vector Patch)))
         (dotimes (i:i32 ((&tv j) 'nanims))
           ; Episode 2's last animation borrows the fifth's frames.
-          (let (jj (if (and (= epsd 1) (= j 8)) 4 (unsafe/cast i32 j)))
+          (let (jj (if (and (= epsd 1) (= j 8)) 4 (as-checked i32 j)))
             (conj &frames (try (named w (wia-name epsd jj i))))))
         (conj &anims frames)))
     (dotimes (i:i32 10) (conj &nums (try (named w (str "WINUM" i)))))
@@ -322,13 +322,13 @@
                               (try (named w (str "WISUCKS"))) (try (named w (str "WIPAR")))))))))
 
 (defn- pat (v:&(Vector Patch) i:i32):&Patch
-  (let (s (view v)) (return (&s (unsafe/cast usize i)))))
+  (let (s (view v)) (return (&s (as-checked usize i)))))
 
 (defn- draw (buf:&Buffer x:i32 y:i32 p:&Patch):(Fallible void)
-  (return (draw-patch buf (unsafe/cast usize x) (unsafe/cast usize y) p)))
+  (return (draw-patch buf (as-checked usize x) (as-checked usize y) p)))
 
-(defn- pw (p:&Patch):i32 (return (unsafe/cast i32 (p 'width))))
-(defn- ph (p:&Patch):i32 (return (unsafe/cast i32 (p 'height))))
+(defn- pw (p:&Patch):i32 (return (as-checked i32 (p 'width))))
+(defn- ph (p:&Patch):i32 (return (as-checked i32 (p 'height))))
 
 ; WI_drawNum: right-aligned at x; `digits` -1 for as many as it takes.
 (defn- draw-num (g:&WiGraphics buf:&Buffer x:i32 y:i32 n:i32 digits:i32):(Fallible i32)
@@ -397,7 +397,7 @@
 
 ; WI_drawOnLnode: the first of the patches that fits on screen there.
 (defn- draw-on-lnode (wi:&Intermission buf:&Buffer n:i32 cs:&(Vector Patch)):(Fallible void)
-  (let (epsd ((ref wi 'wbs) 'epsd) x (lnode-x epsd n) y (lnode-y epsd n) i 0 k (unsafe/cast i32 (count cs)))
+  (let (epsd ((ref wi 'wbs) 'epsd) x (lnode-x epsd n) y (lnode-y epsd n) i 0 k (as-checked i32 (count cs)))
     (while (< i (min k 2))
       (let (c (pat cs i)
             left (- x (as i32 (c 'left-offset))) top (- y (as i32 (c 'top-offset))))

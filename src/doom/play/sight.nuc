@@ -84,9 +84,9 @@
 ; P_CrossBSPNode.
 (defn- cross-bsp-node (w:&World bspnum:i32):bool
   (when (!= (bit-and bspnum NF-SUBSECTOR) 0)
-    (return (cross-subsector w (if (= bspnum -1) 0 (unsafe/cast usize (bit-and bspnum (bit-not NF-SUBSECTOR)))))))
+    (return (cross-subsector w (if (= bspnum -1) 0 (as-checked usize (bit-and bspnum (bit-not NF-SUBSECTOR)))))))
   (let (l (ref w 'level) sc (ref w 'scratch)
-        n (node-at l (unsafe/cast usize bspnum))
+        n (node-at l (as-checked usize bspnum))
         d (node-divline n)
         side (divline-side ((sc 'strace) 'x) ((sc 'strace) 'y) &d))
     ; On the line crosses both sides.
@@ -115,4 +115,4 @@
     (set! (sc 't2x) (t2 'x))
     (set! (sc 't2y) (t2 'y))
     (let (n (count (ref l 'nodes)))
-      (return (ok (cross-bsp-node w (if (= n 0) -1 (unsafe/cast i32 (- n 1)))))))))
+      (return (ok (cross-bsp-node w (if (= n 0) -1 (as-checked i32 (- n 1)))))))))

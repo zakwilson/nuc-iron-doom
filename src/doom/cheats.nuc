@@ -119,7 +119,7 @@
 ; ST_Responder for one typed key `ch`, in a level. A map change is returned
 ; for the game to start.
 (defn cheat-responder (c:&Cheats w:&World ch:i32):?Clev
-  (let (r (ref w 'rules) p (player-at w (unsafe/cast usize (r 'console-player))))
+  (let (r (ref w 'rules) p (player-at w (as-checked usize (r 'console-player))))
     (when (and (not (r 'netgame)) (!= (r 'skill) SK-NIGHTMARE))
       (cond (cheat-check (ref c 'god) ch)
             (do (set! (p 'cheats) (bit-xor (p 'cheats) CF-GODMODE))

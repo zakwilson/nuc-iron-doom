@@ -116,7 +116,7 @@
   (let (l (ref w 'level) rtn false
         secnum (find-sector-from-line-tag w line -1))
     (while (>= secnum 0)
-      (let (si (unsafe/cast usize secnum) sec (sector-at l si))
+      (let (si (as-checked usize secnum) sec (sector-at l si))
         (when (none? (special-data w si))
           (set! rtn true)
           ; Vanilla leaves topheight and topcountdown as the allocator found them.
@@ -179,7 +179,7 @@
            (return (ok))))))
     (when (= (aref (line 'side-num) 1) -1)
       (fail "EV_VerticalDoor: DR special type on 1-sided linedef"))
-    (let (si ((side-at l (unsafe/cast usize (aref (line 'side-num) 1))) 'sector))
+    (let (si ((side-at l (as-checked usize (aref (line 'side-num) 1))) 'sector))
       (when-some (th (special-data w si))
         (when (case sp (:or 1 26 27 28 117) true false)
           (if (= (aliased-direction th) -1)

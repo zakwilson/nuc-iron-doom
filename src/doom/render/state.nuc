@@ -267,8 +267,8 @@
   things:&(Vector ?&Mobj)
   screen:&Buffer)
 
-(defn translated-texture (sc:&Scene i:i32):i32 (return ((sc 'tex-trans) (unsafe/cast usize i))))
-(defn translated-flat (sc:&Scene i:i32):i32 (return ((sc 'flat-trans) (unsafe/cast usize i))))
+(defn translated-texture (sc:&Scene i:i32):i32 (return ((sc 'tex-trans) (as-checked usize i))))
+(defn translated-flat (sc:&Scene i:i32):i32 (return ((sc 'flat-trans) (as-checked usize i))))
 
 ; --- small accessors --------------------------------------------------------------
 

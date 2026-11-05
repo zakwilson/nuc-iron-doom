@@ -19,7 +19,7 @@
                    random:Random pics:PicData):(Fallible &World)
   (let (w (world-new l rules players in-game random pics))
     ; Until the first P_CalcHeight; P_Ticker's menu pause waits for it.
-    (set! ((player-at w (unsafe/cast usize (rules 'console-player))) 'view-z) 1)
+    (set! ((player-at w (as-checked usize (rules 'console-player))) 'view-z) 1)
     (try (load-things w m))
     (try (spawn-specials w))
     (return (ok w))))

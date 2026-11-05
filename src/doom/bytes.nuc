@@ -80,7 +80,7 @@
 
 (extend Name Hash)
 (defn hash (self:&Name):usize
-  (let (v:usize (unsafe/cast usize (self 'v)))
+  (let (v:usize (as-checked usize (self 'v)))
     (return (hash &v))))
 
 (extend Name ToStr)

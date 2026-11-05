@@ -212,8 +212,8 @@
     (st-start sb p))
   (set! (sb 'random-number) random-number)
   (dotimes (i:i64 3)
-    (set! (aref (sb 'keyboxes) i) (if (aref (p 'cards) i) (unsafe/cast i32 i) -1))
-    (when (aref (p 'cards) (+ i 3)) (set! (aref (sb 'keyboxes) i) (unsafe/cast i32 (+ i 3)))))
+    (set! (aref (sb 'keyboxes) i) (if (aref (p 'cards) i) (as-checked i32 i) -1))
+    (when (aref (p 'cards) (+ i 3)) (set! (aref (sb 'keyboxes) i) (as-checked i32 (+ i 3)))))
   (update-face sb p)
   (set! (sb 'old-health) (p 'health)))
 
@@ -234,14 +234,14 @@
 (defn- min (a:i32 b:i32):i32 (return (if (< a b) a b)))
 
 (defn- patch-at (v:&(Vector Patch) i:i32):&Patch
-  (let (s (view v)) (return (&s (unsafe/cast usize i)))))
+  (let (s (view v)) (return (&s (as-checked usize i)))))
 
 (defn- draw (buf:&Buffer x:i32 y:i32 p:&Patch):(Fallible void)
-  (return (draw-patch buf (unsafe/cast usize x) (unsafe/cast usize y) p)))
+  (return (draw-patch buf (as-checked usize x) (as-checked usize y) p)))
 
 ; STlib_drawNum: right-aligned at x, `digits` wide.
 (defn- draw-num (buf:&Buffer g:&StatusGraphics nums:&(Vector Patch) x:i32 y:i32 digits:i32 value:i32):(Fallible void)
-  (let (num value neg (< value 0) w (unsafe/cast i32 ((patch-at nums 0) 'width)) cx x n digits)
+  (let (num value neg (< value 0) w (as-checked i32 ((patch-at nums 0) 'width)) cx x n digits)
     (when neg
       (cond (and (= digits 2) (< num -9)) (set! num -9)
             (and (= digits 3) (< num -99)) (set! num -99))

@@ -64,7 +64,7 @@
 (defn save-put (s:&Saver x:&bool):void (put-word s (if @x 1 0)))
 (defn save-put (s:&Saver x:&usize):void (put-word s (unsafe/cast i32 @x)))
 (defn save-put (s:&Saver x:&?usize):void
-  (put-word s (match @x ((some i) (unsafe/cast i32 i)) ((none) -1))))
+  (put-word s (match @x ((some i) (as-checked i32 i)) ((none) -1))))
 
 (defn save-get (l:&Loader x:&i32):(Fallible void) (set! @x (try (get-word l))) (return (ok)))
 (defn save-get (l:&Loader x:&ui32):(Fallible void)
@@ -77,11 +77,11 @@
 (defn save-get (l:&Loader x:&usize):(Fallible void)
   (let (v (try (get-word l)))
     (when (< v 0) (fail "savegame: a negative index"))
-    (set! @x (unsafe/cast usize v)))
+    (set! @x (as-checked usize v)))
   (return (ok)))
 (defn save-get (l:&Loader x:&?usize):(Fallible void)
   (let (v (try (get-word l)))
-    (set! @x (if (< v 0) none (some (unsafe/cast usize v)))))
+    (set! @x (if (< v 0) none (some (as-checked usize v)))))
   (return (ok)))
 
 ; --- pointers --------------------------------------------------------------------
@@ -91,7 +91,7 @@
     (match (get (ref s 'mobj-ids) k)
       ((some i) (return i))
       ((none)
-       (let (i (unsafe/cast i32 (count (ref s 'mobjs))))
+       (let (i (as-checked i32 (count (ref s 'mobjs))))
          (assoc (ref s 'mobj-ids) k i)
          (conj (ref s 'mobjs) m)
          (return i))))))
@@ -101,7 +101,7 @@
     (match (get (ref s 'thinker-ids) k)
       ((some i) (return i))
       ((none)
-       (let (i (unsafe/cast i32 (count (ref s 'thinkers))))
+       (let (i (as-checked i32 (count (ref s 'thinkers))))
          (assoc (ref s 'thinker-ids) k i)
          (conj (ref s 'thinkers) th)
          (return i))))))
@@ -123,14 +123,14 @@
     ((none) (put-word s -1))))
 
 (defn- mobj-of (l:&Loader i:i32):(Fallible &Mobj)
-  (when (or (< i 0) (>= (unsafe/cast usize i) (count (ref l 'mobjs))))
+  (when (or (< i 0) (>= (as-checked usize i) (count (ref l 'mobjs))))
     (fail "savegame: no mobj " i))
-  (return (ok ((ref l 'mobjs) (unsafe/cast usize i)))))
+  (return (ok ((ref l 'mobjs) (as-checked usize i)))))
 
 (defn- thinker-of (l:&Loader i:i32):(Fallible &Thinker)
-  (when (or (< i 0) (>= (unsafe/cast usize i) (count (ref l 'thinkers))))
+  (when (or (< i 0) (>= (as-checked usize i) (count (ref l 'thinkers))))
     (fail "savegame: no thinker " i))
-  (return (ok ((ref l 'thinkers) (unsafe/cast usize i)))))
+  (return (ok ((ref l 'thinkers) (as-checked usize i)))))
 
 (defn save-get (l:&Loader x:&?&Mobj):(Fallible void)
   (let (i (try (get-word l)))
@@ -217,7 +217,7 @@
 ; The vector functions are the caller's (~'count): ISSUE-010.
 (defmacro put-vec (s v)
   `(let (sl (~'view ~v))
-     (put-word ~s (unsafe/cast i32 (~'count &sl)))
+     (put-word ~s (as-checked i32 (~'count &sl)))
      (dotimes (i:usize (~'count &sl)) (save-put ~s (&sl i)))))
 
 ; The vector is refilled with `blank` to the saved length, then read over.
@@ -233,7 +233,7 @@
 ; automap's of a `(Vector ?&Mobj)` stamps the wrong instance (ISSUE-030).
 ; A none read into one is refused, since overloads can't refuse it (ISSUE-029).
 (defn- put-mobj-vec (s:&Saver v:&(Vector &Mobj)):void
-  (put-word s (unsafe/cast i32 (count v)))
+  (put-word s (as-checked i32 (count v)))
   (dotimes (i:usize (count v))
     (let (x:?&Mobj (some (v i))) (save-put s &x))))
 
@@ -247,7 +247,7 @@
 ; The same for a vector the level sizes: a save of another map is refused.
 (defmacro get-vec-sized (l v)
   `(let (n (try (get-word ~l)) sl (~'view ~v))
-     (when (!= n (unsafe/cast i32 (~'count &sl))) (fail "savegame: its map isn't this IWAD's"))
+     (when (!= n (as-checked i32 (~'count &sl))) (fail "savegame: its map isn't this IWAD's"))
      (dotimes (i:usize (~'count &sl)) (try (save-get ~l (&sl i))))))
 
 (defn save-put (s:&Saver x:&(Vector usize)):void (put-vec s x))
@@ -410,7 +410,7 @@
 (defstruct SaveInfo description:String rules:Rules)
 
 (defn- put-text (s:&Saver t:StrView):void
-  (put-word s (unsafe/cast i32 (t 'len)))
+  (put-word s (as-checked i32 (t 'len)))
   (dotimes (i:usize (t 'len)) (conj (ref s 'out) (unsafe/cast ui8 (byte-of t i)))))
 
 (defn- append (out:&(Vector ui8) more:&(Vector ui8)):void
@@ -450,8 +450,8 @@
       (put-word &s SAVE-VERSION)
       (put-text &s description)
       (save-put &s (ref w 'rules))
-      (put-word &s (unsafe/cast i32 (count (ref s 'thinkers))))
-      (put-word &s (unsafe/cast i32 (count (ref s 'mobjs))))
+      (put-word &s (as-checked i32 (count (ref s 'thinkers))))
+      (put-word &s (as-checked i32 (count (ref s 'mobjs))))
       (append (ref s 'out) &bodies)
       (append (ref s 'out) &world-bytes)
       (put-word &s SAVE-END)
@@ -471,7 +471,7 @@
   (let (v (try (get-word l)))
     (when (!= v SAVE-VERSION) (fail "savegame version " v ", not " SAVE-VERSION)))
   (let (n (try (get-word l)))
-    (when (or (< n 0) (> (+ (l 'pos) (unsafe/cast usize n)) (count (ref l 'data))))
+    (when (or (< n 0) (> (+ (l 'pos) (as-checked usize n)) (count (ref l 'data))))
       (fail "the savegame ends early"))
     (clear! (ref info 'description))
     (dotimes (i:i32 n)

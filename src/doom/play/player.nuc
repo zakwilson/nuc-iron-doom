@@ -69,7 +69,7 @@
       (set! (p 'view-z) (wrap-add (mo 'z) (p 'view-height)))
       (return))
     (let (angle (bit-and (* (/ FINEANGLES 20) (w 'level-time)) FINEMASK)
-          bob (fixed-mul (/ (p 'bob) 2) (finesine (unsafe/cast usize angle))))
+          bob (fixed-mul (/ (p 'bob) 2) (finesine (as-checked usize angle))))
       (when (= (p 'state) PST-LIVE)
         (set! (p 'view-height) (+ (p 'view-height) (p 'delta-view-height)))
         (when (> (p 'view-height) VIEWHEIGHT)
