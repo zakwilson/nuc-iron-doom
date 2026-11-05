@@ -144,8 +144,9 @@ scripts/check-demos.sh      # phase B: tic hashes against reference/data/
 make -C ../nucleus -j4 && make -C ../nucleus -k test bootstrap   # after a Nucleus fix (env.sh sourced)
 ```
 
-Only `env.sh` and `setup-cloud.sh` exist so far. Milestone 0 writes the rest
-(`PROMPT.md` §9). Update this list as scripts are added or renamed.
+Written so far: `env.sh`, `setup-cloud.sh`, `run-tests.sh`, `check-probes.sh`.
+`check-frames.sh`, `check-demos.sh` and `build-reference.sh` come with the
+milestones that need them. Update this list as scripts are added or renamed.
 
 ## Layout
 

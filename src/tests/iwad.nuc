@@ -1,0 +1,20 @@
+(ns tests.iwad)
+
+(import-use nucleus.test)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.file)
+(import-use doom.error)
+(import-use doom.iwad)
+
+(deftest iwad-found-in-xdg-data-dirs
+  (when (not (file-exists? (strview-from-cstr "/usr/share/games/doom/doom1.wad")))
+    (skip! "no shareware IWAD in /usr/share/games/doom"))
+  (match (locate-iwad none)
+    ((err e) (try (check false (failure-text &e))))
+    ((ok p) (try (check-contains (string-as-view &p) "doom1.wad")))))
+
+(deftest iwad-by-path-or-name
+  (match (locate-iwad (some (strview-from-cstr "no-such.wad")))
+    ((ok p) (try (check false "no-such.wad is not found")))
+    ((err e) (try (check-contains (failure-text &e) "No IWAD file was found")))))

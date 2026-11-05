@@ -2,8 +2,8 @@
 ; Nucleus port: see COPYING.
 ;
 ; Iron Doom has one parser module per map lump, each slicing fixed offsets out
-; of a chunk by hand. `defrecord` generates the struct, its on-disk size and
-; its reader from one field list, so a record's layout is written once.
+; of a chunk by hand. `derive-record` generates a record's on-disk size and
+; reader from its struct, so the layout is written once.
 
 (ns doom.record)
 
@@ -12,6 +12,7 @@
 (import-use nucleus.create)
 (import-use nucleus.coll)
 (import-use nucleus.node)
+(import-ct nucleus.node)
 (import-use doom.bytes)
 
 (defn read-field (dst:&i16 b:&Bytes o:&usize):void
@@ -22,21 +23,27 @@
   (set! @dst (name-at b @o))
   (set! @o (+ @o 8)))
 
+(defn disk-size (x:&i16):usize (return 2))
+(defn disk-size (x:&Name):usize (return 8))
+
 (defprotocol Record
   (record-size (x:&Self):usize)
   (read-record (out:&Self b:&Bytes off:usize):void))
 
-; Each field is (name type) with type i16 or Name, in on-disk order.
-(defmacro defrecord (rec :rest fields)
-  (let (size:i64 0)
-    (dotimes (i (ast-len fields))
-      (set! size (+ size (if (= (ast-at (ast-at fields i) 1) 'Name) 8 2))))
+; (derive-record T): T's fields, in order, are its on-disk layout. The struct is
+; written out rather than generated, because a macro-defined type can't appear
+; in another function's signature (ISSUE-011).
+(defmacro derive-record (rec)
+  (let (fs (struct-fields rec) sizes (node-list-new 0) reads (node-list-new 0))
+    (dotimes (i (ast-len fs))
+      (let (f (ast-at (ast-at fs i) 0))
+        (node-push sizes `(set! n (+ n (disk-size (ref x '~f)))))
+        (node-push reads `(read-field (ref out '~f) b &o))))
     ; List-form parameters: `out:&~rec` is one atom the template can't reach (ISSUE-002).
-    `(do (defstruct ~rec ~@fields)
-         (defn record-size ((x (ref ~rec))):usize ~(node-int size))
+    `(do (defn record-size ((x (ref ~rec))):usize
+           (let (n:usize 0) ~@sizes n))
          (defn read-record ((out (ref ~rec)) b:&Bytes off:usize):void
-           (let (o off)
-             (macmap ((f) `(read-field (ref out '~(ast-at f 0)) b &o)) ~fields)))
+           (let (o off) ~@reads))
          (extend ~rec Record))))
 
 ; Every whole record in `b`; a trailing partial one is ignored, as chunks_exact does.

@@ -1,0 +1,33 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; Everything the game reads from the IWAD (Iron Doom's WadFile resource).
+
+(ns doom.assets)
+
+(import-use nucleus.vector)
+(import-use nucleus.hashmap)
+(import-use nucleus.strview)
+(import-use doom.error)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.mapdata)
+(import-use doom.graphics)
+
+(defstruct Assets
+  ; Owns the file's bytes; the rest are views into them.
+  wad:Wad
+  maps:(HashMap Name Map)
+  flats:Flats
+  textures:WallTextures
+  palettes:(Vector Palette)
+  title:Patch)
+
+(defn assets-load (path:StrView):(Fallible Assets)
+  (let (w (try (wad-open path))
+        title (try (patch-parse (ref (try (lump-named &w "TITLEPIC")) 'data))))
+    (return (ok (Assets w (maps-parse &w) (try (flats-parse &w)) (try (textures-parse &w))
+                        (try (palettes-parse &w)) title)))))
+
+(defn find-map (a:&Assets episode:i32 m:i32):?Map
+  (return (get (ref a 'maps) (map-name episode m))))

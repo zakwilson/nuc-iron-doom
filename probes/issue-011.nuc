@@ -1,0 +1,16 @@
+; ISSUE-011: a function whose signature names a macro-defined struct is
+; silently generic: the signature prescan takes the unknown name as a type variable.
+; fixed-when: runs
+; Actual: "in generic body: unknown function 'ok'" at the defn below the macro
+; call, though the struct is defined by then.
+
+(defmacro defpoint (nm) `(defstruct ~nm x:i32 y:i32))
+(defpoint Point)
+
+(defn origin ():!Point
+  (return (ok (Point 0 0))))
+
+(defn main ():i32
+  (match (origin)
+    ((ok p) (return (p 'x)))
+    ((err e) (return 1))))

@@ -23,11 +23,17 @@ Nucleus as follows:
   for a back sector). Dropping the arena unloads the level.
 - **`anyhow::Result` + `#[sys_fail]` → `!T` and `try`**, propagated to `main`,
   the only place that prints and exits.
-- **`clap` derive → a macro (`defoptions`)** that generates the options struct
-  and its parser from one table.
-- **WAD record parsers → a `defrecord` macro** that generates each map-record
-  struct and its little-endian reader from one field list, plus a generic
-  `read-records` over a `Record` protocol.
+- **`clap` derive → a macro (`defoptions`)** over a written options struct:
+  one table row per flag gives the spelling and help, and the field's type picks
+  the overloaded `read-option` that parses it. The macro checks each row names a
+  field (`struct-fields`).
+- **WAD record parsers → `derive-record`**, which generates each map record's
+  size and little-endian reader from its written struct, plus a generic
+  `read-records` over a `Record` protocol. (The first design generated the
+  structs too; ISSUE-011 made a macro-defined type unusable in signatures.)
+- **`anyhow` messages → `(Fallible T)`**, a `Result` whose error carries a
+  formatted message, with `defcast`s both ways to the stdlib's `!T`, and a
+  `fail` macro for `bail!`.
 
 Why not a macro-built ECS: Iron Doom's systems each touch one or two
 resources, and the world is a fixed set of level arrays. An ECS would add a
@@ -40,8 +46,8 @@ it.
 
 | Milestone | State |
 |---|---|
-| 0. Setup | in progress |
-| 1. Foundations | not started |
+| 0. Setup | done, except the reference frames (see below) |
+| 1. Foundations | done: CLI and response files, IWAD search, WAD directory, every lump parser, RNG, 12 unit tests |
 | 2. Screens | not started |
 | 3. Level and walls | not started |
 | 4–8 (phase B) | not started |
@@ -55,10 +61,24 @@ Doom from a session. To record them, either approve
 `scripts/build-reference.sh` in a session, or add it to the environment's
 setup script after `setup-cloud.sh`.
 
+## Compiler fixes
+
+Fixes the port made to Nucleus. The session can't push to `zakwilson/nucleus`,
+so each is committed in `../nucleus` (branch `doom-bugfixes`) and carried here
+as a patch in `nucleus-patches/`, which `setup-cloud.sh` applies.
+
+| Issue | Nucleus commit | Patch |
+|---|---|---|
+| ISSUE-006 | `06230b5` | `nucleus-patches/0001-*.patch` |
+| ISSUE-009 | not yet committed (gate running) | — |
+
 ## In flight
 
-- Nothing long-running.
+- ISSUE-009's compiler gate (`make -k test bootstrap` in `../nucleus`). The
+  fix is in `../nucleus`'s working tree, and the port's `cli.nuc` needs it.
 
 ## Next steps
 
-- Milestone 0: hello-SDL, probes infrastructure.
+- Commit ISSUE-009 in `../nucleus` and add its patch.
+- Milestone 2: SDL video (palette, gamma, 320×200 into a 4:3 window), patch
+  drawing, title screen, melt, input, exit, `-framedump`.

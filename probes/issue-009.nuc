@@ -1,0 +1,13 @@
+; ISSUE-009: (some v) and none aren't built against the type of a (deref p) or
+; (aref a i) place, as they are for a field or a named local.
+; fixed-when: runs
+; Actual: "some: value must be non-null (ref ...)" for (some 4), and
+; "set!: (deref p) place: value type mismatch" for none.
+
+(defn main ():i32
+  (let (m:?i32 none p:&?i32 &m)
+    (set! @p (some 4))
+    (match m
+      ((some v) (set! @p none))
+      ((none) (return 1)))
+    (match m ((some v) (return 2)) ((none) (return 0)))))

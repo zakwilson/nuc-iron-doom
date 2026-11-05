@@ -18,20 +18,22 @@
 (import-use doom.record)
 (import-use doom.wad)
 
-(defrecord MapThing (x i16) (y i16) (angle i16) (thing-type i16) (options i16))
-(defrecord MapLine (v1 i16) (v2 i16) (flags i16) (special i16) (tag i16)
-  (front-side i16) (back-side i16))
-(defrecord MapSide (x-offset i16) (y-offset i16)
-  (top-texture Name) (lower-texture Name) (middle-texture Name) (sector i16))
-(defrecord MapVertex (x i16) (y i16))
-(defrecord MapSegment (v1 i16) (v2 i16) (angle i16) (line i16) (side i16) (offset i16))
-(defrecord MapSubSector (num-segs i16) (first-seg i16))
-(defrecord MapNode (x i16) (y i16) (dx i16) (dy i16)
-  (right-box-top i16) (right-box-bottom i16) (right-box-left i16) (right-box-right i16)
-  (left-box-top i16) (left-box-bottom i16) (left-box-left i16) (left-box-right i16)
-  (right-child i16) (left-child i16))
-(defrecord MapSector (floor-height i16) (ceiling-height i16)
-  (floor-tex Name) (ceiling-tex Name) (light-level i16) (special i16) (tag i16))
+(defstruct MapThing x:i16 y:i16 angle:i16 thing-type:i16 options:i16)
+(defstruct MapLine v1:i16 v2:i16 flags:i16 special:i16 tag:i16 front-side:i16 back-side:i16)
+(defstruct MapSide x-offset:i16 y-offset:i16
+  top-texture:Name lower-texture:Name middle-texture:Name sector:i16)
+(defstruct MapVertex x:i16 y:i16)
+(defstruct MapSegment v1:i16 v2:i16 angle:i16 line:i16 side:i16 offset:i16)
+(defstruct MapSubSector num-segs:i16 first-seg:i16)
+(defstruct MapNode x:i16 y:i16 dx:i16 dy:i16
+  right-box-top:i16 right-box-bottom:i16 right-box-left:i16 right-box-right:i16
+  left-box-top:i16 left-box-bottom:i16 left-box-left:i16 left-box-right:i16
+  right-child:i16 left-child:i16)
+(defstruct MapSector floor-height:i16 ceiling-height:i16
+  floor-tex:Name ceiling-tex:Name light-level:i16 special:i16 tag:i16)
+
+(macmap ((r) `(derive-record ~r))
+  (MapThing MapLine MapSide MapVertex MapSegment MapSubSector MapNode MapSector))
 
 (defstruct MapBlockMap
   origin-x:i16 origin-y:i16 width:i16 height:i16

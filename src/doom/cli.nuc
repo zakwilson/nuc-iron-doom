@@ -18,6 +18,7 @@
 (import-use nucleus.io)
 (import-use nucleus.parse)
 (import-use nucleus.node)
+(import-ct nucleus.node)
 (import-use doom.error)
 (import-use doom.util)
 
@@ -156,31 +157,41 @@
 
 ; --- the table -------------------------------------------------------------------
 
-; (defoptions Name (field Type "-flag" "VALUE" "help") …) defines the struct
-; (each field starts unset), `parse-<Name>` over the arguments, and `usage-<Name>`.
+; (defoptions T (field "-flag" "VALUE" "help") …) generates `parse-options`,
+; filling a T from the arguments, and `print-usage`. Each row's field must be
+; one of T's, and its type picks the `read-option` that reads it. T is written
+; out, since a macro-defined type can't appear in a signature (ISSUE-011).
 (defmacro defoptions (nm :rest opts)
-  `(do (defstruct ~nm ~@(macmap ((o) `(~(ast-at o 0) ~(ast-at o 1))) ~opts))
-       (defn parse-options (out:&~nm a:&(Slice StrView)):(Fallible void)
-         (let (i:usize 0)
-           (while (< i (count a))
-             (let (arg @(a i))
-               (cond
-                 ~@(macmap ((o) `((= arg (strview-from-cstr ~(ast-at o 2)))
-                                  (try (read-option (ref out '~(ast-at o 0)) a &i arg))))
-                           ~opts)
-                 (true (fail "unexpected argument '" arg "' found"))))
-             (inc! i)))
-         (return (ok)))
-       (defn print-usage ((o (ref ~nm))):void
-         (println "Usage: nuc-iron-doom [OPTIONS]\n\nOptions:")
-         ~@(macmap ((o) `(println "  " ~(ast-at o 2) " <" ~(ast-at o 3) ">\n          " ~(ast-at o 4)))
-                   ~opts)
-         (println "  -response <FILES>...\n          Load extra command line arguments from the given response file"))))
+  (let (fs (struct-fields nm) tests (node-list-new 0) helps (node-list-new 0))
+    (dotimes (k (ast-len opts))
+      (let (o (ast-at opts k) found false)
+        (dotimes (j (ast-len fs))
+          (when (= (ast-at (ast-at fs j) 0) (ast-at o 0)) (set! found true)))
+        (when (not found) (macro-error o "defoptions: no such field in the options struct"))
+        (node-push tests `(= arg (strview-from-cstr ~(ast-at o 1))))
+        (node-push tests `(try (read-option (ref out '~(ast-at o 0)) a &i arg)))
+        (node-push helps `(println "  " ~(ast-at o 1) " <" ~(ast-at o 2) ">\n          "
+                                   ~(ast-at o 3)))))
+    `(do (defn parse-options ((out (ref ~nm)) (a (ref (Slice StrView)))):(Fallible void)
+           (let (i:usize 0)
+             ; A template's `count` must name one namespace's methods (ISSUE-010).
+             (while (< i (nucleus.slice/count a))
+               (let (arg @(a i))
+                 (cond ~@tests
+                       true (fail "unexpected argument '" arg "' found")))
+               (inc! i)))
+           (return (ok)))
+         (defn print-usage ((o (ref ~nm))):void
+           (println "Usage: nuc-iron-doom [OPTIONS]\n\nOptions:")
+           ~@helps
+           (println "  -response <FILES>...\n          "
+                    "Load extra command line arguments from the given response file")))))
+
+(defstruct CommandLine iwad:?StrView framedump:?Framedump)
 
 (defoptions CommandLine
-  (iwad ?StrView "-iwad" "FILE" "Specify an IWAD file to use")
-  (framedump ?Framedump "-framedump" "TICS DIR"
-             "Run TICS tics headless, writing each frame to DIR as a PPM"))
+  (iwad "-iwad" "FILE" "Specify an IWAD file to use")
+  (framedump "-framedump" "TICS DIR" "Run TICS tics headless, writing each frame to DIR as a PPM"))
 
 (defn command-line-from (args:&Args):(Fallible CommandLine)
   (let (a1 (try (legacy-response-files args))

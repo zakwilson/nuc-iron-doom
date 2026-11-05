@@ -9,7 +9,10 @@ provisional until milestone 8.)
 
 | Issue | Claim | Severity | Kind |
 |---|---|---|---|
+| ISSUE-011 | A macro-defined struct can't appear in any other function's signature | major | design |
 | ISSUE-006 | A struct defined by a macro can't be a field type | major | bug |
+| ISSUE-009 | `(some v)`/`none` aren't target-typed through a `deref` or `aref` place | minor | bug |
+| ISSUE-010 | A macro template can't call `count` where two collection namespaces are imported | minor | design |
 | ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature |
 | ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature |
 | ISSUE-004 | `dotimes` over a literal binds an `i32` that can't meet a `usize` | minor | design |
@@ -163,6 +166,86 @@ literal in a test. A macro that returns the value is the natural shape (it can
 then feed a `defvar` or a local too). Having it return a definition makes the
 table's name an argument of the generator, and the definition no longer reads
 as a `defconst` at the site.
+
+## ISSUE-009: `(some v)` and `none` aren't target-typed through a `deref` or `aref` place
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed-in-compiler (nucleus `doom-bugfixes`, gate running)
+- **Probe:** `probes/issue-009.nuc` — expected `(set! @p (some 4))` with
+  `p:&?i32` to store a `some`; actual `some: value must be non-null (ref ...)`,
+  and `(set! @p none)` gives `set!: (deref p) place: value type mismatch`
+- **Port sites:** `src/doom/cli.nuc` (`read-option`, which fills an option
+  through `dst:&?StrView`)
+- **Workaround:** before the fix, `((Maybe StrView) some v)` spelled out.
+
+Context: a field place `(set! (s 'f) (some 4))` and a named local both build
+the arm against the place's type, so the deref place looked like an oversight,
+and it is: the field and binding `set!` paths call `union-target-rewrite` and
+arm the want channel, and the `deref` and `aref` paths didn't. Writing through
+an out-parameter is how the option parser fills each field, as Rust's
+`*dst = Some(v)` does. The fix is one shared helper for the two paths.
+
+## ISSUE-010: a macro template can't call `count` where two collection namespaces are imported
+
+- **Severity:** minor
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-010.nuc` — expected `` `(count ~s) `` in a template
+  to compile in a file importing `nucleus.vector` and `nucleus.slice`; actual
+  `macro 'total' names 'count', whose methods here come from namespaces
+  'nucleus.vector', 'nucleus.slice', and a full name reaches one`
+- **Port sites:** `src/doom/cli.nuc` (`defoptions`)
+- **Workaround:** write the full name of the one namespace you mean,
+  `nucleus.slice/count`, in the template.
+- **Suggestion:** a protocol that every collection's `count` conforms to (a
+  `Counted` protocol, or `Coll` covering `Slice`) gives hygiene a single full
+  name. At the least, say "write one of these full names in the template:
+  nucleus.vector/count, nucleus.slice/count", and list each namespace once.
+
+Context: template hygiene (stage 23, ruling D2) rewrites a free name to one
+namespace's full name, and refuses an overload whose methods no single
+namespace or protocol covers. `count` is defined separately by `Vector`,
+`Slice`, `HashMap`, `Node` and others, so any file that imports two of them
+can't use `count` in a template, though the same file calls it freely. In
+`src/doom/cli.nuc` the message listed `'nucleus.vector'` thirteen times among
+twenty-one entries, and "a full name reaches one" reads as a statement rather
+than the fix.
+
+## ISSUE-011: a macro-defined struct can't appear in any other function's signature
+
+- **Severity:** major
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-011.nuc` — expected `(defn origin ():!Point …)`
+  below `(defpoint Point)` to compile; actual `unknown type: Point — not
+  defined anywhere in this compilation unit`. Inside a template argument it's
+  worse: `(defn command-line-from …):(Fallible CommandLine)` silently became a
+  generic over a type variable named `CommandLine`, and the error was `in
+  generic body: unknown function 'ok'`.
+- **Port sites:** `src/doom/record.nuc` (`derive-record`), `src/doom/cli.nuc`
+  (`defoptions`), `src/doom/mapdata.nuc`
+- **Workaround:** write the struct by hand and have the macro derive its code
+  from `struct-fields`, so the type exists before any prescan runs.
+- **Suggestion:** treat a name that a top-level macro call in the unit might
+  define as "pending" rather than unknown or a type variable, and settle the
+  signature when its `defn` is reached. Separately, an implicit type variable
+  that is also spelled like a concrete type (capitalized, multi-letter, not
+  declared anywhere) deserves at least a warning.
+
+Context: both signature prescans (types, then `defn` signatures) run before
+any macro has expanded, and an unresolvable name in a template-argument
+position is, by rule, a fresh type variable. So a struct a macro defines is a
+second-class type: usable in bodies and (after ISSUE-006's fix) as a field
+type, but in no signature outside the macro's own expansion, in any file,
+because the whole-graph prescan reads every file's signatures first. The
+port's first designs, `defrecord` generating each map struct and
+`defoptions` generating the options struct (the clap-derive analogue), both
+hit this, and the workaround changes the design: the struct is now written
+twice in spirit, once as a `defstruct` and once as the macro's row list for
+`defoptions`. The `derive-record` form is arguably the better idiom (it's how
+serde derives), but the language pushed the port there rather than letting it
+choose.
 
 ## What worked well
 
