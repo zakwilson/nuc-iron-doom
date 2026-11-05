@@ -13,14 +13,17 @@
 (import-use doom.cli)
 (import-use doom.iwad)
 (import-use doom.assets)
+(import-use doom.video)
+(import-use doom.game)
 
 (defn run (argc:i32 argv:ptr):(Fallible void)
   (let (cl (try (command-line argc argv))
         path (try (locate-iwad (cl 'iwad)))
-        assets (try (assets-load (string-as-view &path))))
-    (println "IWAD: " (string-as-view &path) ", " (count (ref assets 'maps)) " maps, "
-             (count (ref (ref assets 'textures) 'list)) " textures")
-    (return (ok))))
+        assets (try (assets-load (string-as-view &path)))
+        g (game-new cl assets (try (video-open))))
+    (let (r (game-run &g))
+      (video-close (ref g 'video))
+      (return r))))
 
 (defn main (argc:i32 argv:ptr):int
   (match (run argc argv)

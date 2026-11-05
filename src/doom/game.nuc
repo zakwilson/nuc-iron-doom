@@ -1,0 +1,144 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; The game state and the tic. Iron Doom's Bevy app runs, each frame, PreUpdate
+; (input), StateTransition, FixedUpdate (one 35 Hz tic), Update, PostUpdate
+; (drawing) and Last (presenting); `game-tic` runs the same steps in that order.
+; States become `Mode`, and a requested change waits in `pending` until the
+; next tic's transition step, as NextState does.
+
+(ns doom.game)
+
+(import-use "SDL2/SDL.h")
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.cli)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.assets)
+(import-use doom.rand)
+(import-use doom.video)
+(import-use doom.melt)
+(import-use doom.framedump)
+
+; Bevy's fixed timestep: Duration::from_secs_f64(1/35), which truncates to whole ns.
+(defconst TIC-NS 28571428)
+; The title shows for 1.7142857142857143 s (60 tics of real time), so the 61st
+; tic's timer tick finishes it.
+(defconst TITLE-NS 1714285714)
+
+(defunion Mode
+  (setup)
+  (intro elapsed-ns:i64)
+  (level)
+  (melt))
+
+(defn- mode-id (m:&Mode):i32
+  (match @m ((setup) 0) ((intro e) 1) ((level) 2) ((melt) 3)))
+
+(defstruct Game
+  cl:CommandLine
+  assets:Assets
+  video:Video
+  screen:Buffer
+  rand:Rand
+  mode:Mode
+  pending:?Mode
+  ; The melt in progress, while `mode` is melt.
+  melt:?Melt
+  tic:i32
+  quit:bool)
+
+(defn game-new (cl:CommandLine assets:Assets video:Video):Game
+  (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
+                (Mode-setup) none none 0 false)))
+
+(defn- palette0 (g:&Game):&Palette
+  (let (ps (view (ref (ref g 'assets) 'palettes)))
+    (return (&ps 0))))
+
+; PreUpdate: SDL events. Closing the window quits, as in Iron Doom; Escape
+; quits too, since the window is fullscreen and Iron Doom binds nothing else.
+(defn- poll-input (g:&Game):void
+  (let (ev (alloca SDL_Event))
+    (while (!= (SDL_PollEvent ev) 0)
+      (let (t (ev 'type))
+        (when (= t SDL_QUIT) (set! (g 'quit) true))
+        (when (and (= t SDL_KEYDOWN) (= (((ref ev 'key) 'keysym) 'scancode) SDL_SCANCODE_ESCAPE))
+          (set! (g 'quit) true))))))
+
+; The level, drawn into the screen buffer (milestone 3).
+(defn- draw-level (g:&Game):(Fallible void)
+  (return (ok)))
+
+(defn game-tic (g:&Game):(Fallible void)
+  (inc! (g 'tic))
+  (poll-input g)
+  ; StateTransition.
+  (let (from (mode-id (ref g 'mode)) entered:bool false)
+    (when-some (next (g 'pending))
+      (set! (g 'mode) next)
+      (set! (g 'pending) none)
+      (set! entered true))
+    (let (to (mode-id (ref g 'mode)) load-level false)
+      ; FixedUpdate.
+      (match (g 'mode)
+        ((setup) 0)
+        ((intro elapsed)
+         (when (= elapsed 0)
+           (try (draw-patch (ref g 'screen) 0 0 (ref (ref g 'assets) 'title))))
+         (let (now (+ elapsed TIC-NS))
+           (set! (g 'mode) (Mode-intro now))
+           (when (and (< elapsed TITLE-NS) (>= now TITLE-NS)) (set! load-level true))))
+        ((level) 0)
+        ((melt)
+         (when-some (m (g 'melt))
+           ; A copy, but its columns and screens are the same heap buffers.
+           (let (mm m)
+             (when (melt-tic &mm (ref g 'screen))
+               (set! (g 'melt) none)
+               (set! (g 'pending) (some (Mode-level))))))))
+      ; Update.
+      (match (g 'mode)
+        ((setup) (set! (g 'pending) (some (Mode-intro 0))))
+        ((intro e) 0) ((level) 0) ((melt) 0))
+      (when load-level
+        (set! (g 'pending) (some (Mode-level))))
+      ; A scene change other than into or out of the melt starts one: the old
+      ; screen is kept, the new scene drawn, and the melt shows the old screen first.
+      (let (melting (and entered (!= from to) (!= from 0) (!= from 3) (!= to 3))
+            start:?Buffer (if melting (some (copy-of (ref g 'screen))) none))
+        ; PostUpdate.
+        (match (g 'mode) ((level) (try (draw-level g))) ((setup) 0) ((intro e) 0) ((melt) 0))
+        (when-some (st start)
+          (let (end (copy-of (ref g 'screen)))
+            (copy-from (ref g 'screen) &st)
+            (set! (g 'melt) (some (melt-new st end (ref g 'rand))))
+            (set! (g 'pending) (some (Mode-melt))))))))
+  ; Last.
+  (when-some (fd ((ref g 'cl) 'framedump))
+    (when (dump-tic? &fd (g 'tic))
+      (try (framedump-write (fd 'dir) (g 'tic) (ref g 'screen) (palette0 g) 0)))
+    (when (>= (g 'tic) (last-tic &fd)) (set! (g 'quit) true)))
+  (try (video-present (ref g 'video) (ref g 'screen)))
+  (return (ok)))
+
+(defn game-run (g:&Game):(Fallible void)
+  (try (video-set-palette (ref g 'video) (palette0 g) 0))
+  (let (headless (some? ((ref g 'cl) 'framedump))
+        start-ms (SDL_GetTicks64)
+        n:ui64 0)
+    (while (not (g 'quit))
+      (try (game-tic g))
+      (inc! n)
+      ; 35 tics a second in real time; a framedump runs as fast as it can.
+      (when (not headless)
+        (let (due (+ start-ms (/ (* n 1000) 35)) now (SDL_GetTicks64))
+          (when (< now due) (SDL_Delay (unsafe/cast ui32 (- due now))))))))
+  (return (ok)))

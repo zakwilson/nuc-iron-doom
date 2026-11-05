@@ -36,6 +36,11 @@
   (let (s (view (ref self 'data)))
     (dotimes (i:usize (count &s)) (set &s i v))))
 
+(defn copy-of (src:&(Array2d T)):(Array2d T)
+  (let (d (array2d (src 'width) (src 'height) ((ref src 'data) 0)))
+    (copy-from &d src)
+    (return d)))
+
 (defn copy-from (self:&(Array2d T) src:&(Array2d T)):void
   (let (d (view (ref self 'data)) s (view (ref src 'data)))
     (dotimes (i:usize (count &d)) (set &d i @(&s i)))))

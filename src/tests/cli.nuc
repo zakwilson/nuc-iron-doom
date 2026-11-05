@@ -15,7 +15,7 @@
     (conj &a (strview-from-cstr "-iwad"))
     (conj &a (strview-from-cstr "doom1.wad"))
     (conj &a (strview-from-cstr "-framedump"))
-    (conj &a (strview-from-cstr "70"))
+    (conj &a (strview-from-cstr "2,70"))
     (conj &a (strview-from-cstr "out"))
     (match (command-line-from &a)
       ((err e) (try (check false (failure-text &e))))
@@ -24,7 +24,8 @@
        (match (cl 'framedump)
          ((none) (try (check false "framedump parsed")))
          ((some fd)
-          (try (check-eq-int (as i64 (fd 'tics)) 70 "framedump tics"))
+          (try (check-eq-int (as i64 (last-tic &fd)) 70 "framedump last tic"))
+          (try (check (dump-tic? &fd 2) "framedump tic 2"))
           (try (check-eq (fd 'dir) "out"))))))))
 
 (deftest unknown-option-is-an-error

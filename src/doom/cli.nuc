@@ -17,6 +17,7 @@
 (import-use nucleus.fmt)
 (import-use nucleus.io)
 (import-use nucleus.parse)
+(import-use nucleus.math)
 (import-use nucleus.node)
 (import-ct nucleus.node)
 (import-use doom.error)
@@ -146,14 +147,36 @@
       ((err e) (fail "invalid value '" s "' for '" flag "'"))))
   (return (ok)))
 
-; -framedump TICS DIR: run TICS tics headless, writing each frame to DIR.
-(defstruct Framedump tics:i32 dir:StrView)
+; -framedump TICS DIR: write the frames of the listed tics (comma-separated) to
+; DIR, then exit. Tic 1 is the first, still in setup, as reference/iron-doom.patch counts.
+(defstruct Framedump tics:(Vector i32) dir:StrView)
 
 (defn read-option (dst:&?Framedump a:&(Slice StrView) i:&usize flag:StrView):(Fallible void)
-  (let (n:?i32 none)
-    (try (read-option &n a i flag))
-    (set! @dst (some (Framedump (unwrap-or n 0) (try (value-arg a i flag)))))
+  (let (list (try (value-arg a i flag))
+        tics (make (Vector i32))
+        b (unsafe/cast &ui8 (list 'data))
+        start:usize 0
+        k:usize 0)
+    (while (<= k (list 'len))
+      (when (or (= k (list 'len)) (= @(unsafe/cast &ui8 (unsafe/ptr+ b (as-checked i64 k))) 44))
+        (let (part (strview (unsafe/cast &ui8 (unsafe/ptr+ b (as-checked i64 start))) (- k start)))
+          (match (parse i32 &part)
+            ((ok n) (conj &tics n))
+            ((err e) (fail "invalid tic '" part "' for '" flag "'"))))
+        (set! start (+ k 1)))
+      (inc! k))
+    (set! @dst (some (Framedump tics (try (value-arg a i flag)))))
     (return (ok))))
+
+(defn last-tic (fd:&Framedump):i32
+  (let (m 0 v (view (ref fd 'tics)))
+    (dotimes (i:usize (count &v)) (set! m (max m @(&v i))))
+    (return m)))
+
+(defn dump-tic? (fd:&Framedump tic:i32):bool
+  (let (v (view (ref fd 'tics)))
+    (dotimes (i:usize (count &v)) (when (= @(&v i) tic) (return true)))
+    (return false)))
 
 ; --- the table -------------------------------------------------------------------
 
@@ -191,7 +214,7 @@
 
 (defoptions CommandLine
   (iwad "-iwad" "FILE" "Specify an IWAD file to use")
-  (framedump "-framedump" "TICS DIR" "Run TICS tics headless, writing each frame to DIR as a PPM"))
+  (framedump "-framedump" "TICS DIR" "Write the frames of the listed tics (1,2,…) to DIR as PPMs, then exit"))
 
 (defn command-line-from (args:&Args):(Fallible CommandLine)
   (let (a1 (try (legacy-response-files args))
