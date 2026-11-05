@@ -1,0 +1,151 @@
+diff --git a/crates/cli/src/lib.rs b/crates/cli/src/lib.rs
+index 9d2e004..c5de2a2 100644
+--- a/crates/cli/src/lib.rs
++++ b/crates/cli/src/lib.rs
+@@ -24,6 +24,10 @@ pub struct CommandLine {
+     /// Load extra command line arguments from the given response file
+     #[arg(long, num_args = 1.., value_name = "FILES")]
+     pub response: Vec<PathBuf>,
++
++    /// Write frames at the listed tics as PPMs in DIR, then exit
++    #[arg(long, num_args = 2, value_names = ["TICS", "DIR"])]
++    pub framedump: Vec<String>,
+ }
+ 
+ impl FromWorld for CommandLine {
+diff --git a/crates/window/Cargo.toml b/crates/window/Cargo.toml
+index 1602dcf..054493a 100644
+--- a/crates/window/Cargo.toml
++++ b/crates/window/Cargo.toml
+@@ -6,6 +6,7 @@ edition = "2024"
+ [dependencies]
+ anyhow = { workspace = true }
+ bevy = { workspace = true }
++cli = { path = "../cli" }
+ common = { path = "../common" }
+ derive_more = { workspace = true }
+ exit = { path = "../exit" }
+diff --git a/crates/window/src/framedump.rs b/crates/window/src/framedump.rs
+new file mode 100644
+index 0000000..c157bba
+--- /dev/null
++++ b/crates/window/src/framedump.rs
+@@ -0,0 +1,67 @@
++//! Reference harness (nuc-iron-doom): `--framedump <tic,tic,...> <dir>` writes the
++//! screen buffer as a PPM after each listed FixedUpdate tic, then exits.
++
++use crate::palette::GAMMA_TABLE;
++use crate::ScreenBuffer;
++use bevy::prelude::*;
++use cli::CommandLine;
++use std::io::Write;
++use wad::prelude::*;
++
++pub struct FramedumpPlugin;
++
++impl Plugin for FramedumpPlugin {
++    fn build(&self, app: &mut App) {
++        app.init_resource::<TicCount>()
++            .add_systems(FixedFirst, count_tic)
++            .add_systems(Last, dump_frame);
++    }
++}
++
++#[derive(Resource, Default)]
++struct TicCount {
++    tics: u32,
++    dumped: u32,
++}
++
++fn count_tic(mut count: ResMut<TicCount>) {
++    count.tics += 1;
++}
++
++fn dump_frame(
++    mut count: ResMut<TicCount>,
++    cli: Res<CommandLine>,
++    screen: Res<ScreenBuffer>,
++    wad: Option<Res<WadFile>>,
++    mut exit: EventWriter<AppExit>,
++) {
++    if cli.framedump.len() != 2 || count.dumped == count.tics {
++        return;
++    }
++    count.dumped = count.tics;
++    let tics: Vec<u32> = cli.framedump[0]
++        .split(',')
++        .filter_map(|t| t.parse().ok())
++        .collect();
++    if !tics.contains(&count.tics) {
++        return;
++    }
++    let Some(wad) = wad else { return };
++    let palette = wad.get_palette(PaletteVariant::Palette0);
++    let gamma = &GAMMA_TABLE[0];
++    let mut out = Vec::with_capacity(320 * 200 * 3 + 16);
++    write!(out, "P6\n320 200\n255\n").unwrap();
++    for y in 0..200 {
++        for x in 0..320 {
++            let c = &palette[screen[(x, y)] as usize];
++            out.push(gamma[c.r as usize] & !3);
++            out.push(gamma[c.g as usize] & !3);
++            out.push(gamma[c.b as usize] & !3);
++        }
++    }
++    let path = format!("{}/tic{:05}.ppm", cli.framedump[1], count.tics);
++    std::fs::write(&path, out).unwrap();
++    if Some(&count.tics) == tics.iter().max() {
++        exit.send(AppExit::Success);
++    }
++}
+diff --git a/crates/window/src/lib.rs b/crates/window/src/lib.rs
+index 47e4f18..b029b7e 100644
+--- a/crates/window/src/lib.rs
++++ b/crates/window/src/lib.rs
+@@ -7,6 +7,7 @@ use palette::PalettePlugin;
+ use sdl_window::SdlWindowPlugin;
+ 
+ mod exit;
++mod framedump;
+ mod input;
+ pub mod palette;
+ mod sdl_window;
+@@ -32,6 +33,7 @@ impl Plugin for WindowPlugin {
+     fn build(&self, app: &mut App) {
+         app.init_resource::<ScreenBuffer>()
+             .add_plugins((InputPlugin, PalettePlugin, SdlWindowPlugin, ExitAppPlugin))
++            .add_plugins(framedump::FramedumpPlugin)
+             .set_runner(window_runner);
+     }
+ }
+diff --git a/crates/window/src/palette.rs b/crates/window/src/palette.rs
+index 1c802dd..75c2b8b 100644
+--- a/crates/window/src/palette.rs
++++ b/crates/window/src/palette.rs
+@@ -8,6 +8,7 @@ use sdl2::pixels::{Color as SdlColor, Palette as SdlPalette};
+ use wad::prelude::*;
+ 
+ mod gamma_table;
++pub(crate) use gamma_table::GAMMA_TABLE;
+ 
+ pub struct PalettePlugin;
+ 
+diff --git a/src/main.rs b/src/main.rs
+index cd6e116..ebba5f2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,7 +11,13 @@ mod crates_plugins;
+ pub const TIC_RATE: f64 = 35.0;
+ 
+ fn main() -> AppExit {
+-    App::new()
++    let mut app = App::new();
++    // --framedump: advance exactly one fixed tic per frame, so dumps are deterministic.
++    if std::env::args().any(|a| a == "--framedump") {
++        let tic = Time::<Fixed>::from_hz(TIC_RATE).timestep();
++        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(tic));
++    }
++    app
+         .insert_resource(Time::<Fixed>::from_hz(TIC_RATE))
+         .add_plugins(CratesPlugins.set(LogPlugin {
+             #[cfg(debug_assertions)]

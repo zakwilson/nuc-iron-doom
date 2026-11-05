@@ -1,0 +1,13 @@
+(import-use "SDL2/SDL.h")
+(import-use nucleus.io)
+
+(defn main (argc:i32 argv:ptr:CStr):int
+  (when (!= (SDL_Init SDL_INIT_VIDEO) 0)
+    (eprintln "SDL_Init failed")
+    (return 1))
+  (let (w (SDL_CreateWindow "nuc-iron-doom" 0 0 320 240 0))
+    (when (null? w) (eprintln "no window") (return 1))
+    (println "hello SDL")
+    (SDL_DestroyWindow w))
+  (SDL_Quit)
+  0)

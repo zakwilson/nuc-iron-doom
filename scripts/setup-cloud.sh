@@ -11,7 +11,8 @@ LLVM=20
 
 # The image ships LLVM 18; Nucleus needs 19+. doom-wad-shareware is the 1.9
 # shareware IWAD, at /usr/share/games/doom/doom1.wad.
-if ! command -v "llvm-config-$LLVM" >/dev/null || ! pkg-config --exists sdl2; then
+if ! command -v "llvm-config-$LLVM" >/dev/null || ! command -v rsync >/dev/null \
+    || ! pkg-config --exists sdl2 || [ ! -f /usr/share/games/doom/doom1.wad ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
     apt-get install -y -q "llvm-$LLVM-dev" "clang-$LLVM" \
@@ -42,4 +43,22 @@ if [ ! -f "$BASE/nucleus/boot/nucleusc.ll" ]; then
 fi
 
 # The Makefile finds llvm-config on PATH, and /usr/bin/llvm-config is LLVM 18.
-PATH="$(llvm-config-$LLVM --bindir):$PATH" make -s -C "$BASE/nucleus" -j"$(nproc)"
+export PATH="$(llvm-config-$LLVM --bindir):$PATH"
+[ -x "$BASE/nucleus/build/nucleusc" ] && exit 0
+if ! make -s -C "$BASE/nucleus" -j"$(nproc)"; then
+    # nucleus-boot's main predates the `_get` → `field` rename, so build the
+    # commits that bridge it, each with the one before, and boot from the last.
+    tmp=$(mktemp -d)
+    boot="$BASE/nucleus/bin/nucleusc"
+    for rev in dc5a321 cac7bac 1b3e18f; do
+        git -C "$BASE/nucleus" worktree add -q --detach "$tmp/$rev" "$rev"
+        (cd "$tmp/$rev" && "$boot" --emit-llvm src/nucleusc.nuc > "$tmp/$rev.ll")
+        clang "$tmp/$rev.ll" $(llvm-config-$LLVM --ldflags) -lLLVM-$LLVM -ldl -rdynamic -O1 \
+            -o "$tmp/nucleusc-$rev"
+        boot="$tmp/nucleusc-$rev"
+        git -C "$BASE/nucleus" worktree remove --force "$tmp/$rev"
+    done
+    cp "$boot" "$BASE/nucleus/bin/nucleusc"
+    rm -rf "$tmp"
+    make -s -C "$BASE/nucleus" -j"$(nproc)"
+fi

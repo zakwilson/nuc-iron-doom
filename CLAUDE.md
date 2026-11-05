@@ -52,12 +52,16 @@ repo and never by absolute path.
   clones the siblings, and builds the compiler with `make` in `../nucleus`.
   If a session starts without `../nucleus/build/nucleusc`, run the script by
   hand.
-  - **It hasn't been run end to end yet.** The session that wrote it couldn't
-    build the compiler: auto mode denies building freshly cloned external code
-    from a session. Its apt and clone steps were checked by hand. Record the
-    first real run's timings and any fixes here.
-  - The setup script itself runs with no permission prompt. That's why it,
-    rather than a session, builds the compiler.
+  - Run by hand on 2026-11-05 it took about 5 minutes. The `make` step is
+    allowed from a session when it runs through this script.
+  - **`nucleus-boot` `main` is older than `doom-bugfixes`.** Its IR predates
+    the `_get` → `field` rename (nucleus `cac7bac`), so its compiler can't
+    build `doom-bugfixes` directly. When `make` fails, the script chains
+    through `dc5a321` → `cac7bac` → `1b3e18f` (about 70 s each). Pushing a
+    fresh `boot/` to a `nucleus-boot` `doom-bugfixes` branch would remove the
+    chain. The setup script already prefers that branch, but a session was
+    denied `add_repo` push access to `nucleus-boot`.
+  - The setup script itself runs with no permission prompt.
 - **Toolchain.** The image ships LLVM/clang 18 as the default `llvm-config` and
   `clang`; Nucleus needs 19+. `. scripts/env.sh` puts LLVM 20's `bin/` and
   `$NUCLEUS_HOME/build` first on `PATH` and sets `NUCLEUS_HOME` (default
@@ -67,9 +71,10 @@ repo and never by absolute path.
   container's own clone, built against the container's LLVM, so there's no
   host binary to protect.
   - Gates: `make -k test bootstrap` (`-k` so a test failure still runs the
-    bootstrap). Record the container's baseline (pass and fail counts) here on
-    first run. The old container failed five `suite-target` datalayout tests
-    by construction. Compare against the baseline, not against zero.
+    bootstrap). Baseline 2026-11-05 (LLVM 20, nucleus `cb17330`): 1672
+    passed, 4 failed, 6 skipped, bootstrap PASS. The four failures are
+    `mt1`/`mt2`/`mt5`/`mt6` in `suite-build`, which need `avr-gcc`. Compare
+    against the baseline, not against zero. The suite takes about 25 minutes.
   - **A fix that changes the compiler's own codegen moves the bootstrap.** See
     nucleus `context/build.md`, "After a codegen change". Converge with
     `make update-bootstrap`, then commit the new `boot/*.ll` to
@@ -88,9 +93,10 @@ repo and never by absolute path.
   the `bundled` feature, which builds SDL2 from source with `cmake`, so the
   first build is slow. Chocolate Doom builds with autotools. Both go into
   `reference/build/` (gitignored) through `scripts/build-reference.sh`, with
-  patches kept in `reference/`. Auto mode may deny a session's first build of
-  freshly cloned code. If it does, ask the user to approve it, or move the
-  build into the setup script.
+  patches kept in `reference/`. **Auto mode denied `cargo build` of Iron Doom
+  from a session** (2026-11-05). Recording the reference frames needs the user
+  to approve `scripts/build-reference.sh`, or to run it from the environment's
+  setup script.
 - **No display.** Run everything with
   `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy`. The user playtests on their
   own machine.
