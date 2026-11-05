@@ -56,7 +56,7 @@ it.
 | 5. Playsim | in progress, playable: all of p_*.c is in `doom.play.*` (thinkers, map utilities, movement and collision, mobjs, player, weapons, sight, monster AI and attacks, damage and pickups, every sector special). `doom.session` is G_InitNew, G_DoLoadLevel and G_Ticker, and `doom.ticcmd` is G_BuildTiccmd. `-playdemo` and `-timedemo` play v1.9 demos, and `-tichash` writes the sync hash. All three doom1.wad demos play to their end (5026, 3836 and 2134 tics), and the player dies 50–60 tics before each ends, as in the originals: good evidence of sync, but the gate (`scripts/check-demos.sh`) waits on the reference build |
 | 6. Playable | done, gate as far as it can run here: `scripts/check-maps.sh` passes on all nine shareware maps, and the three demos still play to their end with demo3's pinned hash unchanged (the comparison with Chocolate Doom waits on the reference build). The status bar (`doom.statusbar`), HUD messages and level title (`doom.hud`), gamestates with G_Ticker's game actions, the intermission (`doom.intermission`, single player), the finale (`doom.finale`, no Doom 2 cast), Chocolate's wipe (`doom.wipe`), the menus (`doom.menu`: main, episode, skill, options, sound volume, help, quit and end-game; load and save say they aren't ported), the attract loop, pause, cheats (`doom.cheats`), the automap (`doom.automap`), `-warp`, `-skill`, `-record`, `-fast`, `-respawn` and `-nomonsters`. Playtest requested below |
 | 7. Sound, music, savegames, config | done, gate passing: sound effects (`doom.mixer` over SDL_mixer, with S_StartSound's decisions and M_Random pitches made in the playsim), music (`doom.mus2mid`, matching Chocolate Doom's `mus2mid.c` byte for byte on all 13 shareware songs), the settings file (`doom.config`, EDN with key bindings by name), and savegames (`doom.play.saveg`, a versioned binary format whose readers and writers `defsave` derives from `struct-fields`; the menu's Load and Save, F2/F3/F6/F9, `-loadgame`). Demo3 saved at tic 1000, loaded and played on gives every tic hash of the uninterrupted run, and a loaded save saves the same bytes. A headless run with the dummy (and disk) audio driver plays. Playtest requested below |
-| 8. Idiom pass and report | not started |
+| 8. Idiom pass and report | done: the idiom pass made 198 index and count conversions `as-checked` (from `unsafe/cast`; ISSUE-032), used `same?` for pointer equality and `_` for the matches that ignored most thinker kinds, and moved `byte-of` out of the HUD font module; the three demos give byte-identical tic hashes after it. `ISSUES.md` now opens with the executive summary (the five changes that would help most), the final ranking of all 32 findings, and the line counts against Iron Doom and Chocolate Doom |
 
 ## Reference frames and tic hashes
 
@@ -168,15 +168,19 @@ shortcut.
 
 ## Next steps
 
+The milestones are done. What remains needs the user or a later session:
+
 - The gates for milestones 2–5 wait on `scripts/build-reference.sh` (frames
-  from Iron Doom and Chocolate Doom, tic hashes from Chocolate Doom).
-- Milestone 8: the idiom pass and the final report (line counts, the
-  executive summary, the ISSUES ranking).
-- Compiler fixes worth trying: ISSUE-030 (the generic memo and mangling
-  ignore a nested pointer's kind) and ISSUE-031 (`case` binding its form
-  once).
-- Gaps: Doom 2's cast call; netgame and deathmatch intermission stats; the
-  bunny scroll's drawer-side pistol sounds.
+  from Iron Doom and Chocolate Doom, tic hashes from Chocolate Doom), which
+  auto mode won't run here. Once `reference/data/` has them,
+  `scripts/check-demos.sh` and a `check-frames.sh` close those gates.
+- The seven compiler fixes are carried as `nucleus-patches/0001`–`0007`,
+  because pushing to `zakwilson/nucleus` was refused. Apply them to
+  `doom-bugfixes` with `git am`, then delete them here.
+- Playtest feedback on the request above.
+- Gaps left: Doom 2's cast call; netgame and deathmatch intermission stats;
+  the bunny scroll's drawer-side pistol sounds; low detail; mouse and
+  joystick; gamma.
 - Known gaps: freed mobjs are reused last-freed first, which only
   approximates the zone allocator for stale `target` pointers; the tichash
   comparison leaves out `rndindex` unless `STRICT=1` (see

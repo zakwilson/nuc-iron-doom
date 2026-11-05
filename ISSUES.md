@@ -1,41 +1,168 @@
 # Nucleus issues found by the Iron Doom port
 
 Format and rules: `PROMPT.md` §7. Probes: `scripts/check-probes.sh`.
+This file is also the final report (milestone 8).
+
+## Executive summary
+
+The port is complete as far as `PROMPT.md` goes. Phase A reproduces Iron
+Doom (title, melt, E1M1 with walls and sky, float movement). Phase B is a
+playable shareware Doom on Chocolate Doom's fixed-point playsim, with its
+renderer, status bar, HUD, menus, automap, intermission, finale, attract
+loop, sound, music, settings file and savegames. All three `doom1.wad` demos
+run to their recorded length with the player's death where the originals
+have it. Demo3 saved and loaded mid-way gives every tic hash of the
+uninterrupted run. The comparison against Chocolate Doom's own frames and
+tic hashes waits on `scripts/build-reference.sh`, which this environment
+wouldn't run. It is about 16,300 lines of Nucleus for what is 54,700 lines of
+C (2,500 for Iron Doom's 6,600 lines of Rust), plus 950 lines of tests.
+
+The language carried a port of this size. Every finding below has a
+workaround, and seven bugs were fixed in the compiler along the way
+(`nucleus-patches/0001`–`0007`). What cost the most was not missing power
+but **silent wrong behaviour**: a reference that was a copy (ISSUE-021), a
+union copy that lost bytes (ISSUE-016), a `case` that ran its form twice
+(ISSUE-031), a generic instance shared across pointer kinds (ISSUE-030), and a
+diagnostic that steered every narrowing to the unchecked cast (ISSUE-032).
+Each was found late and by accident. The five changes that would help most:
+
+1. **`case` evaluates its form once** (ISSUE-031). A gensym in one stdlib
+   macro. The documented `cond` expansion surprises everyone who has used
+   `switch`, `match` or Clojure's `case`. It hid a real bug in the port (the
+   finale ticked twice a tic) for two milestones.
+2. **`as` names `as-checked` when it refuses a narrowing** (ISSUE-032). One
+   message. The port wrote 198 unchecked `unsafe/cast` conversions of indices
+   and counts because the refusal names only that, and the checked form was
+   there all along. Every future program inherits the choice the message
+   makes.
+3. **Make the pointer kind part of type identity where it changes meaning**
+   (ISSUE-021, ISSUE-030, ISSUE-029). A `let` typed `&T` binding a copy, a
+   generic stamped for `&Q` reused for `?&Q` (an internal error), and
+   overloads that can't tell `?&T` from `&T` are three faces of `type-eq`
+   ignoring pointer kinds. Nucleus's pointer kinds are its main safety
+   feature over C; where identity drops them, the safety goes quietly.
+4. **Finish `Vector`**: a slice view, `pop`, and one protocol for `count`
+   (ISSUE-005, ISSUE-014, ISSUE-010). The port's own `view` is called 110
+   times; a template can't say `count` once two collections or `nucleus.node`
+   are loaded. Small stdlib work with the widest reach after the two above.
+5. **Derived ownership for structs** (ISSUE-025, with ISSUE-028 as the
+   warning). `World` is freed by a hand-written list of 33 `drop`s that
+   nothing checks, and `derive-edn`'s nested keep-absent decode releases a
+   field twice. A derived drop for a struct of `Drop` fields, used by derived
+   code too, removes both kinds of mistake.
+
+Next after those: ISSUE-011 (a macro-defined struct can't appear in other
+signatures), which forced every deriving macro in the port to work from a
+hand-written struct instead of generating it.
+
+What beat Rust and C (details at the end): deriving code from `struct-fields`
+(savegames, settings, WAD records, the command line), compile-time
+generation of tables, and `defunion` + `match` for the thinker kinds.
 
 ## Summary
 
-Ranked by porter pain removed per unit of language work. (Ranking is
-provisional until milestone 8.)
+Ranked by porter pain removed per unit of language work: cheap fixes to
+problems that recur or fail silently first. The issues already fixed by the
+carried patches come last.
 
-| Issue | Claim | Severity | Kind |
-|---|---|---|---|
-| ISSUE-016 | A union copy dropped the bytes in its repr member's padding | major | bug |
-| ISSUE-021 | A `let` typed `&T` silently binds a copy of a `T` value | major | bug |
-| ISSUE-011 | A macro-defined struct can't appear in any other function's signature | major | design |
-| ISSUE-006 | A struct defined by a macro can't be a field type | major | bug |
-| ISSUE-023 | A program is capped at 128 unions (every `Maybe` counts) and 128 enums | major | bug |
-| ISSUE-009 | `(some v)`/`none` aren't target-typed through a `deref` or `aref` place | minor | bug |
-| ISSUE-013 | Float `!=` was ordered, so NaN != NaN was false | minor | bug |
-| ISSUE-015 | A float constant doesn't adapt to an overload's `f32` parameter | minor | design |
-| ISSUE-019 | A struct literal passed to a generic binds `T` to `&S` | minor | bug |
-| ISSUE-022 | `none` passed to a generic method isn't typed from its other arguments | minor | bug |
-| ISSUE-024 | A `match` over a pointer `Maybe` doesn't target-type a bare `none` arm | minor | bug |
-| ISSUE-025 | A struct of owning fields gets no drop; freeing one lists every field by hand | minor | missing-feature |
-| ISSUE-010 | A macro template can't call `count` where two collection namespaces are imported | minor | design |
-| ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature |
-| ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature |
-| ISSUE-004 | `dotimes` over a literal binds an `i32` that can't meet a `usize` | minor | design |
-| ISSUE-014 | `Vector` has no `pop` | papercut | missing-feature |
-| ISSUE-003 | A `:where` after the return type gets an unrelated error | papercut | diagnostics |
-| ISSUE-002 | Colon type sugar can't carry an unquote in a template | papercut | design |
-| ISSUE-007 | A call named like a field is silently a designated initializer | papercut | diagnostics |
-| ISSUE-008 | A `defconst`'s value is not macro-expanded | papercut | design |
-| ISSUE-017 | `str` and `println` can't format a `ui32`, `i16` or `ui8` | papercut | missing-feature |
-| ISSUE-012 | `->`, `+` and other symbol punctuation can't be in a function name | papercut | design |
-| ISSUE-018 | `deftype` refuses the documented fn-pointer spelling | papercut | diagnostics |
-| ISSUE-020 | `(new T a v)` with `v:T` reads `v` as the first field | papercut | missing-feature |
+| Rank | Issue | Claim | Severity | Kind | Status |
+|---:|---|---|---|---|---|
+| 1 | ISSUE-031 | `case` evaluates its form once per value it tries | major | design | worked around |
+| 2 | ISSUE-032 | `as` refuses a narrowing and points only at `unsafe/cast`, not `as-checked` | major | diagnostics | worked around |
+| 3 | ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature | worked around |
+| 4 | ISSUE-021 | A `let` typed `&T` silently binds a copy of a `T` value | major | bug | worked around |
+| 5 | ISSUE-030 | A generic stamped for `&Q` and then `?&Q` reuses the first instance's inner calls | major | bug | worked around |
+| 6 | ISSUE-028 | A keep-absent struct inside a keep-absent struct is released twice | major | bug | worked around |
+| 7 | ISSUE-014 | `Vector` has no `pop` | papercut | missing-feature | worked around |
+| 8 | ISSUE-017 | `str` and `println` can't format a `ui32`, `i16` or `ui8` | papercut | missing-feature | worked around |
+| 9 | ISSUE-010 | A macro template can't call `count` where two collection namespaces (or `nucleus.node`) are loaded | minor | design | worked around |
+| 10 | ISSUE-025 | A struct of owning fields gets no drop; freeing one lists every field by hand | minor | missing-feature | worked around |
+| 11 | ISSUE-011 | A macro-defined struct can't appear in any other function's signature | major | design | worked around |
+| 12 | ISSUE-029 | Overloads can't differ only in a pointer's nullability | minor | design | worked around |
+| 13 | ISSUE-022 | `none` passed to a generic method isn't typed from its other arguments | minor | bug | worked around |
+| 14 | ISSUE-019 | A struct literal passed to a generic binds `T` to `&S` | minor | bug | worked around |
+| 15 | ISSUE-026 | A sum constructor in an `if` arm isn't target-typed at a call argument | minor | design | worked around |
+| 16 | ISSUE-004 | `dotimes` over a literal binds an `i32` that can't meet a `usize` | minor | design | worked around |
+| 17 | ISSUE-015 | A float constant doesn't adapt to an overload's `f32` parameter | minor | design | worked around |
+| 18 | ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature | worked around |
+| 19 | ISSUE-007 | A call named like a field is silently a designated initializer | papercut | diagnostics | worked around |
+| 20 | ISSUE-003 | A `:where` after the return type gets an unrelated error | papercut | diagnostics | open |
+| 21 | ISSUE-018 | `deftype` refuses the documented fn-pointer spelling | papercut | diagnostics | worked around |
+| 22 | ISSUE-020 | `(new T a v)` with `v:T` reads `v` as the first field | papercut | missing-feature | worked around |
+| 23 | ISSUE-008 | A `defconst`'s value is not macro-expanded | papercut | design | worked around |
+| 24 | ISSUE-012 | `->`, `+` and other symbol punctuation can't be in a function name | papercut | design | worked around |
+| 25 | ISSUE-002 | Colon type sugar can't carry an unquote in a template | papercut | design | worked around |
+| — | ISSUE-016 | A union copy dropped the bytes in its repr member's padding | major | bug | fixed (patch 0004) |
+| — | ISSUE-023 | A program was capped at 128 unions (every `Maybe` counts) and 128 enums | major | bug | fixed (patch 0005) |
+| — | ISSUE-006 | A struct defined by a macro couldn't be a field type | major | bug | fixed (patch 0001) |
+| — | ISSUE-027 | An untyped `let` binding could consume the want its body tail needs | minor | bug | fixed (patch 0007) |
+| — | ISSUE-024 | A `match` over a pointer `Maybe` didn't target-type a bare `none` arm | minor | bug | fixed (patch 0006) |
+| — | ISSUE-009 | `(some v)`/`none` weren't target-typed through a `deref` or `aref` place | minor | bug | fixed (patch 0002) |
+| — | ISSUE-013 | Float `!=` was ordered, so NaN != NaN was false | minor | bug | fixed (patch 0003) |
 
----
+## Size against the originals
+
+Lines are physical lines. Code lines leave out blank and comment-only lines,
+and code characters leave out whitespace and comments, which is the fairer
+measure: rustfmt spreads Rust over many short lines, and a Lisp packs more on
+each. Counted by a script over `src/`, Iron Doom's crates and Chocolate
+Doom's `src/`.
+
+Phase A, against Iron Doom (Rust):
+
+| Subsystem | Rust lines | Nucleus lines | Code lines, Nucleus/Rust | Code characters, Nucleus/Rust |
+|---|---:|---:|---:|---:|
+| Command line | 178 | 258 | 199/126 = 1.58 | 2.41 |
+| WAD and lumps | 2371 | 736 | 557/1882 = 0.30 | 0.44 |
+| Window, input, video | 881 | 411 | 317/750 = 0.42 | 0.51 |
+| Screen melt | 269 | 65 | 47/198 = 0.24 | 0.29 |
+| Level, player, movement | 1558 | 533 | 396/1337 = 0.30 | 0.48 |
+| World view (walls, sky) | 903 | 332 | 266/744 = 0.36 | 0.53 |
+| RNG | 84 | 57 | 29/56 = 0.52 | 0.51 |
+| App, states, title, exit, common, errors | 386 | 86 | 49/318 = 0.15 | 0.19 |
+| **Total** | 6630 | 2478 | 1860/5411 = 0.34 | 0.50 |
+
+Phase B, against Chocolate Doom (C):
+
+| Subsystem | C lines | Nucleus lines | Code lines, Nucleus/C | Code characters, Nucleus/C |
+|---|---:|---:|---:|---:|
+| Playsim (`p_*.c` but `p_saveg.c`) | 17133 | 5877 | 4776/10493 = 0.46 | 0.95 |
+| Renderer (`r_*.c`) | 6779 | 1545 | 1245/3830 = 0.33 | 0.68 |
+| Tables (`info.c`, `tables.c`, `sounds.c`, `d_items.c`) | 8900 | 3677 | 3574/8447 = 0.42 | 0.70 |
+| Game loop (`g_game.c`, `d_main.c`) | 4494 | 1477 | 1187/2906 = 0.41 | 0.77 |
+| Status bar and cheats (`st_*.c`) | 1928 | 454 | 363/1208 = 0.30 | 0.62 |
+| HUD (`hu_*.c`) | 1304 | 211 | 164/905 = 0.18 | 0.32 |
+| Menus (`m_menu.c`) | 2190 | 629 | 515/1546 = 0.33 | 0.80 |
+| Intermission (`wi_stuff.c`) | 1881 | 451 | 371/1233 = 0.30 | 0.68 |
+| Finale and wipe (`f_*.c`) | 1120 | 221 | 162/786 = 0.21 | 0.64 |
+| Automap (`am_map.c`) | 1423 | 569 | 483/1001 = 0.48 | 0.99 |
+| Sound (`s_sound.c`, `i_sdlsound.c`) | 1959 | 280 | 215/1170 = 0.18 | 0.37 |
+| MUS to MIDI (`mus2mid.c`) | 765 | 184 | 149/510 = 0.29 | 0.58 |
+| Settings (`m_config.c`) | 2854 | 152 | 117/821 = 0.14 | 0.19 |
+| Savegames (`p_saveg.c`) | 1953 | 554 | 460/996 = 0.46 | 0.76 |
+| **Total** | 54683 | 16281 | 13781/35852 = 0.38 | 0.75 |
+
+Reading them:
+
+- **The C counts include what the port leaves out**: netgames, DeHackEd
+  string hooks, Chocolate's compatibility options and its hundreds of
+  config variables (most of `m_config.c`), Doom 2's cast call, and the
+  sound back ends Chocolate supports besides SDL_mixer. Where the C and the
+  port do the same work, the playsim and the automap, the size is about the
+  same (0.95 and 0.99 by characters). Nucleus doesn't make Doom's logic
+  shorter. The savings are where a macro derives what C writes out: the
+  settings (0.19), savegames (0.76, while saving more state than vanilla),
+  the HUD and sound.
+- **Against Rust** the port is half the size by characters. Iron Doom's
+  Bevy plumbing (plugins, system parameters, state scoping) is what
+  disappears: "App, states, title, exit" is 0.19. The one subsystem that
+  grew is the **command line** (2.4×): `clap`'s derive does in one
+  attribute per field what `defoptions` does with a hand-written table and
+  per-type `read-option` overloads, and the Nucleus side also parses the
+  thirteen flags Iron Doom doesn't have (`-framedump`, `-ironrender` and
+  phase B's).
+- The tests (946 lines, 31 tests) have no counterpart in Iron Doom.
+
 
 ## ISSUE-001: a two-key `invoke` reads, but the same place can't be `set!`
 
@@ -580,7 +707,7 @@ documented rule: the join doesn't infer `none`'s type from its sibling.
 - **Probe:** none (not a bug): `Drop` is documented as opt-in per type.
 - **Port sites:** `src/doom/play/world.nuc` (`world-free`); called from
   `src/doom/session.nuc` (`load-level`, `session-init-new`)
-- **Workaround:** a hand-written `world-free` that drops 30 fields of `World`,
+- **Workaround:** a hand-written `world-free` that drops 33 fields of `World`,
   `Level` and `MapScratch` one by one, then gives the `World`'s bytes back to
   the heap. A field added later and left out of it leaks without a word.
 - **Suggestion:** a derived drop for a struct whose fields conform to `Drop`
@@ -803,3 +930,45 @@ now with a comment saying why.
   reader from one field list, with a `macmap` nested inside the quasiquote and a
   protocol-bounded `read-records` whose type variable appears only in its
   return type. That replaces ten near-identical Rust parser modules.
+
+- **Savegames derived from `struct-fields`.** `defsave` (a 22-line macro)
+  gives each of 24 structs a writer and a reader, field by field, with array
+  fields as loops and a skip list. Pointers go through two overloads that
+  number thinkers and mobjs as they're met. The format saves everything the
+  playsim reads, the RNG and free lists included. A game saved and loaded
+  mid-demo stays in sync, and a loaded save saves the same bytes. Chocolate
+  Doom's `p_saveg.c` writes each field by hand in 1,950 lines and still
+  can't keep a demo in sync. Adding a field to a struct needs no change
+  here, only a version bump.
+
+- **The settings file through `derive-edn`.** Two structs and one
+  `derive-edn` line give a readable EDN file with key bindings by name and
+  defaults for missing keys: 152 lines against `m_config.c`'s 2,850 (which
+  also handles far more variables). The one problem was ISSUE-028.
+
+- **`defunion` + `match` for thinkers.** Vanilla's `thinker_t` holds a
+  function pointer and marks removal with `-1`; here a `Think` union names
+  each kind and its data. `match` refused to compile every dispatch that
+  missed a kind as specials were added. That is the Rust guarantee
+  `PROMPT.md` worried about losing, and it held. `_` covers the matches
+  that care about one kind.
+
+- **Errors through the playsim.** `(Fallible T)` and `try` carry vanilla's
+  `I_Error` cases (a missing texture, a bad sidedef) up to `main` with a
+  message. The blockmap iterators' callbacks return a plain bool as
+  vanilla's do, with the error parked in the world and raised once the
+  iteration ends.
+
+- **A level's objects in one arena.** Every mobj, thinker and special of a
+  level comes from the world's arena, so a level change frees them with one
+  `drop` and the free lists keep vanilla's reuse order.
+
+- **SDL2 and SDL_mixer straight from their headers.** `(import-use
+  "SDL2/SDL.h")` gave the event union, the key enums and the mixer's
+  channel API with no bindings written, once `build.edn` mapped the
+  headers to pkg-config.
+
+- **Fixed point without surprises.** `FixedMul` and `FixedDiv` with 64-bit
+  intermediates, wrapping angle arithmetic and the overflow clamp were each
+  a line or two, and they kept the playsim deterministic: the three demos
+  played to their recorded ends.
