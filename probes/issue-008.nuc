@@ -1,0 +1,19 @@
+; ISSUE-008: a defconst's value is not macro-expanded.
+; fixed-when: compiles
+; Actual: "defconst: 'TABLE' needs a run-time initializer; a constant's value
+; must be known at compile time -- use defvar", though the macro expands to an
+; (array T …) literal that defconst accepts when written out.
+
+(import-use nucleus.node)
+
+(defmacro squares ()
+  (let (out (node-list-new 0))
+    (node-push out 'array)
+    (node-push out 'i32)
+    (dotimes (i 4) (node-push out (node-int (* i i))))
+    out))
+
+(defconst TABLE (squares))
+
+(defn main ():i32
+  (return (- (aref TABLE 3) 9)))

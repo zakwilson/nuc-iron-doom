@@ -16,6 +16,7 @@ provisional until milestone 8.)
 | ISSUE-003 | A `:where` after the return type gets an unrelated error | papercut | diagnostics |
 | ISSUE-002 | Colon type sugar can't carry an unquote in a template | papercut | design |
 | ISSUE-007 | A call named like a field is silently a designated initializer | papercut | diagnostics |
+| ISSUE-008 | A `defconst`'s value is not macro-expanded | papercut | design |
 
 ---
 
@@ -142,7 +143,32 @@ a reader after the field it fills is the natural spelling, as in Iron Doom's
 `block_map: MapBlockMapParser::parse(...)`. The message pointed at a type
 mismatch that the source didn't seem to contain.
 
+## ISSUE-008: a `defconst`'s value is not macro-expanded
+
+- **Severity:** papercut
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-008.nuc` — expected `(defconst TABLE (squares))` to
+  take the `(array i32 …)` literal the macro expands to; actual `defconst:
+  'TABLE' needs a run-time initializer`
+- **Port sites:** `src/doom/rand.nuc` (`def-lcg-table`)
+- **Workaround:** the macro emits the whole `(defconst NAME …)`.
+- **Suggestion:** expand a macro call in a `defconst` value position before
+  classifying it, as a top-level macro call already is.
+
+Context: the RNG table is the output of a known LCG, so the port computes it in
+a macro instead of pasting 256 numbers, and checks it against Iron Doom's
+literal in a test. A macro that returns the value is the natural shape (it can
+then feed a `defvar` or a local too). Having it return a definition makes the
+table's name an argument of the generator, and the definition no longer reads
+as a `defconst` at the site.
+
 ## What worked well
+
+- Computing the 256-byte RNG table from its LCG in a macro body (ordinary
+  Nucleus code run at compile time, building the literal with `node-push`)
+  took ten lines, and the result matched Iron Doom's pasted table on the first
+  run.
 
 - A record macro (`defrecord`) generates a struct, its byte size and its
   reader from one field list, with a `macmap` nested inside the quasiquote and a

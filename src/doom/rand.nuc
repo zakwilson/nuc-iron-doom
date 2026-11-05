@@ -1,0 +1,38 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; Doom's random numbers: an index into a fixed 256-byte table (Iron Doom
+; crates/rand; Chocolate Doom m_random.c).
+
+(ns doom.rand)
+
+(import-use nucleus.node)
+
+; The table is the LCG x' = 134775813x + 1 (mod 2^32) from x = 1, taking bits
+; 16–23 of each state (Iron Doom's table.rs derives the same closed form).
+; Generated here rather than pasted; tests check it against the literal table.
+; The macro emits the whole defconst: a defconst's value isn't expanded (ISSUE-008).
+(defmacro- def-lcg-table (nm)
+  (let (out (node-list-new 0) x:i64 1)
+    (node-push out 'array)
+    (node-push out 'ui8)
+    (dotimes (i 256)
+      (node-push out (node-int (bit-and (bit-shr x 16) 255)))
+      (set! x (bit-and (+ (* x 134775813) 1) 0xffffffff)))
+    `(defconst ~nm ~out)))
+
+(def-lcg-table RAND-TABLE)
+
+; Iron Doom's `Rand` resource. The index advances before each read, so the
+; first value drawn is table[1].
+(defstruct Rand index:usize)
+
+(defn rand-new ():Rand (return (Rand 0)))
+
+(defn next-u8 (r:&Rand):ui8
+  (set! (r 'index) (bit-and (+ (r 'index) 1) 255))
+  (return (aref RAND-TABLE (as i64 (r 'index)))))
+
+; rand's `random::<i32>()`: the table byte widened, so never negative.
+(defn next-i32 (r:&Rand):i32
+  (return (as i32 (next-u8 r))))
