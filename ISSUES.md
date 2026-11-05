@@ -17,7 +17,7 @@ tic hashes waits on `scripts/build-reference.sh`, which this environment
 wouldn't run. It is about 16,300 lines of Nucleus for what is 54,700 lines of
 C (2,500 for Iron Doom's 6,600 lines of Rust), plus 950 lines of tests.
 
-The language carried a port of this size. Every finding below has a
+The language carried a port of this size. No finding blocked it: each has a
 workaround, and seven bugs were fixed in the compiler along the way
 (`nucleus-patches/0001`–`0007`). What cost the most was not missing power
 but **silent wrong behaviour**: a reference that was a copy (ISSUE-021), a
