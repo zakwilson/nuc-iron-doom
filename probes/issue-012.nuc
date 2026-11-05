@@ -1,0 +1,9 @@
+; ISSUE-012: `->` is legal in a symbol but not in a function name. Only `?`
+; and `!` are mapped when a name becomes an LLVM identifier.
+; fixed-when: runs
+; Actual: "illegal character '>' in generated symbol for 'f32->i32'".
+
+(defn f32->i32 (f:f32):i32 (return (unsafe/cast i32 f)))
+
+(defn main ():i32
+  (return (- (f32->i32 2.5) 2)))

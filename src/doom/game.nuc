@@ -26,6 +26,11 @@
 (import-use doom.video)
 (import-use doom.melt)
 (import-use doom.framedump)
+(import-use doom.mapdata)
+(import-use doom.level)
+(import-use doom.camera)
+(import-use doom.player)
+(import-use doom.render)
 
 ; Bevy's fixed timestep: Duration::from_secs_f64(1/35), which truncates to whole ns.
 (defconst TIC-NS 28571428)
@@ -52,12 +57,17 @@
   pending:?Mode
   ; The melt in progress, while `mode` is melt.
   melt:?Melt
+  level:?Level
+  camera:?Camera
+  view:View
+  ; Tics a turn key has been held, kept across levels as Iron Doom's Local is.
+  turn-held:ui32
   tic:i32
   quit:bool)
 
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
   (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
-                (Mode-setup) none none 0 false)))
+                (Mode-setup) none none none none (view-new) 0 0 false)))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -73,8 +83,26 @@
         (when (and (= t SDL_KEYDOWN) (= (((ref ev 'key) 'keysym) 'scancode) SDL_SCANCODE_ESCAPE))
           (set! (g 'quit) true))))))
 
-; The level, drawn into the screen buffer (milestone 3).
+(defn- load-level (g:&Game episode:i32 m:i32):(Fallible void)
+  (if-some (mp (find-map (ref g 'assets) episode m))
+    (let (l (try (level-load &mp (ref (ref g 'assets) 'flats) (ref (ref g 'assets) 'textures))))
+      (set! (g 'camera) (some (camera-new (player &l))))
+      (set! (g 'level) (some l)))
+    (fail "Tried to load invalid map: E" episode "M" m))
+  (return (ok)))
+
+; FixedUpdate, then FixedPostUpdate's camera update.
+(defn- level-tic (g:&Game):void
+  (when-some (l (g 'level))
+    (let (a (read-actions) ll l)
+      (player-tic (player &ll) &a (ref g 'turn-held))
+      (set! (g 'camera) (some (camera-new (player &ll)))))))
+
 (defn- draw-level (g:&Game):(Fallible void)
+  (when-some (l (g 'level))
+    (when-some (c (g 'camera))
+      (let (ll l cc c)
+        (render-view (ref g 'view) &ll &cc (ref (ref g 'assets) 'textures) (ref g 'screen)))))
   (return (ok)))
 
 (defn game-tic (g:&Game):(Fallible void)
@@ -86,7 +114,7 @@
       (set! (g 'mode) next)
       (set! (g 'pending) none)
       (set! entered true))
-    (let (to (mode-id (ref g 'mode)) load-level false)
+    (let (to (mode-id (ref g 'mode)) title-done false)
       ; FixedUpdate.
       (match (g 'mode)
         ((setup) 0)
@@ -95,8 +123,8 @@
            (try (draw-patch (ref g 'screen) 0 0 (ref (ref g 'assets) 'title))))
          (let (now (+ elapsed TIC-NS))
            (set! (g 'mode) (Mode-intro now))
-           (when (and (< elapsed TITLE-NS) (>= now TITLE-NS)) (set! load-level true))))
-        ((level) 0)
+           (when (and (< elapsed TITLE-NS) (>= now TITLE-NS)) (set! title-done true))))
+        ((level) (level-tic g))
         ((melt)
          (when-some (m (g 'melt))
            ; A copy, but its columns and screens are the same heap buffers.
@@ -108,7 +136,8 @@
       (match (g 'mode)
         ((setup) (set! (g 'pending) (some (Mode-intro 0))))
         ((intro e) 0) ((level) 0) ((melt) 0))
-      (when load-level
+      (when title-done
+        (try (load-level g 1 1))
         (set! (g 'pending) (some (Mode-level))))
       ; A scene change other than into or out of the melt starts one: the old
       ; screen is kept, the new scene drawn, and the melt shows the old screen first.

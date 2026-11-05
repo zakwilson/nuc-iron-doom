@@ -9,17 +9,22 @@ provisional until milestone 8.)
 
 | Issue | Claim | Severity | Kind |
 |---|---|---|---|
+| ISSUE-016 | A union copy dropped the bytes in its repr member's padding | major | bug |
 | ISSUE-011 | A macro-defined struct can't appear in any other function's signature | major | design |
 | ISSUE-006 | A struct defined by a macro can't be a field type | major | bug |
 | ISSUE-009 | `(some v)`/`none` aren't target-typed through a `deref` or `aref` place | minor | bug |
+| ISSUE-013 | Float `!=` was ordered, so NaN != NaN was false | minor | bug |
+| ISSUE-015 | A float constant doesn't adapt to an overload's `f32` parameter | minor | design |
 | ISSUE-010 | A macro template can't call `count` where two collection namespaces are imported | minor | design |
 | ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature |
 | ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature |
 | ISSUE-004 | `dotimes` over a literal binds an `i32` that can't meet a `usize` | minor | design |
+| ISSUE-014 | `Vector` has no `pop` | papercut | missing-feature |
 | ISSUE-003 | A `:where` after the return type gets an unrelated error | papercut | diagnostics |
 | ISSUE-002 | Colon type sugar can't carry an unquote in a template | papercut | design |
 | ISSUE-007 | A call named like a field is silently a designated initializer | papercut | diagnostics |
 | ISSUE-008 | A `defconst`'s value is not macro-expanded | papercut | design |
+| ISSUE-012 | `->` is legal in a symbol but not in a function name | papercut | design |
 
 ---
 
@@ -247,6 +252,117 @@ twice in spirit, once as a `defstruct` and once as the macro's row list for
 `defoptions`. The `derive-record` form is arguably the better idiom (it's how
 serde derives), but the language pushed the port there rather than letting it
 choose.
+
+## ISSUE-012: `->` is legal in a symbol but not in a function name
+
+- **Severity:** papercut
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-012.nuc` — expected `(defn f32->i32 …)` to
+  compile; actual `illegal character '>' in generated symbol for 'f32->i32'
+  (ir-name '@doom.vec2__f32->i32') — LLVM identifiers allow only
+  [A-Za-z0-9$._-]`
+- **Port sites:** `src/doom/vec2.nuc` (`f32-to-i32`, `f32-to-usize`)
+- **Workaround:** spell the conversion `f32-to-i32`.
+- **Suggestion:** map `>` and `<` (and the other reader-legal punctuation) to
+  mnemonics, as `?` and `!` already are.
+
+Context: the reader accepts `->` in a symbol, and `a->b` is the Lisp name for
+a conversion. The compiler maps `?` to `_QMARK` and `!` to `_BANG` in every
+emitted name (`docs/generics.md`, "`?`/`!` in names") and stops there, so the
+name is accepted by the reader and refused at emission. The diagnostic is
+clear and points at the definition, so this costs a rename.
+
+## ISSUE-013: float `!=` was ordered, so NaN != NaN was false
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed-in-compiler (nucleus `36c13e3`, carried as
+  `nucleus-patches/0003-*.patch`)
+- **Probe:** `probes/issue-013.nuc` — expected `(!= n n)` to be true for a
+  NaN `n`, as in C and Rust; actual false
+- **Port sites:** `src/doom/vec2.nuc` (`f32-to-i32`, which takes NaN to 0 as
+  Rust's `as` does)
+- **Workaround:** none needed after the fix; before it, `(not (= n n))`.
+
+Context: every float comparison was emitted as an ordered `fcmp`, including
+`!=` as `fcmp one`, which is false when either side is NaN. C's `!=`, Rust's
+`!=` and IEEE 754's "not equal" are all unordered (`fcmp une`), and
+`docs/types.md` promises float arithmetic bit-exact with C. The port found it
+writing Rust's saturating float-to-int cast, where `(!= f f)` is the NaN test.
+The fix is the one table entry. The compiler's own source has a float `!=`,
+so the fix moves the bootstrap.
+
+## ISSUE-014: `Vector` has no `pop`
+
+- **Severity:** papercut
+- **Kind:** missing-feature
+- **Status:** worked-around
+- **Probe:** `probes/issue-014.nuc` — expected `(pop &v)` to remove and
+  return the last element; actual `unknown: pop`
+- **Port sites:** `src/doom/util.nuc` (`pop-last`), used by the BSP walk in
+  `src/doom/level.nuc`
+- **Workaround:** `(let (x (v (- n 1))) (truncate! v (- n 1)) x)`, in a
+  helper.
+- **Suggestion:** `pop` returning `?T` (and `peek` or `last`), since
+  `Vector` is the stdlib's only growable sequence and so its only stack.
+
+Context: Iron Doom walks the BSP tree with an explicit stack
+(`Vec::push`/`Vec::pop`), the standard way to avoid recursion. `Vector` has
+`conj`, `insert`, `remove-at`, `truncate!` and `clear!`, but nothing that
+hands back the element it removes, and `String` has `string-pop-char`.
+
+## ISSUE-015: a float constant doesn't adapt to an overload's `f32` parameter
+
+- **Severity:** minor
+- **Kind:** design
+- **Status:** worked-around
+- **Probe:** `probes/issue-015.nuc` — with `(defn _* (v:V k:f32):V …)` and
+  `(defconst K 0.5)`, expected `(* v K)` to dispatch like `(* v 0.5)`;
+  actual `_*: mixed float and non-float operands — use explicit cast`
+- **Port sites:** `src/doom/player.nuc` (`friction`)
+- **Workaround:** bind the constant to a typed local first:
+  `(let (k:f32 FRICTION) (* v k))`.
+- **Suggestion:** let a name for a literal adapt wherever the literal does,
+  dispatch included; and when no user method matches, name the overloads
+  that were tried instead of falling through to the built-in's message.
+
+Context: `docs/types.md` says a named constant types like the literal it
+names, and in a built-in binop it does: `(* a:f32 K)` is `f32`. The
+compiler's `operand-is-int-literal` comment says the dispatch path was left
+out on purpose ("Extending them is a separate, deliberate change"), so this
+is a known gap rather than a slip, but it is one a port meets as soon as it
+overloads an operator for a vector type and names its constants, which Iron
+Doom's `constants.rs` does for every movement number. The second half is
+the diagnostic: `V` has an `_*`, so "mixed float and non-float operands"
+describes the fallback the compiler tried last, not the mismatch.
+
+## ISSUE-016: a union copy dropped the bytes in its repr member's padding
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** fixed-in-compiler (nucleus `TBD`, carried as
+  `nucleus-patches/0004-*.patch`)
+- **Probe:** `probes/issue-016.nuc` — expected `(ok (V 1.0 -2.0))` from a
+  function returning `(Result V E)`, with `V` two `f32`s and `E` an `i32` and
+  an `i64`, to come back with `y` = -2; actual `y` was whatever the
+  destination held (1.77e-41 in the port)
+- **Port sites:** none left; it struck `src/doom/level.nuc`, whose
+  `vertex-at` returns `(Fallible Vec2)`
+- **Workaround:** none needed after the fix. Before it, nothing short of
+  avoiding a small float struct as an `ok` payload.
+
+Context: LLVM has no union type, so a union's IR type was its largest-aligned
+member plus an `i8` tail, as clang does it. But clang copies a union with
+`memcpy`, and Nucleus copies values as first-class aggregates (`load`/`store`
+of the whole type), which carry the fields and not the padding. `Failure` is
+`{i32, String}`, padded at bytes 4 to 8, which is exactly where an `ok`
+payload of `Vec2` keeps `y`. So every `(Fallible Vec2)` lost `y` on its way
+out of the function, silently: no diagnostic, no crash, and the first frame
+of E1M1 drew every wall as a sliver on the horizon. Any payload whose bytes
+overlap the padding of the union's widest member is hit, which makes it the
+most dangerous finding so far. The fix gives a union an IR type with no
+padding: integers as wide as its alignment, enough to cover its size.
 
 ## What worked well
 

@@ -1,0 +1,267 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; A loaded level (Iron Doom crates/level: resources.rs, components.rs and
+; commands/*). Iron Doom spawns each map record as an entity and links them by
+; entity handle; here each kind is a vector and the links are indices into it.
+; Its Wall/Portal enums become an optional back sector.
+
+(ns doom.level)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.mapdata)
+(import-use doom.graphics)
+(import-use doom.vec2)
+
+; std::f32::consts, written exactly.
+(defconst FRAC-PI-2 0x1.921fb6p+0)
+(defconst FRAC-PI-4 0x1.921fb6p-1)
+; A binary angle measure unit in radians: FRAC_PI_4 / 2^29.
+(defconst BAM-TO-RAD 0x1.921fb6p-30)
+
+(defstruct Sector
+  floor-height:f32 ceiling-height:f32
+  floor-tex:usize ceiling-tex:usize
+  light-level:i16 special:i16 tag:i16)
+
+(defstruct Side
+  x-offset:f32 y-offset:f32
+  top-texture:usize lower-texture:usize middle-texture:usize
+  sector:usize)
+
+; A wall when it has no back sector, else a portal into it.
+(defstruct Line
+  v1:Vec2 v2:Vec2 flags:i16 special:i16 tag:i16
+  front-sector:usize back-sector:?usize)
+
+(defstruct Segment
+  v1:Vec2 v2:Vec2 normal:Vec2
+  line:usize side:usize offset:f32
+  front-sector:usize back-sector:?usize)
+
+(defstruct SubSector first-seg:usize num-segs:usize)
+
+(defstruct MapObject pos:Vec2 velocity:Vec2 dir:Vec2 thing-type:i16 options:i16)
+
+(defunion BspNode
+  (branch i:usize)
+  (leaf sub-sector:usize))
+
+(defstruct BspBranch origin:Vec2 direction:Vec2 right-child:BspNode left-child:BspNode)
+
+(defstruct Level
+  vertexes:(Vector Vec2)
+  sectors:(Vector Sector)
+  lines:(Vector Line)
+  sides:(Vector Side)
+  segments:(Vector Segment)
+  sub-sectors:(Vector SubSector)
+  objects:(Vector MapObject)
+  ; The player's index in `objects`.
+  player:usize
+  branches:(Vector BspBranch)
+  root:BspNode
+  ; F_SKY1, which the renderer compares ceilings against.
+  sky-flat:?usize)
+
+; usize::try_from on an i16, whose error text Iron Doom passes through.
+(defn- index-of (i:i16):(Fallible usize)
+  (when (< i 0) (fail "out of range integral type conversion attempted"))
+  (return (ok (as usize (as i32 i)))))
+
+(defn- f32-of (i:i16):f32 (return (unsafe/cast f32 i)))
+
+(defn- vec2-of (x:i16 y:i16):Vec2 (return (Vec2 (f32-of x) (f32-of y))))
+
+(defn sector-at (l:&Level i:usize):&Sector (let (s (view (ref l 'sectors))) (return (&s i))))
+(defn side-at (l:&Level i:usize):&Side (let (s (view (ref l 'sides))) (return (&s i))))
+(defn line-at (l:&Level i:usize):&Line (let (s (view (ref l 'lines))) (return (&s i))))
+(defn segment-at (l:&Level i:usize):&Segment (let (s (view (ref l 'segments))) (return (&s i))))
+(defn sub-sector-at (l:&Level i:usize):&SubSector (let (s (view (ref l 'sub-sectors))) (return (&s i))))
+(defn branch-at (l:&Level i:usize):&BspBranch (let (s (view (ref l 'branches))) (return (&s i))))
+
+(defn player (l:&Level):&MapObject
+  (let (s (view (ref l 'objects)))
+    (return (&s (l 'player)))))
+
+; --- loading, in Iron Doom's order -----------------------------------------------
+
+(defn- load-sectors (m:&Map fl:&Flats):(Fallible (Vector Sector))
+  (let (out (make (Vector Sector)) ms (view (ref m 'sectors)))
+    (dotimes (i:usize (count &ms))
+      (let (s (&ms i))
+        (when (none? (flat-index fl (s 'floor-tex)))
+          (fail "Sector references invalid floor texture \"" (s 'floor-tex) "\"."))
+        (when (none? (flat-index fl (s 'ceiling-tex)))
+          (fail "Sector references invalid ceiling texture \"" (s 'ceiling-tex) "\"."))
+        (conj &out (Sector (f32-of (s 'floor-height)) (f32-of (s 'ceiling-height))
+                           (unwrap-or (flat-index fl (s 'floor-tex)) 0)
+                           (unwrap-or (flat-index fl (s 'ceiling-tex)) 0)
+                           (s 'light-level) (s 'special) (s 'tag)))))
+    (return (ok out))))
+
+(defn- vertex-at (l:&Level i:i16 what:CStr):(Fallible Vec2)
+  (let (k (try (index-of i)) vs (view (ref l 'vertexes)))
+    (when (>= k (count &vs)) (fail what " references invalid vertex"))
+    (return (ok @(&vs k)))))
+
+; The sector on one side of a map line, through its sidedef.
+(defn- side-sector (m:&Map l:&Level side:i16):(Fallible usize)
+  (let (k (try (index-of side)) sides (view (ref m 'sides)))
+    (when (>= k (count &sides)) (fail "Line references invalid side."))
+    (let (sec (try (index-of ((&sides k) 'sector))))
+      (when (>= sec (count (ref l 'sectors))) (fail "Side references invalid sector."))
+      (return (ok sec)))))
+
+(defn- back-sector (m:&Map l:&Level ml:&MapLine):(Fallible ?usize)
+  (when (< (ml 'back-side) 0) (return (ok none)))
+  (return (ok (some (try (side-sector m l (ml 'back-side)))))))
+
+(defn- load-lines (m:&Map l:&Level):(Fallible (Vector Line))
+  (let (out (make (Vector Line)) ms (view (ref m 'lines)))
+    (dotimes (i:usize (count &ms))
+      (let (ml (&ms i))
+        (conj &out (Line (try (vertex-at l (ml 'v1) "Line")) (try (vertex-at l (ml 'v2) "Line"))
+                         (ml 'flags) (ml 'special) (ml 'tag)
+                         (try (side-sector m l (ml 'front-side)))
+                         (try (back-sector m l ml))))))
+    (return (ok out))))
+
+(defn- side-texture (tx:&WallTextures n:Name):(Fallible usize)
+  (if-some (i (texture-index tx n))
+    (return (ok i))
+    (fail "Line side references invalid texture.")))
+
+(defn- load-sides (m:&Map l:&Level tx:&WallTextures):(Fallible (Vector Side))
+  (let (out (make (Vector Side)) ms (view (ref m 'sides)))
+    (dotimes (i:usize (count &ms))
+      (let (s (&ms i) sec (try (index-of (s 'sector))))
+        (when (>= sec (count (ref l 'sectors))) (fail "Line side references invalid sector."))
+        (conj &out (Side (f32-of (s 'x-offset)) (f32-of (s 'y-offset))
+                         (try (side-texture tx (s 'top-texture)))
+                         (try (side-texture tx (s 'lower-texture)))
+                         (try (side-texture tx (s 'middle-texture)))
+                         sec))))
+    (return (ok out))))
+
+; The outward normal: the segment's BAM angle turned a quarter clockwise.
+(defn- segment-normal (angle:i16):Vec2
+  (let (bam (bit-shl (unsafe/cast ui32 (as i32 angle)) 16)
+        a:f32 (* (unsafe/cast f32 bam) BAM-TO-RAD))
+    (return (rotate (rot2 (- a FRAC-PI-2)) (Vec2 1.0 0.0)))))
+
+(defn- load-segments (m:&Map l:&Level):(Fallible (Vector Segment))
+  (let (out (make (Vector Segment)) ms (view (ref m 'segments)) mls (view (ref m 'lines)))
+    (dotimes (i:usize (count &ms))
+      (let (s (&ms i)
+            v1 (try (vertex-at l (s 'v1) "Line segment"))
+            v2 (try (vertex-at l (s 'v2) "Line segment"))
+            li (try (index-of (s 'line))))
+        (when (>= li (count &mls)) (fail "Line segment references invalid line"))
+        (let (ml (&mls li)
+              front (try (side-sector m l (ml 'front-side)))
+              back (try (back-sector m l ml))
+              side (try (index-of (if (= (s 'side) 0) (ml 'front-side) (ml 'back-side)))))
+          (when (>= side (count (ref l 'sides))) (fail "Line segment references side"))
+          ; Seen from the back, the line's sectors swap.
+          (if (= (s 'side) 0)
+            (conj &out (Segment v1 v2 (segment-normal (s 'angle)) li side (f32-of (s 'offset))
+                                front back))
+            (if-some (b back)
+              (conj &out (Segment v1 v2 (segment-normal (s 'angle)) li side (f32-of (s 'offset))
+                                  b (some front)))
+              (fail "Line segment is on the back of a one-sided line"))))))
+    (return (ok out))))
+
+(defn- load-sub-sectors (m:&Map l:&Level):(Fallible (Vector SubSector))
+  (let (out (make (Vector SubSector)) ms (view (ref m 'sub-sectors)))
+    (dotimes (i:usize (count &ms))
+      (let (s (&ms i))
+        (when (< (s 'num-segs) 0) (fail "Subsector contains negative number of segments."))
+        (when (< (s 'first-seg) 0) (fail "Subsector references invalid segment."))
+        (let (first (as usize (as i32 (s 'first-seg))) n (as usize (as i32 (s 'num-segs))))
+          (when (> (+ first n) (count (ref l 'segments))) (fail "Subsector references invalid segment."))
+          (conj &out (SubSector first n)))))
+    (return (ok out))))
+
+(defn- load-objects (m:&Map):(Vector MapObject)
+  (let (out (make (Vector MapObject)) ms (view (ref m 'things)))
+    (dotimes (i:usize (count &ms))
+      (let (t (&ms i) ty (t 'thing-type))
+        ; Players 2 to 4 are left out, as in single player.
+        (when (or (< ty 2) (> ty 4))
+          (let (a:f32 (* FRAC-PI-4 (unsafe/cast f32 (/ (t 'angle) 45))))
+            (conj &out (MapObject (vec2-of (t 'x) (t 'y)) VEC2-ZERO
+                                  (rotate (rot2 a) (Vec2 1.0 0.0)) ty (t 'options)))))))
+    (return out)))
+
+(defn- bsp-child (m:&Map l:&Level child:i16):(Fallible BspNode)
+  (when (>= child 0) (return (ok (BspNode-branch (try (load-bsp m l (as usize (as i32 child))))))))
+  (let (ss (as usize (bit-and (as i32 child) 0x7fff)))
+    (when (>= ss (count (ref l 'sub-sectors))) (fail "BSP leaf node references invalid sub-sector."))
+    (return (ok (BspNode-leaf ss)))))
+
+; Iron Doom builds the tree by recursion from the root, so only the nodes it
+; reaches are checked. A branch keeps its map index.
+(defn- load-bsp (m:&Map l:&Level node:usize):(Fallible usize)
+  (let (ns (view (ref m 'nodes)))
+    (when (>= node (count &ns)) (fail "Tried to access invalid BSP node."))
+    (let (n (&ns node)
+          right (try (bsp-child m l (n 'right-child)))
+          left (try (bsp-child m l (n 'left-child))))
+      (set (ref l 'branches) node
+           (BspBranch (vec2-of (n 'x) (n 'y)) (vec2-of (n 'dx) (n 'dy)) right left))
+      (return (ok node)))))
+
+(defn level-load (m:&Map fl:&Flats tx:&WallTextures):(Fallible Level)
+  (let (vs (make (Vector Vec2)) mv (view (ref m 'vertexes)))
+    (dotimes (i:usize (count &mv))
+      (conj &vs (vec2-of ((&mv i) 'x) ((&mv i) 'y))))
+    (let (l (Level vs (try (load-sectors m fl)) (make (Vector Line)) (make (Vector Side))
+                   (make (Vector Segment)) (make (Vector SubSector)) (make (Vector MapObject)) 0
+                   (make (Vector BspBranch)) (BspNode-leaf 0)
+                   (flat-index fl (name "F_SKY1"))))
+      (set! (l 'lines) (try (load-lines m &l)))
+      (set! (l 'sides) (try (load-sides m &l tx)))
+      (set! (l 'segments) (try (load-segments m &l)))
+      (set! (l 'sub-sectors) (try (load-sub-sectors m &l)))
+      (set! (l 'objects) (load-objects m))
+      (let (os (view (ref l 'objects)) found false)
+        (dotimes (i:usize (count &os))
+          (when (and (not found) (= ((&os i) 'thing-type) 1))
+            (set! (l 'player) i)
+            (set! found true)))
+        (when (not found) (fail "Map has no player 1 start.")))
+      (let (nn (count (ref m 'nodes)))
+        (when (= nn 0) (fail "Tried to access invalid BSP node."))
+        (dotimes (i:usize nn)
+          (conj (ref l 'branches) (BspBranch VEC2-ZERO VEC2-ZERO (BspNode-leaf 0) (BspNode-leaf 0))))
+        (set! (l 'root) (BspNode-branch (try (load-bsp m &l (- nn 1))))))
+      (return (ok l)))))
+
+; --- the BSP walk ---------------------------------------------------------------
+
+(defn- on-back-side? (b:&BspBranch p:Vec2):bool
+  (return (>= (perp-dot (b 'direction) (- p (b 'origin))) 0.0)))
+
+; Every subsector, nearest first, as Iron Doom's BspTreeIter visits them: a
+; pre-order walk with no bounding-box culling.
+(defn sub-sectors-from (l:&Level view-point:Vec2 out:&(Vector usize)):void
+  (clear! out)
+  (let (stack (make (Vector BspNode)))
+    (conj &stack (l 'root))
+    (while (> (count &stack) 0)
+      (match (pop-last &stack)
+        ((branch i)
+         (let (b (branch-at l i))
+           (if (on-back-side? b view-point)
+             (do (conj &stack (b 'right-child)) (conj &stack (b 'left-child)))
+             (do (conj &stack (b 'left-child)) (conj &stack (b 'right-child))))))
+        ((leaf ss) (conj out ss))))
+    (drop &stack)))

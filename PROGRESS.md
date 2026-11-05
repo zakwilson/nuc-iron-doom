@@ -17,10 +17,12 @@ Nucleus as follows:
   per tic, which is the same picture since nothing moves between tics.
 - **Events → return values.** `LoadLevel`, `InitMeltScreen`, `Exit` become
   the result of a tic (`Transition`) that the loop acts on.
-- **Entities + `Instance<T>` handles → arrays in a level arena with `&T`
-  links.** Sectors, sides, lines, segments and subsectors are `(Slice T)` views
-  over one `Arena` per level; links between them are non-null `&T` (or `?&T`
-  for a back sector). Dropping the arena unloads the level.
+- **Entities + `Instance<T>` handles → one `Vector` per kind in a `Level`,
+  linked by index** (`doom.level`). A line or segment's Wall/Portal enum
+  becomes an optional back sector, and the BSP's `Rc` tree becomes a vector of
+  branches whose children are a `BspNode` union (branch index or subsector).
+  Indices rather than `&T` because a level is built in stages and the vectors
+  grow while it is.
 - **`anyhow::Result` + `#[sys_fail]` → `!T` and `try`**, propagated to `main`,
   the only place that prints and exits.
 - **`clap` derive → a macro (`defoptions`)** over a written options struct:
@@ -49,7 +51,7 @@ it.
 | 0. Setup | done, except the reference frames (see below) |
 | 1. Foundations | done: CLI and response files, IWAD search, WAD directory, every lump parser, RNG, 12 unit tests |
 | 2. Screens | done except the framedump gate: title (tic 2) and melt run; frames can't be compared until the reference is built |
-| 3. Level and walls | not started |
+| 3. Level and walls | in progress: level loading, controls, movement, camera and the wall renderer written; E1M1's first view renders. Left: a movement check, the playtest request, the framedump gate |
 | 4–8 (phase B) | not started |
 
 ## Reference frames
@@ -71,12 +73,19 @@ as a patch in `nucleus-patches/`, which `setup-cloud.sh` applies.
 |---|---|---|
 | ISSUE-006 | `06230b5` | `nucleus-patches/0001-*.patch` |
 | ISSUE-009 | `ac05293` | `nucleus-patches/0002-*.patch` |
+| ISSUE-013 | `36c13e3` | `nucleus-patches/0003-*.patch` |
+| ISSUE-016 | pending the gate | `nucleus-patches/0004-*.patch` |
 
+0003 and 0004 change the compiler's own code generation, so after applying
+them `make bootstrap` reports a diff until it is converged (nucleus
+`context/build.md`, "After a codegen change"). `make` itself is unaffected.
+The converged `boot/*.ll` can't be pushed to `nucleus-boot` from here.
 ## In flight
 
-- Nothing long-running.
+- The nucleus gate (`make -k test`) for the ISSUE-016 fix, in a background
+  shell. If the container was reclaimed, rerun it after setup.
 
 ## Next steps
 
-- Milestone 3: level loading, player controls and movement, camera, the BSP
-  wall and sky renderer.
+- Milestone 3: check movement against an f32 model of Iron Doom's, then ask
+  for a playtest.

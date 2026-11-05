@@ -1,0 +1,129 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; Player controls and movement (Iron Doom crates/level/src/map_object/player).
+; Iron Doom's movement is f32 and keeps no demo sync; phase B replaces it with
+; Chocolate Doom's fixed-point playsim.
+
+(ns doom.player)
+
+(import-use "SDL2/SDL.h")
+(import-use doom.vec2)
+(import-use doom.level)
+
+(defconst MAX-MOMENTUM 30.0)
+(defconst FRICTION 0.90625)
+(defconst MOVE-FORWARD 0.78125)
+(defconst RUN-FORWARD 1.5625)
+(defconst MAX-MOVE 1.5625)
+(defconst STRAFE 0.75)
+(defconst FAST-STRAFE 1.25)
+; A turn key held for fewer tics than this turns at half speed.
+(defconst SLOW-TURN-TICS 6)
+(defconst TURN 0.06135923)
+
+; The actions held this tic (Iron Doom's PlayerAction).
+(defstruct Actions
+  move-forward:bool move-backward:bool run-forward:bool run-backward:bool
+  turn-left:bool turn-right:bool fast-left-turn:bool fast-right-turn:bool
+  strafe-left:bool strafe-right:bool fast-strafe-left:bool fast-strafe-right:bool)
+
+(defn- key? (keys:&ui8 sc:i32):bool
+  (return (!= (aref keys (as i64 sc)) 0)))
+
+; Iron Doom binds chords through leafwing-input-manager, whose default clash
+; strategy releases an action when a longer chord holding all its keys is
+; pressed. So Alt+Left strafes without also turning, and Shift+Alt+Left
+; strafes fast and does neither of the others.
+(defn read-actions ():Actions
+  (let (keys (unsafe/cast &ui8 (SDL_GetKeyboardState null))
+        shift (or (key? keys SDL_SCANCODE_LSHIFT) (key? keys SDL_SCANCODE_RSHIFT))
+        alt (or (key? keys SDL_SCANCODE_LALT) (key? keys SDL_SCANCODE_RALT))
+        fwd (or (key? keys SDL_SCANCODE_W) (key? keys SDL_SCANCODE_UP))
+        back (or (key? keys SDL_SCANCODE_S) (key? keys SDL_SCANCODE_DOWN))
+        left (key? keys SDL_SCANCODE_LEFT)
+        right (key? keys SDL_SCANCODE_RIGHT)
+        sl (or (key? keys SDL_SCANCODE_A) (key? keys SDL_SCANCODE_COMMA))
+        sr (or (key? keys SDL_SCANCODE_D) (key? keys SDL_SCANCODE_PERIOD)))
+    (return (Actions fwd back (and shift fwd) (and shift back)
+                     (and left (not alt)) (and right (not alt))
+                     (and shift left (not alt)) (and shift right (not alt))
+                     (or sl (and alt left)) (or sr (and alt right))
+                     (or (and shift sl) (and alt shift left)) (or (and shift sr) (and alt shift right))))))
+
+(defn- clamp-move (v:f32):f32
+  (when (< v (- 0.0 MAX-MOVE)) (return (- 0.0 MAX-MOVE)))
+  (when (> v MAX-MOVE) (return MAX-MOVE))
+  (return v))
+
+(defn- side-momentum (p:&MapObject a:&Actions):void
+  (let (side:f32 0.0)
+    (cond (a 'fast-strafe-left) (set! side (- side FAST-STRAFE))
+          (a 'strafe-left) (set! side (- side STRAFE)))
+    (cond (a 'fast-strafe-right) (set! side (+ side FAST-STRAFE))
+          (a 'strafe-right) (set! side (+ side STRAFE)))
+    (set! side (clamp-move side))
+    (when (!= side 0.0)
+      (let (d (rotate (rot2 (- 0.0 FRAC-PI-2)) (p 'dir)))
+        (set! (p 'velocity) (+ (p 'velocity) (* side d)))))))
+
+(defn- forward-momentum (p:&MapObject a:&Actions):void
+  (let (fwd:f32 0.0)
+    (cond (a 'run-forward) (set! fwd (+ fwd RUN-FORWARD))
+          (a 'move-forward) (set! fwd (+ fwd MOVE-FORWARD)))
+    (cond (a 'run-backward) (set! fwd (- fwd RUN-FORWARD))
+          (a 'move-backward) (set! fwd (- fwd MOVE-FORWARD)))
+    (set! fwd (clamp-move fwd))
+    (when (!= fwd 0.0)
+      (set! (p 'velocity) (+ (p 'velocity) (* fwd (p 'dir)))))))
+
+(defn- turning? (a:&Actions):bool
+  (return (or (a 'turn-left) (a 'fast-left-turn) (a 'turn-right) (a 'fast-right-turn))))
+
+(defn- update-angle (p:&MapObject a:&Actions turn-held:&ui32):void
+  (if (turning? a) (set! @turn-held (+ @turn-held 1)) (set! @turn-held 0))
+  (let (turn:f32 0.0 slow:f32 (/ TURN 2.0) fast:f32 (* 2.0 TURN))
+    (if (< @turn-held SLOW-TURN-TICS)
+      (do (when (or (a 'turn-left) (a 'fast-left-turn)) (set! turn (+ turn slow)))
+          (when (or (a 'turn-right) (a 'fast-right-turn)) (set! turn (- turn slow))))
+      (do (cond (a 'fast-left-turn) (set! turn (+ turn fast))
+                (a 'turn-left) (set! turn (+ turn TURN)))
+          (cond (a 'fast-right-turn) (set! turn (- turn fast))
+                (a 'turn-right) (set! turn (- turn TURN)))))
+    (when (!= turn 0.0)
+      (set! (p 'dir) (fast-renormalize (rotate (rot2 turn) (p 'dir)))))))
+
+; Iron Doom halves a step that is too long only when it is positive, and stops
+; after the first step when either part is zero. Both kept.
+(defn- try-move (p:&MapObject):void
+  (when (= (p 'velocity) VEC2-ZERO) (return))
+  (let (xm ((p 'velocity) 'x) ym ((p 'velocity) 'y) half:f32 (/ MAX-MOMENTUM 2.0) going true)
+    (while going
+      (let (tx:f32 0.0 ty:f32 0.0)
+        (if (or (> xm half) (> ym half))
+          (do (set! tx (+ ((p 'pos) 'x) (/ xm 2.0)))
+              (set! ty (+ ((p 'pos) 'y) (/ ym 2.0)))
+              (set! xm (/ xm 2.0))
+              (set! ym (/ ym 2.0)))
+          (do (set! tx (+ ((p 'pos) 'x) xm))
+              (set! ty (+ ((p 'pos) 'y) ym))
+              (set! xm 0.0)
+              (set! ym 0.0)))
+        (set! (p 'pos) (Vec2 tx ty))
+        (when (or (= xm 0.0) (= ym 0.0)) (set! going false))))))
+
+; Iron Doom stops a slow player only when nothing changed it this tic, but
+; try_move has always just moved it, so the stop never fires and friction
+; alone slows it. Kept, since it decides where the camera ends up.
+(defn- friction (p:&MapObject):void
+  (when (!= (p 'velocity) VEC2-ZERO)
+    ; ISSUE-015: a float constant doesn't adapt to `_*`'s f32 parameter.
+    (let (k:f32 FRICTION)
+      (set! (p 'velocity) (* (p 'velocity) k)))))
+
+(defn player-tic (p:&MapObject a:&Actions turn-held:&ui32):void
+  (side-momentum p a)
+  (forward-momentum p a)
+  (update-angle p a turn-held)
+  (try-move p)
+  (friction p))

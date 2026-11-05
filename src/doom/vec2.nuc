@@ -1,0 +1,54 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; The f32 2D math Iron Doom takes from Bevy (glam's Vec2, bevy_math's Rot2 and
+; Dir2). Each operation is written out in the order glam evaluates it, so the
+; results round the same way and frames match bit for bit.
+
+(ns doom.vec2)
+
+(import-use "math.h")
+
+(defstruct Vec2 x:f32 y:f32)
+
+(defn vec2 (x:f32 y:f32):Vec2 (return (Vec2 x y)))
+
+(defconst VEC2-ZERO (Vec2 0.0 0.0))
+
+(defn _+ (a:Vec2 b:Vec2):Vec2 (return (Vec2 (+ (a 'x) (b 'x)) (+ (a 'y) (b 'y)))))
+(defn _- (a:Vec2 b:Vec2):Vec2 (return (Vec2 (- (a 'x) (b 'x)) (- (a 'y) (b 'y)))))
+(defn _* (k:f32 v:Vec2):Vec2 (return (Vec2 (* k (v 'x)) (* k (v 'y)))))
+(defn _* (v:Vec2 k:f32):Vec2 (return (Vec2 (* (v 'x) k) (* (v 'y) k))))
+(defn = (a:Vec2 b:Vec2):bool (return (and (= (a 'x) (b 'x)) (= (a 'y) (b 'y)))))
+(defn != (a:Vec2 b:Vec2):bool (return (not (= a b))))
+
+(defn dot (a:Vec2 b:Vec2):f32 (return (+ (* (a 'x) (b 'x)) (* (a 'y) (b 'y)))))
+(defn perp-dot (a:Vec2 b:Vec2):f32 (return (- (* (a 'x) (b 'y)) (* (a 'y) (b 'x)))))
+(defn length (v:Vec2):f32 (return (sqrtf (dot v v))))
+
+; A rotation as its sine and cosine (bevy_math Rot2).
+(defstruct Rot2 sin:f32 cos:f32)
+
+(defn rot2 (radians:f32):Rot2 (return (Rot2 (sinf radians) (cosf radians))))
+
+(defn rotate (r:Rot2 v:Vec2):Vec2
+  (return (Vec2 (- (* (v 'x) (r 'cos)) (* (v 'y) (r 'sin)))
+                (+ (* (v 'x) (r 'sin)) (* (v 'y) (r 'cos))))))
+
+; Dir2::fast_renormalize: one Newton step towards unit length.
+(defn fast-renormalize (v:Vec2):Vec2
+  (let (len2 (dot v v))
+    (return (* v (* 0.5 (- 3.0 len2))))))
+
+; Rust's `as` from a float saturates and takes NaN to 0, where fptosi gives poison.
+; ISSUE-012: `f32->i32` is not a legal function name.
+(defn f32-to-i32 (f:f32):i32
+  (cond (!= f f) (return 0)
+        (>= f 2147483647.0) (return 2147483647)
+        (<= f -2147483648.0) (return -2147483648)
+        true (return (unsafe/cast i32 f))))
+
+(defn f32-to-usize (f:f32):usize
+  (cond (not (> f 0.0)) (return 0)
+        (>= f 18446744073709551615.0) (return 18446744073709551615)
+        true (return (unsafe/cast usize f))))

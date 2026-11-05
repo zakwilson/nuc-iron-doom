@@ -10,3 +10,9 @@
 ; The stdlib has no such view (ISSUE-005).
 (defn view (v:&(Vector T)):(Slice T)
   (return (slice-of (unsafe/cast (ptr T) (v 'data)) (v 'len))))
+
+; Remove and return the last element. ISSUE-014: Vector has no pop.
+(defn pop-last (v:&(Vector T)):T
+  (let (n (count v) x (v (- n 1)))
+    (truncate! v (- n 1))
+    (return x)))

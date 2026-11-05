@@ -1,0 +1,67 @@
+From 36c13e3c5948ecc03343dd73182b20db980a4b3e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 02:13:01 +0000
+Subject: [PATCH] Emit float != as the unordered fcmp une (nuc-iron-doom
+ ISSUE-013)
+
+C, Rust and IEEE 754 all make != true when either operand is NaN; the
+ordered fcmp one made (!= x x) false for NaN. The compiler's own source
+has a float !=, so this moves the bootstrap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8hzrZakM3KWb32SpqKh
+---
+ docs/types.md        |  2 +-
+ src/nucleusc.nuc     |  2 +-
+ tests/suite-doom.nuc | 12 ++++++++++++
+ 3 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/docs/types.md b/docs/types.md
+index 66eb768..69efed0 100644
+--- a/docs/types.md
++++ b/docs/types.md
+@@ -507,7 +507,7 @@ A `c"…"` literal — a `c` glued directly onto the opening quote, with no whit
+ 
+ **`Char`** is a single Unicode scalar value — a codepoint in `0..=0x10FFFF` excluding the UTF-16 surrogate range `0xD800..=0xDFFF` (Rust's `char` model; "character" means codepoint, not grapheme cluster). It is a **built-in distinct 32-bit scalar over `ui32`**, the same kind of distinct scalar `CStr` is: it lowers to IR `i32` (C `uint32_t`, size 4) and participates in the integer operators, but it is its own type for dispatch. `=` / `!=` on two `Char` compare codepoints (`(= \a \a)` is true, `(= \a \b)` is false), and a `Char`-vs-int overload is distinguishable. A same-width `as` (or `unsafe/cast`) between `Char` and `ui32`/`i32` is a no-op reinterpret (`(as ui32 \A)` is `65`). Because `Char` is distinct, two *typed* operands of different kind do **not** silently unify: `(= \a (as ui32 65))` is a compile error (`operand type mismatch`) — convert one side explicitly with `as`. An untyped integer literal still adapts to a `Char` operand, so `(= \a 97)` is allowed. Write a `Char` value with a [char literal](#char-literals--a) (below) or, equivalently, the `(char "x")` form. (The `Char` UTF-8 encode/decode and classification library is a separate task.)
+ 
+-Float literals: `1.5`, `-0.25`, `1e10`, `1.5e-3`, `.5`, and C's hex form `0x1.921fb54442d18p+1`. Special values use Scheme syntax: `+inf.0`, `-inf.0`, `+nan.0`. Float arithmetic uses `+ - * / %` and comparisons use `= != < <= > >=` (LLVM `fadd`/`fcmp`).
++Float literals: `1.5`, `-0.25`, `1e10`, `1.5e-3`, `.5`, and C's hex form `0x1.921fb54442d18p+1`. Special values use Scheme syntax: `+inf.0`, `-inf.0`, `+nan.0`. Float arithmetic uses `+ - * / %` and comparisons use `= != < <= > >=` (LLVM `fadd`/`fcmp`). As in C, `!=` is the unordered comparison (`fcmp une`), so it is true when either operand is NaN, and `(!= x x)` tests for NaN; the other five are ordered and false on NaN.
+ 
+ Integer literals are decimal or C hex: `255` and `0xFF` are the same value, and `0x` accepts either case in the prefix and the digits. There is no octal form — a leading zero is not significant, so `0644` is six hundred and forty-four.
+ 
+diff --git a/src/nucleusc.nuc b/src/nucleusc.nuc
+index 338331d..7ee473a 100644
+--- a/src/nucleusc.nuc
++++ b/src/nucleusc.nuc
+@@ -4970,7 +4970,7 @@
+                     "_/" "fdiv"
+                     "%" "frem"
+                     "=" "fcmp oeq"
+-                    "!=" "fcmp one"
++                    "!=" "fcmp une"
+                     "<" "fcmp olt"
+                     "<=" "fcmp ole"
+                     ">" "fcmp ogt"
+diff --git a/tests/suite-doom.nuc b/tests/suite-doom.nuc
+index 3f58c7d..8b0bf8f 100644
+--- a/tests/suite-doom.nuc
++++ b/tests/suite-doom.nuc
+@@ -725,3 +725,15 @@ missing key :sens for #user/Opt"))
+         ov:StrView (string-as-view &out))
+     (try (check-eq (strview-trim-end &ov) "4 5 0 0"))
+     (drop &out)))
++
++; nuc-iron-doom ISSUE-013: float `!=` is unordered, as in C, so NaN != NaN.
++(deftest doom-float-ne-unordered
++  (let (out:String (try (build-run-source "(import-use \"stdio.h\")
++(defn main ():i32
++  (let (z:f32 0.0 n (/ z z) d:f64 0.0 m (/ d d))
++    (printf \"%d %d %d %d %d\\n\" (!= n n) (= n n) (!= m m) (!= z z) (!= z 1.0)))
++  0)
++"))
++        ov:StrView (string-as-view &out))
++    (try (check-eq (strview-trim-end &ov) "1 0 1 0 1"))
++    (drop &out)))
+-- 
+2.43.0
+
