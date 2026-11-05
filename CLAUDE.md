@@ -144,9 +144,10 @@ scripts/check-demos.sh      # phase B: tic hashes against reference/data/
 make -C ../nucleus -j4 && make -C ../nucleus -k test bootstrap   # after a Nucleus fix (env.sh sourced)
 ```
 
-Written so far: `env.sh`, `setup-cloud.sh`, `run-tests.sh`, `check-probes.sh`.
-`check-frames.sh`, `check-demos.sh` and `build-reference.sh` come with the
-milestones that need them. Update this list as scripts are added or renamed.
+Written so far: `env.sh`, `setup-cloud.sh`, `run-tests.sh`, `check-probes.sh`,
+`build-reference.sh` (`[iron-doom] [chocolate-doom]`; auto mode denied running
+it again on 2026-11-05, so the user runs it or adds it to the setup script).
+`check-frames.sh` and `check-demos.sh` come with the milestones that need them. Update this list as scripts are added or renamed.
 
 ## Layout
 

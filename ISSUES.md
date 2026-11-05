@@ -24,6 +24,7 @@ provisional until milestone 8.)
 | ISSUE-002 | Colon type sugar can't carry an unquote in a template | papercut | design |
 | ISSUE-007 | A call named like a field is silently a designated initializer | papercut | diagnostics |
 | ISSUE-008 | A `defconst`'s value is not macro-expanded | papercut | design |
+| ISSUE-017 | `str` and `println` can't format a `ui32`, `i16` or `ui8` | papercut | missing-feature |
 | ISSUE-012 | `->` is legal in a symbol but not in a function name | papercut | design |
 
 ---
@@ -341,7 +342,7 @@ describes the fallback the compiler tried last, not the mismatch.
 
 - **Severity:** major
 - **Kind:** bug
-- **Status:** fixed-in-compiler (nucleus `TBD`, carried as
+- **Status:** fixed-in-compiler (nucleus `7bb5257`, carried as
   `nucleus-patches/0004-*.patch`)
 - **Probe:** `probes/issue-016.nuc` — expected `(ok (V 1.0 -2.0))` from a
   function returning `(Result V E)`, with `V` two `f32`s and `E` an `i32` and
@@ -363,6 +364,27 @@ of E1M1 drew every wall as a sliver on the horizon. Any payload whose bytes
 overlap the padding of the union's widest member is hit, which makes it the
 most dangerous finding so far. The fix gives a union an IR type with no
 padding: integers as wide as its alignment, enough to cover its size.
+
+## ISSUE-017: `str` and `println` can't format a `ui32`, `i16` or `ui8`
+
+- **Severity:** papercut
+- **Kind:** missing-feature
+- **Status:** worked-around
+- **Probe:** `probes/issue-017.nuc` — expected `(str a " " b " " c)` with
+  `a:ui32`, `b:i16`, `c:ui8` to format all three; actual `ambiguous overload
+  for 'to-str' under argument widening`
+- **Port sites:** debugging output only so far, and every check that prints a
+  WAD field (WAD records are `i16`) or a binary angle (`ui32`)
+- **Workaround:** `(as i32 x)` or `(as i64 x)` at each argument.
+- **Suggestion:** a `to-str` for every integer width, or a widening rule that
+  prefers the same signedness and the smallest wider type, so `ui32` picks
+  `ui64` and `i16` picks `i32`.
+
+Context: `nucleus.fmt` defines `to-str` for `i32`, `i64`, `usize` and `ui64`.
+A `ui32` widens to `i64`, `usize` and `ui64` equally, and an `i16` to `i32`
+and `i64`, so the call is ambiguous and the message doesn't say which
+candidates tied. Doom's data is mostly `i16` (WAD records), `ui8` (pixels)
+and `ui32` (binary angles), so every debug print in the port needs a cast.
 
 ## What worked well
 

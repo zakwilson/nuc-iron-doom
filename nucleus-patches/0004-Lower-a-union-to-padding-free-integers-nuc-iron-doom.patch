@@ -1,0 +1,118 @@
+From 7bb5257cfec47196030ee4771c23eb98cd260d49 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 02:27:35 +0000
+Subject: [PATCH] Lower a union to padding-free integers (nuc-iron-doom
+ ISSUE-016)
+
+A union's IR type was its largest-aligned member plus an i8 tail, as clang
+writes it. Clang copies a union with memcpy, but Nucleus copies values as
+first-class aggregates, which carry no padding bytes, so another member
+stored in the repr member's padding was lost. A (Result Vec2 Failure) with
+Vec2 two f32s and Failure {i32, String} dropped Vec2's y on every return.
+The wrapper is now integers as wide as the repr member's alignment,
+covering the union's size. This moves the bootstrap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8hzrZakM3KWb32SpqKh
+---
+ src/union-registry.nuc      | 28 +++++++++++++++++++---------
+ tests/suite-declarators.nuc |  4 ++--
+ tests/suite-doom.nuc        | 17 +++++++++++++++++
+ 3 files changed, 38 insertions(+), 11 deletions(-)
+
+diff --git a/src/union-registry.nuc b/src/union-registry.nuc
+index 7edd040..cf4dc86 100644
+--- a/src/union-registry.nuc
++++ b/src/union-registry.nuc
+@@ -118,9 +118,10 @@
+ 
+ ; ============================================================
+ ; Stage 10: untagged unions (design/stage10/unions.md §2). Anonymous and
+-; memoized like (struct ...). LLVM has no union type, so a union lowers the
+-; way clang does: a struct wrapping the largest-aligned member plus padding
+-; to the full size. The IR type definition needs member sizes, and members
++; memoized like (struct ...). LLVM has no union type, so a union lowers to a
++; struct of integers as wide as its largest-aligned member's alignment,
++; covering its full size: unlike clang's member-plus-padding wrapper, it has
++; no padding for an aggregate copy to drop. The IR type definition needs member sizes, and members
+ ; may name structs whose fields are registered later in the unit — so the
+ ; definition text is deferred to drain-pending-union-irs, called at every
+ ; module-assembly point (named types are order-independent in a module).
+@@ -149,8 +150,8 @@
+         (queue-type-line sd2)))
+     (return (unsafe/cast &StructDef sd))))
+ 
+-; The member a union's IR wrapper struct holds: the first member with maximal
+-; alignment (clang's rule); remaining bytes become an i8 padding array.
++; The first member with maximal alignment (clang's rule), whose alignment
++; sets the width of the integers in the union's IR wrapper.
+ (defn union-repr-member (sd:?&StructDef):i32
+   (let (sdd:ptr:StructDef sd
+         n:i32 (sdd 'num-fields)
+@@ -190,10 +191,19 @@
+           ; it cannot share emit-struct-type-line — only the brackets.
+           op:StrView (if (!= (sdd 'packed) 0) "<{" "{")
+           cl:StrView (if (!= (sdd 'packed) 0) "}>" "}"))
+-      (if (> pad 0)
+-        (emit g-type-stream "%" (sdd 'ir-name) " = type " op " " (type-to-ir rt) ", [" pad
+-              " x i8] " cl "\n\n")
+-        (emit g-type-stream "%" (sdd 'ir-name) " = type " op " " (type-to-ir rt) " " cl "\n\n")))))
++      ; A union is copied as a first-class aggregate, and LLVM keeps no padding
++      ; bytes across one, so a member stored in the repr member's padding was
++      ; lost (nuc-iron-doom ISSUE-016). Integers as wide as the repr member's
++      ; alignment have no padding and keep that alignment.
++      (let (ra:i32 (abi-alignof rt)
++            ew:i32 (if (and (= (sdd 'packed) 0) (> ra 0) (<= ra 16) (= (% total ra) 0)) ra 1))
++        (if (> total 0)
++          (emit g-type-stream "%" (sdd 'ir-name) " = type " op " [" (/ total ew) " x i" (* ew 8) "] "
++                cl "\n\n")
++          (if (> pad 0)
++            (emit g-type-stream "%" (sdd 'ir-name) " = type " op " " (type-to-ir rt) ", [" pad
++                  " x i8] " cl "\n\n")
++            (emit g-type-stream "%" (sdd 'ir-name) " = type " op " " (type-to-ir rt) " " cl "\n\n")))))))
+ 
+ ; Is every by-value named-type field dependency of `sd` present in the module
+ ; currently being assembled? A field lowers to a `%Name` reference only when its
+diff --git a/tests/suite-declarators.nuc b/tests/suite-declarators.nuc
+index 3a7744b..374c221 100644
+--- a/tests/suite-declarators.nuc
++++ b/tests/suite-declarators.nuc
+@@ -231,8 +231,8 @@ int main(void){
+     (try (check-line ir "%cd4_D = type { i32, i32 }"))
+     (try (check-line ir "%cd4_E = type { i32 }"))
+     (try (check-line ir "%cd4_F = type { i8 }"))
+-    (try (check-line ir "%cd4_U = type { i32 }"))
+-    (try (check-line ir "%cd4_V = type { i32 }"))
++    (try (check-line ir "%cd4_U = type { [1 x i32] }"))
++    (try (check-line ir "%cd4_V = type { [1 x i32] }"))
+     (try (check-line ir "%cd4_S = type { i32, i64 }"))
+     (try (check-line ir "%cd4_after = type { i32 }"))
+     (try (check-line ir "%__carr.cd4_G = type { i8 }"))
+diff --git a/tests/suite-doom.nuc b/tests/suite-doom.nuc
+index 8b0bf8f..f86455a 100644
+--- a/tests/suite-doom.nuc
++++ b/tests/suite-doom.nuc
+@@ -737,3 +737,20 @@ missing key :sens for #user/Opt"))
+         ov:StrView (string-as-view &out))
+     (try (check-eq (strview-trim-end &ov) "1 0 1 0 1"))
+     (drop &out)))
++
++; nuc-iron-doom ISSUE-016: a union copied as an aggregate keeps every byte, even
++; where its largest-aligned member has padding.
++(deftest doom-union-copy-keeps-padding-bytes
++  (let (out:String (try (build-run-source "(import-use \"stdio.h\")
++(defstruct V x:f32 y:f32)
++(defstruct E code:i32 n:i64)
++(defn f (v:V):(Result V E) (return (ok v)))
++(defn main ():i32
++  (match (f (V 1.0 -2.0))
++    ((ok w) (printf \"%g %g\\n\" (unsafe/cast f64 (w 'x)) (unsafe/cast f64 (w 'y))))
++    ((err e) (printf \"err\\n\")))
++  0)
++"))
++        ov:StrView (string-as-view &out))
++    (try (check-eq (strview-trim-end &ov) "1 -2"))
++    (drop &out)))
+-- 
+2.43.0
+
