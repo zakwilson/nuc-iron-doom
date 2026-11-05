@@ -1,0 +1,261 @@
+; Copyright (C) Henrique194 and contributors (Iron Doom), GPLv3.
+; Nucleus port: see COPYING.
+;
+; Palettes, patches, flats and composed wall textures (Iron Doom
+; crates/wad/src: palette.rs, patch/, flat.rs, wall_texture/). Pixel data stays
+; a view into the WAD wherever Iron Doom only copied it.
+
+(ns doom.graphics)
+
+(import-use nucleus.slice)
+(import-use nucleus.vector)
+(import-use nucleus.hashmap)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use nucleus.fmt)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.bytes)
+(import-use doom.util)
+(import-use doom.wad)
+(import-use doom.buffer)
+
+; --- palettes ----------------------------------------------------------------
+
+; 256 RGB triples. PLAYPAL holds 14: 0 normal, 1–8 pain red, 9–12 pickup
+; yellow, 13 radiation-suit green.
+(deftype Palette Bytes)
+
+(defn palette-r (p:&Palette c:usize):ui8 (return @(p (* 3 c))))
+(defn palette-g (p:&Palette c:usize):ui8 (return @(p (+ (* 3 c) 1))))
+(defn palette-b (p:&Palette c:usize):ui8 (return @(p (+ (* 3 c) 2))))
+
+(defn palettes-parse (w:&Wad):(Fallible (Vector Palette))
+  (let (lump (try (lump-named w "PLAYPAL"))
+        v (make (Vector Palette))
+        n (/ (lump-size lump) 768))
+    (dotimes (i:usize n)
+      (conj &v (sub-bytes (ref lump 'data) (* i 768) 768)))
+    (return (ok v))))
+
+; --- patches -----------------------------------------------------------------
+
+; A run of opaque pixels in one column, `top-delta` rows down.
+(defstruct Post top-delta:usize data:Bytes)
+(defstruct Column posts:(Vector Post) length:usize)
+(defstruct Patch width:usize height:usize left-offset:i16 top-offset:i16
+  columns:(Vector Column))
+
+(defn- column-parse (b:&Bytes):Column
+  (let (posts (make (Vector Post)) len:usize 0 o:usize 0 go true)
+    (while go
+      (let (top-delta @(b o))
+        (if (= top-delta 255)
+            (set! go false)
+            ; A post is: top delta, length, an unused byte, the pixels, another unused byte.
+            (let (n (as usize @(b (+ o 1))))
+              (conj &posts (Post (as usize top-delta) (sub-bytes b (+ o 3) n)))
+              (set! len (+ len n))
+              (set! o (+ o n 4))))))
+    (return (Column posts len))))
+
+(defn patch-parse (b:&Bytes):(Fallible Patch)
+  (let (width (le-i16 b 0) height (le-i16 b 2))
+    (when (< width 0) (fail "Patch has invalid width"))
+    (when (< height 0) (fail "Patch has invalid height"))
+    (let (cols (make (Vector Column)))
+      (dotimes (i:usize (as usize width))
+        (let (off (le-i32 b (+ 8 (* 4 i))))
+          (when (< off 0) (fail "Patch header has invalid column offset"))
+          (let (rest (rest-bytes b (as usize off)))
+            (conj &cols (column-parse &rest)))))
+      (return (ok (Patch (as usize width) (as usize height) (le-i16 b 4) (le-i16 b 6) cols))))))
+
+(defn patch-column (p:&Patch i:usize):&Column
+  (let (s (view (ref p 'columns)))
+    (return (&s i))))
+
+(defn- column-posts (c:&Column):(Slice Post)
+  (return (view (ref c 'posts))))
+
+(defn draw-column (c:&Column buf:&Buffer x:usize y:usize):void
+  (let (posts (column-posts c))
+    (dotimes (pi:usize (count &posts))
+      (let (post (&posts pi) data (ref post 'data))
+        (dotimes (row:usize (count data))
+          (set buf x (+ y row (post 'top-delta)) @(data row)))))))
+
+; V_DrawPatch: `x`,`y` name the patch's origin, which its offsets move.
+(defn draw-patch (buf:&Buffer x:usize y:usize p:&Patch):(Fallible void)
+  (let (left (as i64 (p 'left-offset)) top (as i64 (p 'top-offset))
+        px (- (as-checked i64 x) left) py (- (as-checked i64 y) top))
+    (when (or (< px 0) (< py 0)) (fail "Bad V_DrawPatch"))
+    (let (ux (as-checked usize px) uy (as-checked usize py))
+      (when (not (and (< ux (width buf)) (<= (+ ux (p 'width)) (width buf))
+                      (<= (+ uy (p 'height)) (height buf)) (< uy (height buf))))
+        (fail "Patch drawn outside the screen"))
+      (dotimes (col:usize (min (width buf) (p 'width)))
+        (draw-column (patch-column p col) buf (+ ux col) uy))
+      (return (ok)))))
+
+; --- flats -------------------------------------------------------------------
+
+(defconst FLAT-SIZE 4096)
+
+(defstruct Flat name:Name data:Bytes)
+
+; Flats in WAD order with a name index: Iron Doom's IndexMap.
+(defstruct Flats list:(Vector Flat) index:(HashMap Name usize))
+
+(defn flats-parse (w:&Wad):(Fallible Flats)
+  (let (start (unwrap-or (lump-index w "F_START") 0)
+        end (unwrap-or (lump-index w "F_END") 0))
+    (when (none? (lump-index w "F_START")) (fail "WAD file is missing flat start marker"))
+    (when (none? (lump-index w "F_END")) (fail "WAD file is missing flat end marker"))
+    (when (< end start) (fail "WAD file has flat end marker placed before flat start marker"))
+    (when (>= (+ start 1) end) (fail "WAD file contains no flats"))
+    (let (fl (Flats (make (Vector Flat)) (make (HashMap Name usize))))
+      (dotimes (i:usize (- end start 1))
+        (let (lump (lump-at w (+ start 1 i)))
+          (when (not (marker? lump))
+            (when (!= (lump-size lump) FLAT-SIZE)
+              (fail "Flat '" (lump 'name) "' has invalid size: expected " FLAT-SIZE
+                    " bytes, got " (lump-size lump) " bytes"))
+            (let (f (Flat (lump 'name) (lump 'data)))
+              (if-some (j (get (ref fl 'index) (lump 'name)))
+                (set (ref fl 'list) j f)
+                (do (assoc (ref fl 'index) (lump 'name) (count (ref fl 'list)))
+                    (conj (ref fl 'list) f)))))))
+      (return (ok fl)))))
+
+(defn flat-index (fl:&Flats n:Name):?usize
+  (return (get (ref fl 'index) n)))
+
+(defn flat-at (fl:&Flats i:usize):&Flat
+  (let (s (view (ref fl 'list)))
+    (return (&s i))))
+
+; --- wall textures -------------------------------------------------------------
+
+(defstruct WallTexture name:Name pixels:Buffer)
+(defstruct WallTextures list:(Vector WallTexture) index:(HashMap Name usize))
+
+; One patch placed in a texture definition.
+(defstruct PatchDescriptor origin-x:i16 origin-y:i16 patch-num:usize)
+
+; PNAMES, and the patches it names, parsed on first use.
+(defstruct PatchNames names:(Vector Name) cache:(HashMap Name Patch))
+
+(defn- patch-names-parse (w:&Wad):(Fallible PatchNames)
+  (let (lump (try (lump-named w "PNAMES"))
+        b (ref lump 'data)
+        n (le-i32 b 0))
+    (when (< n 0) (fail "PNAMES lump has invalid number of patches"))
+    (let (names (make (Vector Name)))
+      ; Iron Doom takes every whole name after the count, not just `n` of them.
+      (dotimes (i:usize (/ (- (count b) 4) 8))
+        (conj &names (name-at b (+ 4 (* 8 i)))))
+      (return (ok (PatchNames names (make (HashMap Name Patch))))))))
+
+(defn- get-patch (pn:&PatchNames w:&Wad num:usize):(Fallible Patch)
+  (when (>= num (count (ref pn 'names)))
+    (fail "Invalid patch index when retrieving patch"))
+  (let (nm ((ref pn 'names) num))
+    (when-some (p (get (ref pn 'cache) nm)) (return (ok p)))
+    (if-some (li (lump-index w nm))
+      (let (p (try (patch-parse (ref (lump-at w li) 'data))))
+        (assoc (ref pn 'cache) nm p)
+        (return (ok p)))
+      (fail "Invalid patch name when retrieving patch"))))
+
+; R_GenerateComposite's column fill, with its vanilla quirks.
+(defn- draw-to-texture (c:&Column tex:&Buffer tex-col:usize origin-y:i64):void
+  (let (posts (column-posts c) h (as-checked i64 (height tex)) go true pi:usize 0)
+    (while (and go (< pi (count &posts)))
+      (let (post (&posts pi)
+            n (as-checked i64 (count (ref post 'data)))
+            pos (+ (as-checked i64 (post 'top-delta)) origin-y)
+            skip 0)
+        (when (< pos 0)
+          ; Vanilla bug: the clipped rows are dropped from the end, not the start.
+          (set! n (max 0 (+ n pos)))
+          (set! pos 0))
+        (if (>= pos h)
+            (set! go false)
+            (do (when (> (+ pos n) h) (set! n (- h pos)))
+                (dotimes (i:i64 n)
+                  (set tex tex-col (as-checked usize (+ pos i))
+                       @((ref post 'data) (as-checked usize i))))))
+        (inc! pi)))))
+
+(defn- texture-parse (b:&Bytes pn:&PatchNames w:&Wad):(Fallible WallTexture)
+  (let (nm (name-at b 0) width (le-i16 b 12) height (le-i16 b 14) npatch (le-i16 b 20))
+    (when (< width 0) (fail "Texture has invalid width"))
+    (when (< height 0) (fail "Texture has invalid height"))
+    (when (< npatch 0) (fail "Texture has invalid number of patches"))
+    (let (descs (make (Vector PatchDescriptor)))
+      (dotimes (i:usize (as usize npatch))
+        (let (o (+ 22 (* 10 i)) num (le-i16 b (+ o 4)))
+          (when (< num 0) (fail "Missing patch in texture"))
+          (conj &descs (PatchDescriptor (le-i16 b o) (le-i16 b (+ o 2)) (as usize num)))))
+      (let (tw (as usize width)
+            pix (array2d tw (as usize height) (as ui8 251))
+            ds (view &descs)
+            ; Which descriptors cover each column, in definition order.
+            cover (array2d tw (count &ds) false)
+            ncover (make (Vector usize)))
+        (dotimes (x:usize tw) (conj &ncover 0))
+        (dotimes (di:usize (count &ds))
+          (let (d (&ds di) p (try (get-patch pn w (d 'patch-num)))
+                x1 (as i64 (d 'origin-x))
+                x2 (min (as-checked i64 tw) (+ x1 (as-checked i64 (p 'width)))))
+            (let (x (max x1 0))
+              (while (< x x2)
+                (let (ux (as-checked usize x))
+                  (set &cover ux di true)
+                  (set &ncover ux (+ (&ncover ux) 1)))
+                (inc! x)))))
+        (dotimes (x:usize tw)
+          (dotimes (di:usize (count &ds))
+            (when (&cover x di)
+              (let (d (&ds di) p (try (get-patch pn w (d 'patch-num)))
+                    ; Vanilla bug: a column made of one patch ignores its y offset.
+                    oy (if (> (&ncover x) 1) (as i64 (d 'origin-y)) 0)
+                    pc (as-checked usize (- (as-checked i64 x) (as i64 (d 'origin-x)))))
+                (draw-to-texture (patch-column &p pc) &pix x oy)))))
+        (return (ok (WallTexture nm pix)))))))
+
+(defn- textures-add (tx:&WallTextures lump:&Lump pn:&PatchNames w:&Wad):(Fallible void)
+  (let (b (ref lump 'data) n (le-i32 b 0))
+    (when (< n 0) (fail "Texture definitions has invalid number of textures"))
+    (dotimes (i:usize (as usize n))
+      (let (off (le-i32 b (+ 4 (* 4 i))))
+        (when (or (< off 0) (> (as usize off) (count b)))
+          (fail "Texture definitions has invalid texture offset"))
+        (let (rest (rest-bytes b (as usize off))
+              t (try (texture-parse &rest pn w)))
+          (if-some (j (get (ref tx 'index) (t 'name)))
+            (set (ref tx 'list) j t)
+            (do (assoc (ref tx 'index) (t 'name) (count (ref tx 'list)))
+                (conj (ref tx 'list) t))))))
+    (return (ok))))
+
+(defn textures-parse (w:&Wad):(Fallible WallTextures)
+  (let (tx (WallTextures (make (Vector WallTexture)) (make (HashMap Name usize)))
+        pn (try (patch-names-parse w)))
+    (match (lump-named w "TEXTURE1")
+      ((err e) (fail "Missing shareware texture definitions"))
+      ((ok l) (try (textures-add &tx l &pn w))))
+    (when-some (i (lump-index w "TEXTURE2"))
+      (try (textures-add &tx (lump-at w i) &pn w)))
+    (return (ok tx))))
+
+; "-" is the no-texture marker and maps to texture 0, as in vanilla.
+(defn texture-index (tx:&WallTextures n:Name):?usize
+  (when (= (count (ref tx 'list)) 0) (return none))
+  (when (= (name-byte n 0) 45) (return (some (as usize 0))))
+  (return (get (ref tx 'index) n)))
+
+(defn texture-at (tx:&WallTextures i:usize):&WallTexture
+  (let (s (view (ref tx 'list)))
+    (return (&s i))))

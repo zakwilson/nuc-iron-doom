@@ -8,6 +8,7 @@
 (import-use tests.bytes)
 (import-use tests.wad)
 (import-use tests.mapdata)
+(import-use tests.graphics)
 
 (defn main (argc:i32 argv:ptr):int
   (return (as int (test-main argc argv))))
