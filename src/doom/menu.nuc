@@ -1,0 +1,470 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom m_menu.c, d_englsh.h, dstrings.c); this
+; port is GPLv3, see COPYING.
+;
+; The menus. Vanilla's menu items hold function pointers that reach into the
+; whole game; here an item names an action, and what the game must do (start
+; a game, end it, quit, resize the view) comes back as requests for the game
+; layer to carry out, as G_DeferedInitNew defers the new game anyway.
+; Loading and saving aren't ported (milestone 7): their items say so.
+
+(ns doom.menu)
+
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.hufont)
+(import-use doom.input)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.world)
+
+(defconst LINEHEIGHT 16)
+(defconst SKULLXOFF -32)
+
+(defenum MenuId MAIN-MENU EPI-MENU NEW-MENU OPTIONS-MENU READ1-MENU READ2-MENU SOUND-MENU)
+
+(defenum MenuAction
+  ACT-NONE ACT-NEWGAME ACT-OPTIONS ACT-LOADGAME ACT-SAVEGAME ACT-READTHIS ACT-READTHIS2
+  ACT-FINISHREADTHIS ACT-QUITDOOM ACT-EPISODE ACT-CHOOSESKILL ACT-ENDGAME ACT-MESSAGES
+  ACT-DETAIL ACT-SCREENSIZE ACT-SENSITIVITY ACT-SOUND ACT-SFXVOL ACT-MUSICVOL)
+
+; What a message's answer does (messageRoutine).
+(defenum MessageRoutine MSG-NONE MSG-NIGHTMARE MSG-ENDGAME MSG-QUIT)
+
+; status: 1 selectable, 2 a slider (left and right work), -1 a blank line.
+(defstruct MenuItem status:i32 name:StrView action:i32 alpha:i32)
+
+; Which of the menu's own drawers it calls (its routine).
+(defenum MenuDrawer DRAW-MAIN DRAW-EPISODE DRAW-NEWGAME DRAW-OPTIONS DRAW-READ1 DRAW-READ2
+  DRAW-READ-COMMERCIAL DRAW-SOUND)
+
+(defstruct Menu items:(Vector MenuItem) prev:i32 drawer:i32 x:i32 y:i32 last-on:i32)
+
+; What the game must do.
+(defunion MenuRequest
+  (new-game skill:i32 episode:i32)
+  (end-game)
+  (quit)
+  (player-message text:StrView)
+  (view-size)
+  (sound name:i32))
+
+(defstruct MenuState
+  menus:(Vector Menu)
+  active:bool current:i32 item-on:i32
+  skull-counter:i32 which-skull:i32
+  ; M_StartMessage's.
+  to-print:bool message:String routine:i32 needs-input:bool last-active:bool
+  epi:i32
+  ; The settings the menus change.
+  show-messages:bool detail:i32 screen-size:i32 screenblocks:i32
+  sfx-volume:i32 music-volume:i32 mouse-sensitivity:i32
+  ; What the game must do, oldest first; the game empties it.
+  requests:(Vector MenuRequest)
+  ; A game is being played (usergame): End Game needs one.
+  user-game:bool
+  commercial:bool shareware:bool ultimate:bool)
+
+(defn- item (status:i32 n:CStr action:i32 alpha:i32):MenuItem
+  (return (MenuItem status (strview-from-cstr n) action alpha)))
+
+(defn- menu (items:(Vector MenuItem) prev:i32 drawer:i32 x:i32 y:i32 last-on:i32):Menu
+  (return (Menu items prev drawer x y last-on)))
+
+; The menu definitions, with M_Init's per-version changes.
+(defn menu-new (commercial:bool shareware:bool ultimate:bool):MenuState
+  (let (ms (make (Vector Menu))
+        main (make (Vector MenuItem)) epi (make (Vector MenuItem)) newg (make (Vector MenuItem))
+        opt (make (Vector MenuItem)) r1 (make (Vector MenuItem)) r2 (make (Vector MenuItem))
+        snd (make (Vector MenuItem)))
+    (conj &main (item 1 "M_NGAME" ACT-NEWGAME 110))
+    (conj &main (item 1 "M_OPTION" ACT-OPTIONS 111))
+    (conj &main (item 1 "M_LOADG" ACT-LOADGAME 108))
+    (conj &main (item 1 "M_SAVEG" ACT-SAVEGAME 115))
+    (when (not commercial)
+      (conj &main (item 1 "M_RDTHIS" (if ultimate ACT-READTHIS2 ACT-READTHIS) 114)))
+    (conj &main (item 1 "M_QUITG" ACT-QUITDOOM 113))
+    (conj &epi (item 1 "M_EPI1" ACT-EPISODE 107))
+    (conj &epi (item 1 "M_EPI2" ACT-EPISODE 116))
+    (conj &epi (item 1 "M_EPI3" ACT-EPISODE 105))
+    ; Only the Ultimate Doom executable shows episode 4.
+    (when ultimate (conj &epi (item 1 "M_EPI4" ACT-EPISODE 116)))
+    (conj &newg (item 1 "M_JKILL" ACT-CHOOSESKILL 105))
+    (conj &newg (item 1 "M_ROUGH" ACT-CHOOSESKILL 104))
+    (conj &newg (item 1 "M_HURT" ACT-CHOOSESKILL 104))
+    (conj &newg (item 1 "M_ULTRA" ACT-CHOOSESKILL 117))
+    (conj &newg (item 1 "M_NMARE" ACT-CHOOSESKILL 110))
+    (conj &opt (item 1 "M_ENDGAM" ACT-ENDGAME 101))
+    (conj &opt (item 1 "M_MESSG" ACT-MESSAGES 109))
+    (conj &opt (item 1 "M_DETAIL" ACT-DETAIL 103))
+    (conj &opt (item 2 "M_SCRNSZ" ACT-SCREENSIZE 115))
+    (conj &opt (item -1 "" ACT-NONE 0))
+    (conj &opt (item 2 "M_MSENS" ACT-SENSITIVITY 109))
+    (conj &opt (item -1 "" ACT-NONE 0))
+    (conj &opt (item 1 "M_SVOL" ACT-SOUND 115))
+    (conj &r1 (item 1 "" (if commercial ACT-FINISHREADTHIS ACT-READTHIS2) 0))
+    (conj &r2 (item 1 "" ACT-FINISHREADTHIS 0))
+    (conj &snd (item 2 "M_SFXVOL" ACT-SFXVOL 115))
+    (conj &snd (item -1 "" ACT-NONE 0))
+    (conj &snd (item 2 "M_MUSVOL" ACT-MUSICVOL 109))
+    (conj &snd (item -1 "" ACT-NONE 0))
+    ; In MenuId order.
+    (conj &ms (menu main -1 DRAW-MAIN 97 (if commercial 72 64) 0))
+    (conj &ms (menu epi MAIN-MENU DRAW-EPISODE 48 63 0))
+    (conj &ms (menu newg (if commercial MAIN-MENU EPI-MENU) DRAW-NEWGAME 48 63 2))
+    (conj &ms (menu opt MAIN-MENU DRAW-OPTIONS 60 37 0))
+    (conj &ms (if commercial
+                (menu r1 MAIN-MENU DRAW-READ-COMMERCIAL 330 165 0)
+                (menu r1 MAIN-MENU DRAW-READ1 280 185 0)))
+    (conj &ms (menu r2 (if ultimate -1 READ1-MENU) DRAW-READ2 330 175 0))
+    (conj &ms (menu snd OPTIONS-MENU DRAW-SOUND 80 64 0))
+    (return (MenuState ms false MAIN-MENU 0 10 0
+                       false (make String) MSG-NONE false false 0
+                       true 0 7 10 8 8 5
+                       (make (Vector MenuRequest)) false commercial shareware ultimate))))
+
+(defn- menu-at (m:&MenuState id:i32):&Menu
+  (let (s (view (ref m 'menus))) (return (&s (unsafe/cast usize id)))))
+
+(defn- item-at (mn:&Menu i:i32):MenuItem
+  (let (s (view (ref mn 'items))) (return @(&s (unsafe/cast usize i)))))
+
+(defn- item-count (mn:&Menu):i32 (return (unsafe/cast i32 (count (ref mn 'items)))))
+
+(defn- request (m:&MenuState r:MenuRequest):void (conj (ref m 'requests) r))
+
+(defn- sound (m:&MenuState sfx:i32):void (request m (MenuRequest-sound sfx)))
+
+(defn- setup-next-menu (m:&MenuState id:i32):void
+  (set! (m 'current) id)
+  (set! (m 'item-on) ((menu-at m id) 'last-on)))
+
+(defn- clear-menus (m:&MenuState):void (set! (m 'active) false))
+
+(defn- start-message (m:&MenuState text:StrView routine:i32 needs-input:bool):void
+  (set! (m 'last-active) (m 'active))
+  (set! (m 'to-print) true)
+  (let (s (make String)) (str-into &s text) (set! (m 'message) s))
+  (set! (m 'routine) routine)
+  (set! (m 'needs-input) needs-input)
+  (set! (m 'active) true))
+
+(defconst NIGHTMARE-MSG "are you sure? this skill level\nisn't even remotely fair.\n\npress y or n.")
+(defconst SWSTRING "this is the shareware version of doom.\n\nyou need to order the entire trilogy.\n\npress a key.")
+(defconst ENDGAME-MSG "are you sure you want to end the game?\n\npress y or n.")
+(defconst NOTPORTED "loading and saving aren't ported yet.\n\npress a key.")
+
+(defvar DOOM1-ENDMSG:(array CStr 8) (array CStr
+  "are you sure you want to\nquit this great game?"
+  "please don't leave, there's more\ndemons to toast!"
+  "let's beat it -- this is turning\ninto a bloodbath!"
+  "i wouldn't leave if i were you.\ndos is much worse."
+  "you're trying to say you like dos\nbetter than me, right?"
+  "don't leave yet -- there's a\ndemon around that corner!"
+  "ya know, next time you come in here\ni'm gonna toast ya."
+  "go ahead and leave. see if i care."))
+
+(defvar DOOM2-ENDMSG:(array CStr 8) (array CStr
+  "are you sure you want to\nquit this great game?"
+  "you want to quit?\nthen, thou hast lost an eighth!"
+  "don't go now, there's a \ndimensional shambler waiting\nat the dos prompt!"
+  "get outta here and go back\nto your boring programs."
+  "if i were your boss, i'd \n deathmatch ya in a minute!"
+  "look, bud. you leave now\nand you forfeit your body count!"
+  "just leave. when you come\nback, i'll be waiting with a bat."
+  "you're lucky i don't smack\nyou for thinking about leaving."))
+
+; M_QuitDOOM: one of the end messages, picked by the gametic.
+(defn- quit-doom (m:&MenuState gametic:i32):void
+  (let (k (as i64 (% gametic 8))
+        s (make String))
+    (str-into &s (strview-from-cstr (if (m 'commercial) (aref DOOM2-ENDMSG k) (aref DOOM1-ENDMSG k))))
+    (str-into &s (strview-from-cstr "\n\n(press y to quit to dos.)"))
+    (start-message m (string-as-view &s) MSG-QUIT true)))
+
+(defn- size-display (m:&MenuState choice:i32):void
+  (if (= choice 0)
+    (when (> (m 'screen-size) 0)
+      (set! (m 'screenblocks) (- (m 'screenblocks) 1))
+      (set! (m 'screen-size) (- (m 'screen-size) 1)))
+    (when (< (m 'screen-size) 8)
+      (set! (m 'screenblocks) (+ (m 'screenblocks) 1))
+      (set! (m 'screen-size) (+ (m 'screen-size) 1))))
+  (request m (MenuRequest-view-size)))
+
+(defn- change-messages (m:&MenuState):void
+  (set! (m 'show-messages) (not (m 'show-messages)))
+  (request m (MenuRequest-player-message
+               (strview-from-cstr (if (m 'show-messages) "Messages ON" "Messages OFF")))))
+
+(defn- change-detail (m:&MenuState):void
+  (set! (m 'detail) (- 1 (m 'detail)))
+  (request m (MenuRequest-player-message
+               (strview-from-cstr (if (= (m 'detail) 0) "High detail" "Low detail")))))
+
+(defn- end-game (m:&MenuState):void
+  (if (not (m 'user-game))
+    (sound m SFX-OOF)
+    (start-message m (strview-from-cstr ENDGAME-MSG) MSG-ENDGAME true)))
+
+; An item's routine, with its choice: the item's index, or 0 or 1 for a
+; slider's left or right.
+(defn- run-action (m:&MenuState action:i32 choice:i32 gametic:i32):void
+  (case action
+    ACT-NEWGAME (setup-next-menu m (if (m 'commercial) NEW-MENU EPI-MENU))
+    ACT-OPTIONS (setup-next-menu m OPTIONS-MENU)
+    ACT-LOADGAME (start-message m (strview-from-cstr NOTPORTED) MSG-NONE false)
+    ACT-SAVEGAME (start-message m (strview-from-cstr NOTPORTED) MSG-NONE false)
+    ACT-READTHIS (setup-next-menu m READ1-MENU)
+    ACT-READTHIS2 (setup-next-menu m READ2-MENU)
+    ACT-FINISHREADTHIS (setup-next-menu m MAIN-MENU)
+    ACT-QUITDOOM (quit-doom m gametic)
+    ACT-EPISODE (if (and (m 'shareware) (!= choice 0))
+                  (do (start-message m (strview-from-cstr SWSTRING) MSG-NONE false)
+                      (setup-next-menu m READ1-MENU))
+                  (do (set! (m 'epi) choice)
+                      (setup-next-menu m NEW-MENU)))
+    ACT-CHOOSESKILL (if (= choice SK-NIGHTMARE)
+                      (start-message m (strview-from-cstr NIGHTMARE-MSG) MSG-NIGHTMARE true)
+                      (do (request m (MenuRequest-new-game choice (+ (m 'epi) 1)))
+                          (clear-menus m)))
+    ACT-ENDGAME (end-game m)
+    ACT-MESSAGES (change-messages m)
+    ACT-DETAIL (change-detail m)
+    ACT-SCREENSIZE (size-display m choice)
+    ACT-SENSITIVITY (if (= choice 0)
+                      (when (> (m 'mouse-sensitivity) 0) (set! (m 'mouse-sensitivity) (- (m 'mouse-sensitivity) 1)))
+                      (when (< (m 'mouse-sensitivity) 9) (set! (m 'mouse-sensitivity) (+ (m 'mouse-sensitivity) 1))))
+    ACT-SOUND (setup-next-menu m SOUND-MENU)
+    ACT-SFXVOL (if (= choice 0)
+                 (when (> (m 'sfx-volume) 0) (set! (m 'sfx-volume) (- (m 'sfx-volume) 1)))
+                 (when (< (m 'sfx-volume) 15) (set! (m 'sfx-volume) (+ (m 'sfx-volume) 1))))
+    ACT-MUSICVOL (if (= choice 0)
+                   (when (> (m 'music-volume) 0) (set! (m 'music-volume) (- (m 'music-volume) 1)))
+                   (when (< (m 'music-volume) 15) (set! (m 'music-volume) (+ (m 'music-volume) 1))))
+    0))
+
+; A message's answer (messageRoutine).
+(defn- message-answer (m:&MenuState key:i32):void
+  (let (yes (= key 121))
+    (case (m 'routine)
+      MSG-NIGHTMARE (when yes
+                      (request m (MenuRequest-new-game SK-NIGHTMARE (+ (m 'epi) 1)))
+                      (clear-menus m))
+      MSG-ENDGAME (when yes
+                    (set! ((menu-at m (m 'current)) 'last-on) (m 'item-on))
+                    (clear-menus m)
+                    (request m (MenuRequest-end-game)))
+      MSG-QUIT (when yes (request m (MenuRequest-quit)))
+      0)))
+
+(defn- open-panel (m:&MenuState):void
+  (when (not (m 'active))
+    (set! (m 'active) true)
+    (set! (m 'current) MAIN-MENU)
+    (set! (m 'item-on) ((menu-at m MAIN-MENU) 'last-on))))
+
+; M_Responder: true when the menu took the event.
+(defn menu-responder (m:&MenuState ev:&Event gametic:i32):bool
+  (when (= (ev 'type) EV-QUIT)
+    (if (and (m 'active) (m 'to-print) (= (m 'routine) MSG-QUIT))
+      (request m (MenuRequest-quit))
+      (do (sound m SFX-SWTCHN) (quit-doom m gametic)))
+    (return true))
+  (when (!= (ev 'type) EV-KEYDOWN) (return false))
+  (let (key (ev 'key) ch (ev 'ch))
+    (when (m 'to-print)
+      (when (and (m 'needs-input)
+                 (not (or (= key 32) (= key KEY-ESCAPE) (= key 121) (= key 110))))
+        (return false))
+      (set! (m 'active) (m 'last-active))
+      (set! (m 'to-print) false)
+      (message-answer m key)
+      ; Vanilla closes the menu after any message.
+      (set! (m 'active) false)
+      (sound m SFX-SWTCHX)
+      (return true))
+    (when (not (m 'active))
+      (cond (= key 45) (do (size-display m 0) (sound m SFX-STNMOV) (return true))
+            (= key 61) (do (size-display m 1) (sound m SFX-STNMOV) (return true))
+            ; F1: help.
+            (= key KEY-F1) (do (open-panel m)
+                               (set! (m 'current) (if (m 'ultimate) READ2-MENU READ1-MENU))
+                               (set! (m 'item-on) 0)
+                               (sound m SFX-SWTCHN)
+                               (return true))
+            (= key (+ KEY-F1 6)) (do (sound m SFX-SWTCHN) (end-game m) (return true))
+            (= key (+ KEY-F1 7)) (do (change-messages m) (sound m SFX-SWTCHN) (return true))
+            (= key (+ KEY-F1 9)) (do (sound m SFX-SWTCHN) (quit-doom m gametic) (return true))
+            (= key KEY-ESCAPE) (do (open-panel m) (sound m SFX-SWTCHN) (return true))
+            true (return false)))
+    (let (cur (menu-at m (m 'current)) n (item-count cur))
+      (cond (= key KEY-DOWNARROW)
+            (let (go true)
+              (while go
+                (set! (m 'item-on) (if (> (+ (m 'item-on) 1) (- n 1)) 0 (+ (m 'item-on) 1)))
+                (sound m SFX-PSTOP)
+                (set! go (= ((item-at cur (m 'item-on)) 'status) -1)))
+              (return true))
+            (= key KEY-UPARROW)
+            (let (go true)
+              (while go
+                (set! (m 'item-on) (if (= (m 'item-on) 0) (- n 1) (- (m 'item-on) 1)))
+                (sound m SFX-PSTOP)
+                (set! go (= ((item-at cur (m 'item-on)) 'status) -1)))
+              (return true))
+            (or (= key KEY-LEFTARROW) (= key KEY-RIGHTARROW))
+            (let (it (item-at cur (m 'item-on)))
+              (when (and (!= (it 'action) ACT-NONE) (= (it 'status) 2))
+                (sound m SFX-STNMOV)
+                (run-action m (it 'action) (if (= key KEY-LEFTARROW) 0 1) gametic))
+              (return true))
+            (= key KEY-ENTER)
+            (let (it (item-at cur (m 'item-on)))
+              (when (and (!= (it 'action) ACT-NONE) (!= (it 'status) 0))
+                (set! (cur 'last-on) (m 'item-on))
+                (if (= (it 'status) 2)
+                  (do (run-action m (it 'action) 1 gametic) (sound m SFX-STNMOV))
+                  (do (run-action m (it 'action) (m 'item-on) gametic) (sound m SFX-PISTOL))))
+              (return true))
+            (= key KEY-ESCAPE)
+            (do (set! (cur 'last-on) (m 'item-on))
+                (clear-menus m)
+                (sound m SFX-SWTCHX)
+                (return true))
+            (= key KEY-BACKSPACE)
+            (do (set! (cur 'last-on) (m 'item-on))
+                (when (>= (cur 'prev) 0)
+                  (set! (m 'current) (cur 'prev))
+                  (set! (m 'item-on) ((menu-at m (cur 'prev)) 'last-on))
+                  (sound m SFX-SWTCHN))
+                (return true))
+            (!= ch 0)
+            ; Jump to the next item whose key this is, wrapping round.
+            (let (i (+ (m 'item-on) 1))
+              (while (< i n)
+                (when (= ((item-at cur i) 'alpha) ch)
+                  (set! (m 'item-on) i)
+                  (sound m SFX-PSTOP)
+                  (return true))
+                (set! i (+ i 1)))
+              (set! i 0)
+              (while (<= i (m 'item-on))
+                (when (= ((item-at cur i) 'alpha) ch)
+                  (set! (m 'item-on) i)
+                  (sound m SFX-PSTOP)
+                  (return true))
+                (set! i (+ i 1)))
+              (return false))
+            true (return false)))))
+
+; M_Ticker: the skull blinks.
+(defn menu-ticker (m:&MenuState):void
+  (set! (m 'skull-counter) (- (m 'skull-counter) 1))
+  (when (<= (m 'skull-counter) 0)
+    (set! (m 'which-skull) (bit-xor (m 'which-skull) 1))
+    (set! (m 'skull-counter) 8)))
+
+; --- drawing ----------------------------------------------------------------
+
+(defn- lump-patch (w:&Wad n:StrView):(Fallible Patch)
+  (return (patch-parse (ref (try (lump-named w (name n))) 'data))))
+
+(defn- draw-named (w:&Wad buf:&Buffer x:i32 y:i32 n:CStr):(Fallible void)
+  (let (p (try (lump-patch w (strview-from-cstr n))))
+    (try (draw-patch buf (unsafe/cast usize x) (unsafe/cast usize y) &p)))
+  (return (ok)))
+
+; M_StringWidth of one line.
+(defn- string-width (font:&HuFont s:StrView from:usize to:usize):i32
+  (let (w 0 i from)
+    (while (< i to)
+      (let (k (font-index (byte-of s i)))
+        (set! w (+ w (if (< k 0) 4 (unsafe/cast i32 ((font-patch font k) 'width))))))
+      (set! i (+ i 1)))
+    (return w)))
+
+; M_WriteText for one line (from..to of s).
+(defn- write-line (font:&HuFont buf:&Buffer x:i32 y:i32 s:StrView from:usize to:usize):(Fallible void)
+  (let (cx x i from)
+    (while (< i to)
+      (let (k (font-index (byte-of s i)))
+        (if (< k 0)
+          (set! cx (+ cx 4))
+          (let (p (font-patch font k) w (unsafe/cast i32 (p 'width)))
+            (when (> (+ cx w) 320) (return (ok)))
+            (try (draw-patch buf (unsafe/cast usize cx) (unsafe/cast usize y) p))
+            (set! cx (+ cx w)))))
+      (set! i (+ i 1))))
+  (return (ok)))
+
+; M_DrawThermo: a slider of `width` steps with its dot at `dot`.
+(defn- draw-thermo (w:&Wad buf:&Buffer x:i32 y:i32 width:i32 dot:i32):(Fallible void)
+  (try (draw-named w buf x y "M_THERML"))
+  (dotimes (i:i32 width) (try (draw-named w buf (+ x 8 (* i 8)) y "M_THERMM")))
+  (try (draw-named w buf (+ x 8 (* width 8)) y "M_THERMR"))
+  (try (draw-named w buf (+ x 8 (* dot 8)) y "M_THERMO"))
+  (return (ok)))
+
+(defn- draw-menu-routine (m:&MenuState w:&Wad buf:&Buffer):(Fallible void)
+  (let (cur (menu-at m (m 'current)) x (cur 'x) y (cur 'y))
+    (case (cur 'drawer)
+      DRAW-MAIN (try (draw-named w buf 94 2 "M_DOOM"))
+      DRAW-EPISODE (try (draw-named w buf 54 38 "M_EPISOD"))
+      DRAW-NEWGAME (do (try (draw-named w buf 96 14 "M_NEWG"))
+                       (try (draw-named w buf 54 38 "M_SKILL")))
+      DRAW-OPTIONS (do (try (draw-named w buf 108 15 "M_OPTTTL"))
+                       (try (draw-named w buf (+ x 175) (+ y (* LINEHEIGHT 2))
+                                        (if (= (m 'detail) 0) "M_GDHIGH" "M_GDLOW")))
+                       (try (draw-named w buf (+ x 120) (+ y LINEHEIGHT)
+                                        (if (m 'show-messages) "M_MSGON" "M_MSGOFF")))
+                       (try (draw-thermo w buf x (+ y (* LINEHEIGHT 6)) 10 (m 'mouse-sensitivity)))
+                       (try (draw-thermo w buf x (+ y (* LINEHEIGHT 4)) 9 (m 'screen-size))))
+      DRAW-READ1 (try (draw-named w buf 0 0 "HELP2"))
+      DRAW-READ2 (try (draw-named w buf 0 0 "HELP1"))
+      DRAW-READ-COMMERCIAL (try (draw-named w buf 0 0 "HELP"))
+      DRAW-SOUND (do (try (draw-named w buf 60 38 "M_SVOL"))
+                     (try (draw-thermo w buf x (+ y LINEHEIGHT) 16 (m 'sfx-volume)))
+                     (try (draw-thermo w buf x (+ y (* LINEHEIGHT 3)) 16 (m 'music-volume))))
+      0))
+  (return (ok)))
+
+; M_Drawer: a message centred, or the menu with its items and the skull.
+(defn menu-drawer (m:&MenuState w:&Wad font:&HuFont buf:&Buffer):(Fallible void)
+  (when (m 'to-print)
+    (let (s (string-as-view (ref m 'message)) lh (unsafe/cast i32 ((font-patch font 0) 'height))
+          lines 1 i:usize 0)
+      (while (< i (s 'len))
+        (when (= (byte-of s i) 10) (set! lines (+ lines 1)))
+        (set! i (+ i 1)))
+      (let (y (- 100 (/ (* lines lh) 2)) start:usize 0 j:usize 0)
+        (while (<= j (s 'len))
+          (when (or (= j (s 'len)) (= (byte-of s j) 10))
+            (try (write-line font buf (- 160 (/ (string-width font s start j) 2)) y s start j))
+            (set! y (+ y lh))
+            (set! start (+ j 1)))
+          (set! j (+ j 1)))))
+    (return (ok)))
+  (when (not (m 'active)) (return (ok)))
+  (try (draw-menu-routine m w buf))
+  (let (cur (menu-at m (m 'current)) x (cur 'x) y (cur 'y))
+    (dotimes (i:i32 (item-count cur))
+      (let (it (item-at cur i))
+        (when (and (> ((it 'name) 'len) 0) (some? (lump-index w (name (it 'name)))))
+          (let (p (try (lump-patch w (it 'name))))
+            (try (draw-patch buf (unsafe/cast usize x) (unsafe/cast usize (+ y (* i LINEHEIGHT))) &p))))))
+    (try (draw-named w buf (+ x SKULLXOFF) (+ (- y 5) (* (m 'item-on) LINEHEIGHT))
+                     (if (= (m 'which-skull) 0) "M_SKULL1" "M_SKULL2"))))
+  (return (ok)))

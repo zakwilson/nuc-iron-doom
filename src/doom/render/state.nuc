@@ -198,7 +198,7 @@
 
 ; R_ExecuteSetViewSize for `blocks` (3 to 11; 11 is the full screen) at full
 ; detail.
-(defn- set-view-size (r:&Renderer blocks:i32):void
+(defn set-view-size (r:&Renderer blocks:i32):void
   (let (sw (if (= blocks 11) SCREENWIDTH (* blocks 32))
         vh (if (= blocks 11) SCREENHEIGHT (bit-and (/ (* blocks 168) 10) (bit-not 7))))
     (set! (r 'view-width) sw)

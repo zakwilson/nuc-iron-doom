@@ -1,0 +1,60 @@
+(ns tests.menu)
+
+; The menus driven by key events. The skill menu is drawn to
+; build/tic09997.ppm for checking by eye.
+
+(import-use nucleus.test)
+(import-use nucleus.strview)
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.assets)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.framedump)
+(import-use doom.hufont)
+(import-use doom.input)
+(import-use doom.menu)
+
+(defn- press (m:&MenuState key:i32):bool
+  (let (ev (Event EV-KEYDOWN key (if (< key 127) key 0)))
+    (return (menu-responder m &ev 0))))
+
+(deftest new-game-through-the-menus
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (let (m (menu-new false true false))
+       (try (check (not (press &m KEY-UPARROW)) "a closed menu leaves arrows to the game"))
+       (try (check (press &m KEY-ESCAPE) "Escape opens it"))
+       (try (check (m 'active) "open"))
+       (press &m KEY-ENTER)
+       (press &m KEY-ENTER)
+       (let (font (try (hu-font-load (ref a 'wad)))
+             screen (array2d (as usize 320) (as usize 200) (as ui8 0))
+             ps (view (ref a 'palettes)))
+         (try (draw-patch &screen 0 0 (ref a 'title)))
+         (try (menu-drawer &m (ref a 'wad) &font &screen))
+         (try (framedump-write (strview-from-cstr "build") 9997 &screen (&ps 0) 0)))
+       ; Hurt Me Plenty is the skill menu's default.
+       (press &m KEY-ENTER)
+       (try (check (not (m 'active)) "a skill closes the menu"))
+       (let (found false rs (view (ref m 'requests)))
+         (dotimes (i:usize (count &rs))
+           (match @(&rs i)
+             ((new-game skill ep) (try (check (and (= skill 2) (= ep 1)) "skill 2, episode 1"))
+                                  (set! found true))
+             ((end-game) 0) ((quit) 0) ((player-message t) 0) ((view-size) 0) ((sound n) 0)))
+         (try (check found "a new game was asked for")))))))
+
+(deftest shareware-episode-two-refused
+  (let (m (menu-new false true false))
+    (press &m KEY-ESCAPE)
+    (press &m KEY-ENTER)
+    (press &m KEY-DOWNARROW)
+    (press &m KEY-ENTER)
+    (try (check (m 'to-print) "the shareware message"))
+    (press &m 32)
+    (try (check (not (m 'to-print)) "a key dismisses it"))))

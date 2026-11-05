@@ -52,6 +52,9 @@
 (import-use doom.finale)
 (import-use doom.hufont)
 (import-use doom.hud)
+(import-use doom.menu)
+(import-use doom.input)
+(import-use doom.wad)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
 
@@ -104,13 +107,16 @@
   wi-graphics:?WiGraphics
   seen-forced-wipes:i32
   hu-font:?HuFont
+  menu:MenuState
   tic:i32
   quit:bool)
 
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
-  (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
-                (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                none GS-DEMOSCREEN 0 none 0 none 0 false)))
+  (let (mode (game-mode &assets)
+        menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL)))
+    (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
+                  (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
+                  none GS-DEMOSCREEN 0 none 0 none menu 0 false))))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -125,6 +131,66 @@
         (when (= t SDL_QUIT) (set! (g 'quit) true))
         (when (and (= t SDL_KEYDOWN) (= (((ref ev 'key) 'keysym) 'scancode) SDL_SCANCODE_ESCAPE))
           (set! (g 'quit) true))))))
+
+; Phase B's D_ProcessEvents: the menu sees each key first. What else
+; G_Responder does with keys, build-ticcmd reads from SDL's key state.
+(defn- process-events (g:&Game):(Fallible void)
+  (let (evs (poll-events) v (view &evs)
+        gt (match (g 'session) ((some s) (s 'gametic)) ((none) (g 'tic))))
+    (dotimes (i:usize (count &v))
+      (menu-responder (ref g 'menu) (&v i) gt)))
+  (menu-ticker (ref g 'menu))
+  (try (do-menu-requests g))
+  (return (ok)))
+
+; G_DeferedInitNew and G_DoNewGame: a fresh single-player game.
+(defn- menu-new-game (g:&Game skill:i32 episode:i32):(Fallible void)
+  (let (a (ref g 'assets)
+        s (match (g 'session) ((some old) old) ((none) (try (new-session g))))
+        r (ref s 'rules))
+    (set! (r 'deathmatch) 0)
+    (set! (r 'netgame) false)
+    (set! (r 'respawn-parm) false)
+    (set! (r 'fast) false)
+    (set! (r 'no-monsters) false)
+    (set! (r 'console-player) 0)
+    (dotimes (i:usize MAXPLAYERS) (set (ref s 'in-game) i (= i 0)))
+    (set! (s 'demo) none)
+    (set! (s 'demo-ended) false)
+    (try (session-init-new s a skill episode 1))
+    (set! (g 'session) (some s))
+    (set! ((ref g 'menu) 'user-game) true)
+    (set! (g 'pending) (some (Mode-level))))
+  (return (ok)))
+
+; D_StartTitle, until the attract loop is ported: back to the title.
+(defn- end-game (g:&Game):void
+  (when-some (s (g 'session))
+    (when-some (w (s 'world))
+      (set! (s 'world) none)
+      (world-free w)))
+  (set! (g 'session) none)
+  (set! ((ref g 'menu) 'user-game) false)
+  (set! (g 'wipe-state) GS-DEMOSCREEN)
+  (set! (g 'pending) (some (Mode-intro 0))))
+
+(defn- do-menu-requests (g:&Game):(Fallible void)
+  (let (m (ref g 'menu) rs (view (ref m 'requests)))
+    (dotimes (i:usize (count &rs))
+      (match @(&rs i)
+        ((new-game skill ep) (try (menu-new-game g skill ep)))
+        ((end-game) (end-game g))
+        ((quit) (set! (g 'quit) true))
+        ((player-message t)
+         (when-some (s (g 'session))
+           (when-some (w (s 'world))
+             (set! ((player-at w (unsafe/cast usize ((ref w 'rules) 'console-player))) 'message)
+                   (some (unsafe/cast CStr (t 'data)))))))
+        ((view-size) (set-view-size (ref g 'renderer) (m 'screenblocks)))
+        ; The sound layer is milestone 7's.
+        ((sound n) 0)))
+    (clear! (ref m 'requests)))
+  (return (ok)))
 
 (defn- new-session (g:&Game):(Fallible &Session)
   (let (a (ref g 'assets) s (try (session-new a (game-mode a))))
@@ -166,6 +232,7 @@
     (set! (r 'no-monsters) (cl 'no-monsters))
     (try (session-init-new s a skill ep mp))
     (when (some? (cl 'record)) (session-begin-recording s))
+    (set! ((ref g 'menu) 'user-game) true)
     (set! (g 'session) (some s)))
   (return (ok)))
 
@@ -192,7 +259,8 @@
       (player-tic (player &ll) &a (ref g 'turn-held))
       (set! (g 'camera) (some (camera-new (player &ll))))))
   (when-some (s (g 'session))
-    (let (cmd (build-ticcmd (ref g 'cmd-turn-held)))
+    (set! (s 'menu-active) ((ref g 'menu) 'active))
+    (let (cmd (if ((ref g 'menu) 'active) (ticcmd-zero) (build-ticcmd (ref g 'cmd-turn-held))))
       (when (some? (s 'record)) (lowres-turn &cmd (ref g 'turn-carry)))
       (try (session-tic s (ref g 'assets) cmd)))
     ; G_CheckDemoStatus quits after a -playdemo or -timedemo.
@@ -223,6 +291,37 @@
         (render-view (ref g 'view) &ll &cc (ref (ref g 'assets) 'textures) (ref g 'screen)))))
   (return (ok)))
 
+(defn- named-patch (g:&Game n:CStr):(Fallible Patch)
+  (return (patch-parse (ref (try (lump-named (ref (ref g 'assets) 'wad) n)) 'data))))
+
+; R_FillBackScreen: round a reduced view, the flat tiled and a bevelled edge.
+(defn- fill-back-screen (g:&Game commercial:bool):(Fallible void)
+  (let (r (ref g 'renderer) buf (ref g 'screen)
+        vw (r 'view-width) vh (r 'view-height) wx (r 'view-window-x) wy (r 'view-window-y)
+        src ((try (lump-named (ref (ref g 'assets) 'wad) (if commercial "GRNROCK" "FLOOR7_2"))) 'data))
+    (when (= vw 320) (return (ok)))
+    (dotimes (y:usize 168)
+      (dotimes (x:usize 320)
+        (set buf x y @(&src (+ (* (bit-and y 63) 64) (bit-and x 63))))))
+    (let (t (try (named-patch g "brdr_t")) b (try (named-patch g "brdr_b"))
+          l (try (named-patch g "brdr_l")) rt (try (named-patch g "brdr_r"))
+          x 0 y 0)
+      (while (< x vw)
+        (try (draw-patch buf (unsafe/cast usize (+ wx x)) (unsafe/cast usize (- wy 8)) &t))
+        (try (draw-patch buf (unsafe/cast usize (+ wx x)) (unsafe/cast usize (+ wy vh)) &b))
+        (set! x (+ x 8)))
+      (while (< y vh)
+        (try (draw-patch buf (unsafe/cast usize (- wx 8)) (unsafe/cast usize (+ wy y)) &l))
+        (try (draw-patch buf (unsafe/cast usize (+ wx vw)) (unsafe/cast usize (+ wy y)) &rt))
+        (set! y (+ y 8))))
+    (let (tl (try (named-patch g "brdr_tl")) tr (try (named-patch g "brdr_tr"))
+          bl (try (named-patch g "brdr_bl")) br (try (named-patch g "brdr_br")))
+      (try (draw-patch buf (unsafe/cast usize (- wx 8)) (unsafe/cast usize (- wy 8)) &tl))
+      (try (draw-patch buf (unsafe/cast usize (+ wx vw)) (unsafe/cast usize (- wy 8)) &tr))
+      (try (draw-patch buf (unsafe/cast usize (- wx 8)) (unsafe/cast usize (+ wy vh)) &bl))
+      (try (draw-patch buf (unsafe/cast usize (+ wx vw)) (unsafe/cast usize (+ wy vh)) &br))))
+  (return (ok)))
+
 ; The level as the console player sees it, with the weapon and status bar.
 (defn- draw-session-level (g:&Game s:&Session):(Fallible void)
   (let (w (session-world s))
@@ -233,13 +332,16 @@
                     (ref a 'sprites) (ref w 'sector-things) (ref g 'screen))
           p (player-at w (unsafe/cast usize ((ref w 'rules) 'console-player)))
           e (player-eye p))
+      (try (fill-back-screen g (= ((ref w 'rules) 'mode) COMMERCIAL)))
       (try (render-player-view (ref g 'renderer) &sc &e))
       (draw-player-sprites (ref g 'renderer) &sc p)
       (when (none? (g 'st-graphics))
         (set! (g 'st-graphics) (some (try (status-graphics-load (ref a 'wad) 0)))))
-      (when-some (sg (g 'st-graphics))
-        (let (r (ref w 'rules) sgv sg)
-          (try (st-drawer (ref s 'st) &sgv (ref g 'screen) p (!= (r 'deathmatch) 0) (r 'netgame) 0))))
+      ; Full screen has no status bar.
+      (when (< ((ref g 'renderer) 'view-height) 200)
+        (when-some (sg (g 'st-graphics))
+          (let (r (ref w 'rules) sgv sg)
+            (try (st-drawer (ref s 'st) &sgv (ref g 'screen) p (!= (r 'deathmatch) 0) (r 'netgame) 0)))))
       (let (font (try (font-of g)))
         (try (hud-drawer (ref s 'hud) &font (ref g 'screen))))
       (try (set-palette g (st-palette p)))))
@@ -301,7 +403,7 @@
 
 (defn game-tic (g:&Game):(Fallible void)
   (inc! (g 'tic))
-  (poll-input g)
+  (if ((ref g 'cl) 'iron-render) (poll-input g) (try (process-events g)))
   ; StateTransition.
   (let (from (mode-id (ref g 'mode)) entered:bool false)
     (when-some (next (g 'pending))
@@ -313,7 +415,8 @@
       (match (g 'mode)
         ((setup) 0)
         ((intro elapsed)
-         (when (= elapsed 0)
+         ; Phase B redraws it under the menu every tic.
+         (when (or (= elapsed 0) (not ((ref g 'cl) 'iron-render)))
            (try (draw-patch (ref g 'screen) 0 0 (ref (ref g 'assets) 'title))))
          (let (now (+ elapsed TIC-NS))
            (set! (g 'mode) (Mode-intro now))
@@ -340,8 +443,10 @@
              (set! (g 'pending) (some (Mode-intro 0))))))
         ((intro e) 0) ((level) 0) ((melt) 0))
       (when title-done
-        (if ((ref g 'cl) 'iron-render) (try (load-level g 1 1)) (try (start-game g)))
-        (set! (g 'pending) (some (Mode-level))))
+        ; Phase A starts E1M1; phase B's title waits for the menu.
+        (when ((ref g 'cl) 'iron-render)
+          (try (load-level g 1 1))
+          (set! (g 'pending) (some (Mode-level)))))
       ; A scene change other than into or out of the melt starts one: the old
       ; screen is kept, the new scene drawn, and the melt shows the old screen first.
       ; Phase B wipes in session-frame instead.
@@ -354,6 +459,10 @@
             (copy-from (ref g 'screen) &st)
             (set! (g 'melt) (some (melt-new st end (ref g 'rand))))
             (set! (g 'pending) (some (Mode-melt))))))))
+  ; M_Drawer, over everything.
+  (when (not ((ref g 'cl) 'iron-render))
+    (let (font (try (font-of g)))
+      (try (menu-drawer (ref g 'menu) (ref (ref g 'assets) 'wad) &font (ref g 'screen)))))
   ; Last.
   (when-some (fd ((ref g 'cl) 'framedump))
     (when (dump-tic? &fd (g 'tic))
