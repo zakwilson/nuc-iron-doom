@@ -46,6 +46,7 @@
 (import-use doom.render.things)
 (import-use doom.session)
 (import-use doom.ticcmd)
+(import-use doom.statusbar)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
 
@@ -87,12 +88,15 @@
   cmd-turn-held:i32
   ; lowres_turn's carry, while recording.
   turn-carry:i32
+  st-graphics:?StatusGraphics
+  ; The PLAYPAL palette on screen.
+  palette:i32
   tic:i32
   quit:bool)
 
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
   (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
-                (Mode-setup) none none none none (view-new) none (renderer-new 11) 0 0 0 0 false)))
+                (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0 0 false)))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -192,6 +196,13 @@
     (return (Eye (mo 'x) (mo 'y) (p 'view-z) (mo 'angle) (p 'extra-light)
                  (if (= (p 'fixed-colormap) 0) -1 (p 'fixed-colormap))))))
 
+(defn- set-palette (g:&Game n:i32):(Fallible void)
+  (when (!= n (g 'palette))
+    (set! (g 'palette) n)
+    (let (ps (view (ref (ref g 'assets) 'palettes)))
+      (try (video-set-palette (ref g 'video) (&ps (unsafe/cast usize n)) 0))))
+  (return (ok)))
+
 (defn- draw-level (g:&Game):(Fallible void)
   (when-some (l (g 'level))
     (when-some (c (g 'camera))
@@ -207,7 +218,13 @@
             p (player-at w (unsafe/cast usize ((ref w 'rules) 'console-player)))
             e (player-eye p))
         (try (render-player-view (ref g 'renderer) &sc &e))
-        (draw-player-sprites (ref g 'renderer) &sc p))))
+        (draw-player-sprites (ref g 'renderer) &sc p)
+        (when (none? (g 'st-graphics))
+          (set! (g 'st-graphics) (some (try (status-graphics-load (ref a 'wad) 0)))))
+        (when-some (sg (g 'st-graphics))
+          (let (r (ref w 'rules) sgv sg)
+            (try (st-drawer (ref s 'st) &sgv (ref g 'screen) p (!= (r 'deathmatch) 0) (r 'netgame) 0))))
+        (try (set-palette g (st-palette p))))))
   (return (ok)))
 
 (defn game-tic (g:&Game):(Fallible void)
@@ -265,7 +282,8 @@
   ; Last.
   (when-some (fd ((ref g 'cl) 'framedump))
     (when (dump-tic? &fd (g 'tic))
-      (try (framedump-write (fd 'dir) (g 'tic) (ref g 'screen) (palette0 g) 0)))
+      (let (ps (view (ref (ref g 'assets) 'palettes)))
+        (try (framedump-write (fd 'dir) (g 'tic) (ref g 'screen) (&ps (unsafe/cast usize (g 'palette))) 0))))
     (when (>= (g 'tic) (last-tic &fd)) (set! (g 'quit) true)))
   (try (video-present (ref g 'video) (ref g 'screen)))
   (return (ok)))

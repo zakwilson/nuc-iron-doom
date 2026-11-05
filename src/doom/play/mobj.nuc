@@ -355,7 +355,10 @@
           (try (setup-psprites w pi))
           ; Deathmatch gives every key.
           (when (!= ((ref w 'rules) 'deathmatch) 0)
-            (dotimes (i:i64 NUMCARDS) (set! (aref (p 'cards) i) true)))))))
+            (dotimes (i:i64 NUMCARDS) (set! (aref (p 'cards) i) true)))
+          ; For ST_Start and HU_Start, which the game layer runs.
+          (when (= (unsafe/cast i32 pi) ((ref w 'rules) 'console-player))
+            (set! (w 'console-spawns) (+ (w 'console-spawns) 1)))))))
   (return (ok)))
 
 (defn- skill-bit (skill:i32):i32

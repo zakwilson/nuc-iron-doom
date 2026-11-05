@@ -31,6 +31,7 @@
 (import-use doom.play.setup)
 (import-use doom.play.spec)
 (import-use doom.play.tick)
+(import-use doom.statusbar)
 (import doom.play.map pm)
 
 ; The v1.9 executable's demo version byte, and the end-of-demo marker.
@@ -58,13 +59,14 @@
   ; -tichash's lines, written when the session ends.
   tichash:?String
   ; The demo being recorded, header first; written out at the end.
-  record:?(Vector ui8))
+  record:?(Vector ui8)
+  st:StatusBar)
 
 (defn session-new (a:&Assets mode:i32):(Fallible &Session)
   (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
                        (single-player-rules SK-MEDIUM mode 1 1)
                        (single-player-in-game) (new-game-players) (random-new)
-                       none 0 none false false none none))))
+                       none 0 none false false none none (status-bar-new)))))
 
 ; D_IdentifyVersion: told apart by which maps the IWAD has.
 (defn game-mode (a:&Assets):i32
@@ -353,8 +355,7 @@
           (write-demo-ticcmd s (ref p 'cmd)))))
     (when (s 'demo-ended) (return (ok)))
     (try (ticker w))
-    ; ST_Ticker's st_randomnumber.
-    (m-random (ref w 'random))
+    (st-ticker (ref s 'st) w (player-at w cp) (m-random (ref w 'random)))
     (when-some (out (s 'tichash))
       (let (line (tichash-line s) o out)
         (str-into &o (string-as-view &line))

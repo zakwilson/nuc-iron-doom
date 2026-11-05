@@ -249,7 +249,10 @@
   ; gametic, which the game layer keeps: A_Tracer reads it, not leveltime.
   game-tic:i32
   ; A_BrainAwake's targets and A_BrainSpit's turn and easy-skill toggle.
-  brain-targets:(Vector &Mobj) brain-target-on:i32 brain-easy:i32)
+  brain-targets:(Vector &Mobj) brain-target-on:i32 brain-easy:i32
+  ; How many times the console player has spawned: the status bar and HUD
+  ; restart on each (P_SpawnPlayer's ST_Start and HU_Start).
+  console-spawns:i32)
 
 (defn mobj-info-of (m:&Mobj):MobjInfo (return (mobj-info (m 'type))))
 
@@ -390,7 +393,7 @@
                (filled 32 none) 0 none
                pics (identity (pics 'num-textures)) (identity (pics 'num-flats))
                (make (Vector usize)) false 0 false
-               0 (make (Vector &Mobj)) 0 0))
+               0 (make (Vector &Mobj)) 0 0 0))
     ; P_InitThinkers: the cap alone is a circular list.
     (set! (cap 'prev) (some cap))
     (set! (cap 'next) (some cap))
