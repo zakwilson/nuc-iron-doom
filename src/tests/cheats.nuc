@@ -1,0 +1,48 @@
+(ns tests.cheats)
+
+; The cheat codes typed into a level, a key at a time.
+
+(import-use nucleus.test)
+(import-use nucleus.strview)
+(import-use doom.error)
+(import-use doom.assets)
+(import-use doom.play.defs)
+(import-use doom.play.world)
+(import-use doom.session)
+(import-use doom.cheats)
+(import-use doom.hufont)
+
+(defn- type-text (c:&Cheats w:&World text:CStr):?Clev
+  (let (v (strview-from-cstr text) i:usize 0 out:?Clev none)
+    (while (< i (v 'len))
+      (let (ch (byte-of v i))
+        (when-some (to (cheat-responder c w ch)) (set! out (some to))))
+      (set! i (+ i 1)))
+    (return out)))
+
+(deftest cheats-typed
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (let (s (try (session-new &a (game-mode &a))) c (cheats-new))
+       (try (session-init-new s &a SK-MEDIUM 1 1))
+       (let (w (session-world s) p (player-at w 0))
+         (type-text &c w "iddqd")
+         (try (check (!= (bit-and (p 'cheats) CF-GODMODE) 0) "iddqd: god mode"))
+         ; A wrong key restarts a sequence.
+         (type-text &c w "idkfx")
+         (try (check (not (aref (p 'cards) 0)) "a mistyped idkfa does nothing"))
+         (type-text &c w "idkfa")
+         (try (check (and (aref (p 'cards) 0) (aref (p 'weapon-owned) (as i64 WP-BFG))
+                          (= (p 'armor-points) 200)) "idkfa: keys, weapons and armor"))
+         (type-text &c w "idbeholdv")
+         (try (check (> (aref (p 'powers) (as i64 PW-INVULNERABILITY)) 1) "idbeholdv: invulnerable"))
+         (type-text &c w "idbeholdv")
+         (try (check (= (aref (p 'powers) (as i64 PW-INVULNERABILITY)) 1) "again: its last tic"))
+         (try (check (none? (type-text &c w "idclev51")) "idclev51: no episode 5"))
+         (try (check (none? (type-text &c w "idclev10")) "no map 0"))
+         (match (type-text &c w "idclev13")
+           ((some to) (try (check (and (= (to 'episode) 1) (= (to 'map) 3)) "idclev13: E1M3")))
+           ((none) (try (check false "idclev13 asks for a map"))))
+         (type-text &c w "idmypos")
+         (try (check (some? (p 'message)) "idmypos: a message")))))))

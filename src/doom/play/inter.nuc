@@ -97,7 +97,7 @@
   (set! (aref (p 'cards) (as i64 card)) true))
 
 ; P_GivePower.
-(defn- give-power (p:&Player power:i32):bool
+(defn give-power (p:&Player power:i32):bool
   (let (i (as i64 power))
     (case power
       PW-INVULNERABILITY (do (set! (aref (p 'powers) i) INVULNTICS) (return true))

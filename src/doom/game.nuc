@@ -54,6 +54,7 @@
 (import-use doom.hud)
 (import-use doom.menu)
 (import-use doom.input)
+(import-use doom.cheats)
 (import-use doom.wad)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
@@ -108,6 +109,7 @@
   seen-forced-wipes:i32
   hu-font:?HuFont
   menu:MenuState
+  cheats:Cheats
   ; The attract loop (d_main.c): the sequence's step, the page showing
   ; (GS_DEMOSCREEN) and its tics left, and a pending D_AdvanceDemo.
   demo-sequence:i32 page:?CStr page-tic:i32 advance-demo:bool
@@ -121,7 +123,7 @@
         menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL)))
     (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
                   (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                  none GS-DEMOSCREEN 0 none 0 none menu -1 none 0 false (random-new) 0 false))))
+                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) -1 none 0 false (random-new) 0 false))))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -144,17 +146,17 @@
         gt (match (g 'session) ((some s) (s 'gametic)) ((none) (g 'tic))))
     (dotimes (i:usize (count &v))
       (let (ev (&v i))
-        (when (and (not (menu-responder (ref g 'menu) ev gt))
-                   ; G_Responder: in the attract loop any key brings up the menu.
-                   (= (ev 'type) EV-KEYDOWN) (not ((ref g 'menu) 'user-game))
-                   (none? (demo-lump (ref g 'cl))))
-          (open-panel (ref g 'menu))))))
+        (when (and (not (menu-responder (ref g 'menu) ev gt)) (= (ev 'type) EV-KEYDOWN))
+          ; G_Responder: in the attract loop any key brings up the menu.
+          (if (and (not ((ref g 'menu) 'user-game)) (none? (demo-lump (ref g 'cl))))
+            (open-panel (ref g 'menu))
+            (try (level-responder g ev)))))))
   (menu-ticker (ref g 'menu))
   (try (do-menu-requests g))
   (return (ok)))
 
 ; G_DeferedInitNew and G_DoNewGame: a fresh single-player game.
-(defn- menu-new-game (g:&Game skill:i32 episode:i32):(Fallible void)
+(defn- menu-new-game (g:&Game skill:i32 episode:i32 mp:i32):(Fallible void)
   (let (a (ref g 'assets)
         s (match (g 'session) ((some old) old) ((none) (try (new-session g))))
         r (ref s 'rules))
@@ -167,12 +169,21 @@
     (dotimes (i:usize MAXPLAYERS) (set (ref s 'in-game) i (= i 0)))
     (set! (s 'demo) none)
     (set! (s 'demo-ended) false)
-    (try (session-init-new s a skill episode 1))
+    (try (session-init-new s a skill episode mp))
     (set! (g 'session) (some s))
     (set! (g 'page) none)
     (set! (g 'advance-demo) false)
     (set! ((ref g 'menu) 'user-game) true)
     (set! (g 'pending) (some (Mode-level))))
+  (return (ok)))
+
+; G_Responder's level half: the cheats, in a level not played from a demo.
+(defn- level-responder (g:&Game ev:&Event):(Fallible void)
+  (when-some (s (g 'session))
+    (when-some (w (s 'world))
+      (when (and (= (s 'gamestate) GS-LEVEL) (not ((ref w 'rules) 'demo-playback)))
+        (when-some (to (cheat-responder (ref g 'cheats) w (ev 'ch)))
+          (try (menu-new-game g GAME-SKILL (to 'episode) (to 'map)))))))
   (return (ok)))
 
 ; D_StartTitle: the attract loop from its start.
@@ -184,7 +195,7 @@
   (let (m (ref g 'menu) rs (view (ref m 'requests)))
     (dotimes (i:usize (count &rs))
       (match @(&rs i)
-        ((new-game skill ep) (try (menu-new-game g skill ep)))
+        ((new-game skill ep) (try (menu-new-game g skill ep 1)))
         ((end-game) (end-game g))
         ((quit) (set! (g 'quit) true))
         ((player-message t)
