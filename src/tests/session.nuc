@@ -15,6 +15,12 @@
 (import-use doom.play.defs)
 (import-use doom.play.world)
 (import-use doom.session)
+(import-use doom.intermission)
+(import-use doom.framedump)
+(import-use doom.util)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use nucleus.slice)
 
 ; Each exit loads the next map, freeing the last, until E1M8's ends the episode.
 (deftest episode-by-exits
@@ -29,6 +35,14 @@
            (dotimes (k:usize 35) (try (session-tic s &a (ticcmd-zero))))
            (set! ((session-world s) 'exit) 1)
            (try (session-tic s &a (ticcmd-zero)))
+           ; Through the intermission by pressing use, as WI_checkForAccelerate wants.
+           (let (k 0 use (ticcmd-zero))
+             (set! (use 'buttons) BT-USE)
+             (while (and (not (s 'finished)) (= ((ref (session-world s) 'rules) 'map) m) (< k 2000))
+               (try (check (or (= k 0) (= (s 'gamestate) GS-INTERMISSION)) "the intermission shows"))
+               (try (session-tic s &a (if (= (% k 2) 0) use (ticcmd-zero))))
+               (set! k (+ k 1)))
+             (try (check (< k 2000) "the intermission ends")))
            (set! m (+ m 1)))
          (try (check (= m 9) "E1M8's exit ends the episode")))))))
 
@@ -45,3 +59,21 @@
          (let (v (string-as-view &t))
            (try (check (strview-has-suffix v (strview-from-cstr "2133 86 207 8f22bba2 254 0/68/2/20/9/0\n"))
                        "demo3's last tic"))))))))
+
+; The intermission after E1M3, part way through counting, drawn to
+; build/wi-e1m3.ppm for checking by eye.
+(deftest intermission-draws
+  (match (assets-load (strview-from-cstr "/usr/share/games/doom/doom1.wad"))
+    ((err e) (skip! "no shareware IWAD: " (failure-text &e)))
+    ((ok a)
+     (let (s (try (session-new &a (game-mode &a))))
+       (try (session-init-new s &a SK-MEDIUM 1 3))
+       (dotimes (k:usize 100) (try (session-tic s &a (ticcmd-zero))))
+       (set! ((session-world s) 'exit) 1)
+       (dotimes (k:usize 150) (try (session-tic s &a (ticcmd-zero))))
+       (try (check (= (s 'gamestate) GS-INTERMISSION) "in the intermission"))
+       (let (g (try (wi-graphics-load (ref a 'wad) 0 false))
+             screen (array2d (as usize 320) (as usize 200) (as ui8 0))
+             ps (view (ref a 'palettes)))
+         (try (wi-drawer (ref s 'wi) &g &screen false))
+         (try (framedump-write (strview-from-cstr "build") 9999 &screen (&ps 0) 0)))))))

@@ -32,11 +32,16 @@
 (import-use doom.play.spec)
 (import-use doom.play.tick)
 (import-use doom.statusbar)
+(import-use doom.intermission)
 (import doom.play.map pm)
 
 ; The v1.9 executable's demo version byte, and the end-of-demo marker.
 (defconst DOOM-VERSION 109)
 (defconst DEMOMARKER 0x80)
+
+; G_Ticker's gamestate_t and gameaction_t, as far as the session runs them.
+(defenum GameState GS-LEVEL GS-INTERMISSION GS-FINALE GS-DEMOSCREEN)
+(defenum GameAction GA-NOTHING GA-LOADLEVEL GA-COMPLETED GA-VICTORY GA-WORLDDONE)
 
 ; A demo being played back: the lump and the read position. A demo from a
 ; file keeps the file's bytes in `file`, which `data` views.
@@ -60,13 +65,18 @@
   tichash:?String
   ; The demo being recorded, header first; written out at the end.
   record:?(Vector ui8)
-  st:StatusBar)
+  st:StatusBar
+  gamestate:i32 gameaction:i32 secret-exit:bool
+  wi:Intermission
+  ; Levels loaded: G_DoLoadLevel forces a wipe, which the game layer does.
+  loads:i32)
 
 (defn session-new (a:&Assets mode:i32):(Fallible &Session)
   (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
                        (single-player-rules SK-MEDIUM mode 1 1)
                        (single-player-in-game) (new-game-players) (random-new)
-                       none 0 none false false none none (status-bar-new)))))
+                       none 0 none false false none none (status-bar-new)
+                       GS-LEVEL GA-NOTHING false (intermission-empty) 0))))
 
 ; D_IdentifyVersion: told apart by which maps the IWAD has.
 (defn game-mode (a:&Assets):i32
@@ -102,7 +112,9 @@
        (let (l (try (pm/level-load &m (ref a 'flats) (ref a 'textures)))
              w (try (level-setup l &m @r (s 'players) (ref s 'in-game) (s 'random) (s 'pics))))
          (set! (w 'game-tic) (s 'gametic))
-         (set! (s 'world) (some w))))))
+         (set! (s 'world) (some w))
+         (set! (s 'gamestate) GS-LEVEL)
+         (set! (s 'loads) (+ (s 'loads) 1))))))
   (return (ok)))
 
 ; Vanilla's gameskill outlives a game, and -fast halves the tics again at
@@ -264,24 +276,59 @@
   (set! (p 'damage-count) 0)
   (set! (p 'bonus-count) 0))
 
-; G_DoCompleted and G_WorldDone, without the intermission yet: on to the
-; next map, or the end of the game.
-(defn- level-completed (s:&Session a:&Assets):(Fallible void)
-  (let (w (session-world s) r (ref s 'rules) secret (= (w 'exit) 2)
-        players (view (ref w 'players)) ep (r 'episode) mp (r 'map))
+; G_DoCompleted: the level's stats to the intermission, or on map 8 of Doom
+; 1 the episode's end.
+(defn- do-completed (s:&Session):void
+  (let (w (session-world s) r (ref s 'rules) commercial (= (r 'mode) COMMERCIAL)
+        players (view (ref w 'players)) ep (r 'episode) mp (r 'map)
+        cp (unsafe/cast usize (r 'console-player)))
+    (set! (s 'gameaction) GA-NOTHING)
     (dotimes (i:usize MAXPLAYERS)
       (when ((ref s 'in-game) i) (player-finish-level (&players i))))
-    (when (and (!= (r 'mode) COMMERCIAL) (= mp 8))
-      ; The episode's end: the finale.
-      (set! (s 'finished) true)
-      (return (ok)))
-    (set! (r 'map)
-          (cond (= (r 'mode) COMMERCIAL) (+ mp 1)
-                secret 9
-                ; Back from the secret level.
-                (= mp 9) (case ep 1 4 2 6 3 7 4 3 1)
-                true (+ mp 1)))
-    (return (load-level s a))))
+    (when (not commercial)
+      (when (= mp 8)
+        (set! (s 'gameaction) GA-VICTORY)
+        (return))
+      (when (= mp 9)
+        (dotimes (i:usize MAXPLAYERS) (set! ((&players i) 'did-secret) true))))
+    (let (next (if commercial
+                 (cond (s 'secret-exit) (case mp 15 30 31 31 mp)
+                       (or (= mp 31) (= mp 32)) 15
+                       true mp)
+                 (cond (s 'secret-exit) 8
+                       ; Back from the secret level.
+                       (= mp 9) (case ep 1 3 2 5 3 6 4 2 mp)
+                       true mp))
+          plyr (make (Vector WbPlayer)))
+      (dotimes (i:usize MAXPLAYERS)
+        (let (p (&players i))
+          (conj &plyr (WbPlayer ((ref s 'in-game) i) (p 'kill-count) (p 'item-count)
+                                (p 'secret-count) (w 'level-time)))))
+      (set! (s 'gamestate) GS-INTERMISSION)
+      (set! (s 'wi) (wi-start (WbStart (- ep 1) ((&players cp) 'did-secret) (- mp 1) next
+                                       (w 'total-kills) (w 'total-items) (w 'total-secret)
+                                       (par-time commercial ep mp) (r 'console-player) plyr)
+                              (ref w 'random) commercial (r 'ultimate))))))
+
+; G_WorldDone, from the intermission's end.
+(defn- world-done (s:&Session):void
+  (set! (s 'gameaction) GA-WORLDDONE)
+  (when (s 'secret-exit)
+    (set! ((player-at (session-world s) (unsafe/cast usize ((ref s 'rules) 'console-player))) 'did-secret) true)))
+
+; G_DoWorldDone: the map the intermission pointed at.
+(defn- do-world-done (s:&Session a:&Assets):(Fallible void)
+  (set! (s 'gamestate) GS-LEVEL)
+  (set! ((ref s 'rules) 'map) (+ ((ref (ref s 'wi) 'wbs) 'next) 1))
+  (try (load-level s a))
+  (set! (s 'gameaction) GA-NOTHING)
+  (return (ok)))
+
+; F_StartFinale. The finale itself isn't ported yet, so the game ends here.
+(defn- start-finale (s:&Session):void
+  (set! (s 'gameaction) GA-NOTHING)
+  (set! (s 'gamestate) GS-FINALE)
+  (set! (s 'finished) true))
 
 ; The -tichash line: as reference/tichash.patch writes it.
 (defn- hash-word (h:ui32 v:i32):ui32
@@ -293,7 +340,8 @@
 (defn- tichash-line (s:&Session):String
   (let (w (session-world s) h:ui32 2166136261 n 0
         cap (w 'thinker-cap) th (unwrap (cap 'next)))
-    (while (not (same? th cap))
+    ; Only a level's things are hashed.
+    (while (and (= (s 'gamestate) GS-LEVEL) (not (same? th cap)))
       (when (not (th 'removed))
         (match (th 'think)
           ((mobj m)
@@ -330,21 +378,27 @@
       (str-into &out (hex (bit-and (bit-shr h (unsafe/cast ui32 (* 4 k))) 15))))
     (return out)))
 
-; G_Ticker for a level: reborn, read the ticcmds, think, and the status
-; bar's M_Random. `cmd` is the console player's, when not playing a demo.
+; G_Ticker: reborns, pending game actions, the ticcmds, then the gamestate's
+; ticker. `cmd` is the console player's, when not playing a demo.
 (defn session-tic (s:&Session a:&Assets cmd:TicCmd):(Fallible void)
   (when (none? (s 'world)) (return (ok)))
+  ; The sound layer has had last tic's.
+  (clear! (ref (session-world s) 'sounds))
+  ; G_DoReborn: in single player, the level starts over.
   (let (w (session-world s))
-    ; G_DoReborn: in single player, the level starts over.
-    (let (reborn false)
-      (dotimes (i:usize MAXPLAYERS)
-        (when (and ((ref s 'in-game) i) (= ((player-at w i) 'state) PST-REBORN)) (set! reborn true)))
-      (when (and reborn (not ((ref s 'rules) 'netgame)))
-        (try (load-level s a))))
-    (when (!= ((session-world s) 'exit) 0)
-      (try (level-completed s a))
-      (when (s 'finished) (return (ok)))))
-  (let (w (session-world s) cp (unsafe/cast usize ((ref s 'rules) 'console-player)))
+    (dotimes (i:usize MAXPLAYERS)
+      (when (and ((ref s 'in-game) i) (= ((player-at w i) 'state) PST-REBORN)
+                 (not ((ref s 'rules) 'netgame)))
+        (set! (s 'gameaction) GA-LOADLEVEL))))
+  (while (!= (s 'gameaction) GA-NOTHING)
+    (case (s 'gameaction)
+      GA-LOADLEVEL (do (try (load-level s a)) (set! (s 'gameaction) GA-NOTHING))
+      GA-COMPLETED (do-completed s)
+      GA-VICTORY (start-finale s)
+      GA-WORLDDONE (try (do-world-done s a))
+      (set! (s 'gameaction) GA-NOTHING)))
+  (let (w (session-world s) cp (unsafe/cast usize ((ref s 'rules) 'console-player))
+        commercial (= ((ref s 'rules) 'mode) COMMERCIAL))
     (set! (w 'game-tic) (s 'gametic))
     (dotimes (i:usize MAXPLAYERS)
       (when ((ref s 'in-game) i)
@@ -354,8 +408,18 @@
             (try (read-demo-ticcmd s (ref p 'cmd))))
           (write-demo-ticcmd s (ref p 'cmd)))))
     (when (s 'demo-ended) (return (ok)))
-    (try (ticker w))
-    (st-ticker (ref s 'st) w (player-at w cp) (m-random (ref w 'random)))
+    (case (s 'gamestate)
+      GS-LEVEL
+      (do (try (ticker w))
+          (st-ticker (ref s 'st) w (player-at w cp) (m-random (ref w 'random)))
+          ; G_ExitLevel and G_SecretExitLevel, which the playsim flags.
+          (when (!= (w 'exit) 0)
+            (set! (s 'secret-exit) (= (w 'exit) 2))
+            (set! (w 'exit) 0)
+            (set! (s 'gameaction) GA-COMPLETED)))
+      GS-INTERMISSION
+      (when (wi-ticker (ref s 'wi) w commercial) (world-done s))
+      0)
     (when-some (out (s 'tichash))
       (let (line (tichash-line s) o out)
         (str-into &o (string-as-view &line))

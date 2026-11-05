@@ -1,0 +1,59 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom f_wipe.c); this port is GPLv3, see COPYING.
+;
+; Phase B's screen melt between gamestates. Unlike Iron Doom's (doom.melt), it
+; draws its delays from M_Random, all 320 of them though only the first 160
+; are used, one per two-pixel column. The game runs no tics while it plays.
+
+(ns doom.wipe)
+
+(import-use nucleus.vector)
+(import-use nucleus.create)
+(import-use nucleus.coll)
+(import-use doom.buffer)
+(import-use doom.rand)
+
+(defconst WIPE-HEIGHT 200)
+(defconst WIPE-COLUMNS 160)
+
+(defstruct Wipe start:Buffer end:Buffer y:(Vector i32))
+
+; wipe_initMelt.
+(defn wipe-new (start:Buffer end:Buffer r:&Random):Wipe
+  (let (y (make (Vector i32)) prev (- 0 (% (m-random r) 16)))
+    (conj &y prev)
+    (dotimes (i:i32 319)
+      (let (v (+ prev (- (% (m-random r) 3) 1)))
+        (cond (> v 0) (set! v 0)
+              (= v -16) (set! v -15))
+        (conj &y v)
+        (set! prev v)))
+    (return (Wipe start end y))))
+
+; wipe_doMelt over `ticks` tics; true when every column is down.
+(defn wipe-tic (w:&Wipe screen:&Buffer ticks:i32):bool
+  (let (done true t ticks)
+    (while (> t 0)
+      (dotimes (i:usize WIPE-COLUMNS)
+        (let (yi ((ref w 'y) i))
+          (cond (< yi 0) (do (set (ref w 'y) i (+ yi 1)) (set! done false))
+                (< yi WIPE-HEIGHT)
+                (let (dy (if (< yi 16) (+ yi 1) 8) x (* 2 i))
+                  (when (>= (+ yi dy) WIPE-HEIGHT) (set! dy (- WIPE-HEIGHT yi)))
+                  (let (ny (+ yi dy))
+                    ; The new screen down to ny, the old one shifted down below.
+                    (dotimes (k:i32 ny)
+                      (let (row (unsafe/cast usize k))
+                        (set screen x row ((ref w 'end) x row))
+                        (set screen (+ x 1) row ((ref w 'end) (+ x 1) row))))
+                    (let (row ny)
+                      (while (< row WIPE-HEIGHT)
+                        (let (r (unsafe/cast usize row) src (unsafe/cast usize (- row ny)))
+                          (set screen x r ((ref w 'start) x src))
+                          (set screen (+ x 1) r ((ref w 'start) (+ x 1) src)))
+                        (set! row (+ row 1))))
+                    (set (ref w 'y) i ny)
+                    (set! done false))))))
+      (set! t (- t 1)))
+    (return done)))

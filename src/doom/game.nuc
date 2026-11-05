@@ -47,6 +47,8 @@
 (import-use doom.session)
 (import-use doom.ticcmd)
 (import-use doom.statusbar)
+(import-use doom.intermission)
+(import-use doom.wipe)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
 
@@ -91,12 +93,19 @@
   st-graphics:?StatusGraphics
   ; The PLAYPAL palette on screen.
   palette:i32
+  ; Phase B's D_Display: the wipe playing, the gamestate last drawn (wipegamestate)
+  ; and the session's level loads seen.
+  wipe:?Wipe
+  wipe-state:i32
+  seen-loads:i32
+  wi-graphics:?WiGraphics
   tic:i32
   quit:bool)
 
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
   (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
-                (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0 0 false)))
+                (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
+                none GS-DEMOSCREEN 0 none 0 false)))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -208,23 +217,65 @@
     (when-some (c (g 'camera))
       (let (ll l cc c)
         (render-view (ref g 'view) &ll &cc (ref (ref g 'assets) 'textures) (ref g 'screen)))))
-  (when-some (s (g 'session))
-    (when-some (w (s 'world))
-      (set-sky g ((ref w 'rules) 'episode))
-      (let (a (ref g 'assets)
-            sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats)
-                        (ref w 'texture-translation) (ref w 'flat-translation) (ref a 'colormaps)
-                      (ref a 'sprites) (ref w 'sector-things) (ref g 'screen))
-            p (player-at w (unsafe/cast usize ((ref w 'rules) 'console-player)))
-            e (player-eye p))
-        (try (render-player-view (ref g 'renderer) &sc &e))
-        (draw-player-sprites (ref g 'renderer) &sc p)
-        (when (none? (g 'st-graphics))
-          (set! (g 'st-graphics) (some (try (status-graphics-load (ref a 'wad) 0)))))
-        (when-some (sg (g 'st-graphics))
-          (let (r (ref w 'rules) sgv sg)
-            (try (st-drawer (ref s 'st) &sgv (ref g 'screen) p (!= (r 'deathmatch) 0) (r 'netgame) 0))))
-        (try (set-palette g (st-palette p))))))
+  (return (ok)))
+
+; The level as the console player sees it, with the weapon and status bar.
+(defn- draw-session-level (g:&Game s:&Session):(Fallible void)
+  (let (w (session-world s))
+    (set-sky g ((ref w 'rules) 'episode))
+    (let (a (ref g 'assets)
+          sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats)
+                    (ref w 'texture-translation) (ref w 'flat-translation) (ref a 'colormaps)
+                    (ref a 'sprites) (ref w 'sector-things) (ref g 'screen))
+          p (player-at w (unsafe/cast usize ((ref w 'rules) 'console-player)))
+          e (player-eye p))
+      (try (render-player-view (ref g 'renderer) &sc &e))
+      (draw-player-sprites (ref g 'renderer) &sc p)
+      (when (none? (g 'st-graphics))
+        (set! (g 'st-graphics) (some (try (status-graphics-load (ref a 'wad) 0)))))
+      (when-some (sg (g 'st-graphics))
+        (let (r (ref w 'rules) sgv sg)
+          (try (st-drawer (ref s 'st) &sgv (ref g 'screen) p (!= (r 'deathmatch) 0) (r 'netgame) 0))))
+      (try (set-palette g (st-palette p)))))
+  (return (ok)))
+
+; D_Display's gamestate switch.
+(defn- draw-session (g:&Game s:&Session):(Fallible void)
+  (let (r (ref (session-world s) 'rules) commercial (= (r 'mode) COMMERCIAL))
+    (case (s 'gamestate)
+      GS-LEVEL (try (draw-session-level g s))
+      GS-INTERMISSION
+      (let (wi (ref s 'wi) epsd ((ref wi 'wbs) 'epsd))
+        ; ST_Stop's palette.
+        (try (set-palette g 0))
+        (when (match (g 'wi-graphics) ((some wg) (!= (wg 'epsd) epsd)) ((none) true))
+          (set! (g 'wi-graphics) (some (try (wi-graphics-load (ref (ref g 'assets) 'wad) epsd (r 'ultimate))))))
+        (when-some (wg (g 'wi-graphics))
+          (let (wgv wg) (try (wi-drawer wi &wgv (ref g 'screen) commercial)))))
+      0))
+  (return (ok)))
+
+; One phase-B frame: the wipe if one is playing (no tics run meanwhile), else a
+; tic and D_Display, which starts a wipe when the gamestate changed.
+(defn- session-frame (g:&Game s:&Session):(Fallible void)
+  (when-some (wp (g 'wipe))
+    ; The copy shares the column array, so the melt's progress stays.
+    (let (ww wp)
+      (when (wipe-tic &ww (ref g 'screen) 1) (set! (g 'wipe) none)))
+    (return (ok)))
+  (try (level-tic g))
+  (when (g 'quit) (return (ok)))
+  ; G_DoLoadLevel forces a wipe even from a level.
+  (when (!= (s 'loads) (g 'seen-loads))
+    (set! (g 'seen-loads) (s 'loads))
+    (when (= (g 'wipe-state) GS-LEVEL) (set! (g 'wipe-state) -1)))
+  (let (gs (s 'gamestate) start:?Buffer (if (!= gs (g 'wipe-state)) (some (copy-of (ref g 'screen))) none))
+    (try (draw-session g s))
+    (when-some (st start)
+      (let (end (copy-of (ref g 'screen)))
+        (copy-from (ref g 'screen) &st)
+        (set! (g 'wipe) (some (wipe-new st end (ref (session-world s) 'random))))))
+    (set! (g 'wipe-state) gs))
   (return (ok)))
 
 (defn game-tic (g:&Game):(Fallible void)
@@ -246,7 +297,9 @@
          (let (now (+ elapsed TIC-NS))
            (set! (g 'mode) (Mode-intro now))
            (when (and (< elapsed TITLE-NS) (>= now TITLE-NS)) (set! title-done true))))
-        ((level) (try (level-tic g)))
+        ((level) (match (g 'session)
+                   ((some ss) (try (session-frame g ss)))
+                   ((none) (try (level-tic g)))))
         ((melt)
          (when-some (m (g 'melt))
            ; A copy, but its columns and screens are the same heap buffers.
@@ -270,7 +323,8 @@
         (set! (g 'pending) (some (Mode-level))))
       ; A scene change other than into or out of the melt starts one: the old
       ; screen is kept, the new scene drawn, and the melt shows the old screen first.
-      (let (melting (and entered (!= from to) (!= from 0) (!= from 3) (!= to 3))
+      ; Phase B wipes in session-frame instead.
+      (let (melting (and entered (!= from to) (!= from 0) (!= from 3) (!= to 3) (none? (g 'session)))
             start:?Buffer (if melting (some (copy-of (ref g 'screen))) none))
         ; PostUpdate.
         (match (g 'mode) ((level) (try (draw-level g))) ((setup) 0) ((intro e) 0) ((melt) 0))

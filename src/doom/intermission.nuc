@@ -1,0 +1,454 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom wi_stuff.c); this port is GPLv3, see COPYING.
+;
+; The intermission: the level's stats counted up, then the episode map with
+; the next level marked. Its ticker is part of the game (WI_checkForAccelerate
+; writes the players' attackdown and usedown, which the next level reads),
+; so it runs inside the session's tic; its graphics belong to the drawer.
+; Single-player stats only: the deathmatch and netgame tables are out of
+; scope with networking.
+
+(ns doom.intermission)
+
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.bytes)
+(import-use doom.wad)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.rand)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.world)
+
+(defconst TICRATE 35)
+(defconst SCREENWIDTH 320)
+(defconst SCREENHEIGHT 200)
+(defconst SHOWNEXTLOCDELAY 4)
+
+; What G_DoCompleted hands the intermission (wbstartstruct_t), 0-based maps.
+(defstruct WbPlayer in:bool skills:i32 sitems:i32 ssecret:i32 stime:i32)
+(defstruct WbStart epsd:i32 did-secret:bool last:i32 next:i32
+  max-kills:i32 max-items:i32 max-secret:i32 par-time:i32 pnum:i32
+  plyr:(Vector WbPlayer))
+
+(defenum WiState WI-NOSTATE WI-STATCOUNT WI-SHOWNEXTLOC)
+(defenum AnimType ANIM-ALWAYS ANIM-RANDOM ANIM-LEVEL)
+
+; An animation on the episode map: its period, frames, place, and for a
+; level one the map it waits for.
+(defstruct WiAnim type:i32 period:i32 nanims:i32 x:i32 y:i32 data1:i32 data2:i32
+  nexttic:i32 ctr:i32)
+
+(defstruct Intermission
+  wbs:WbStart
+  state:i32 accelerate:bool
+  cnt:i32 bcnt:i32 sp-state:i32
+  cnt-kills:i32 cnt-items:i32 cnt-secret:i32 cnt-time:i32 cnt-par:i32 cnt-pause:i32
+  pointer-on:bool
+  ; The map was entered with G_WorldDone already called.
+  anims:(Vector WiAnim))
+
+(defn- anim (type:i32 period:i32 nanims:i32 x:i32 y:i32 data1:i32):WiAnim
+  (return (WiAnim type period nanims x y data1 0 0 -1)))
+
+; epsd0animinfo, epsd1animinfo and epsd2animinfo.
+(defn- episode-anims (epsd:i32):(Vector WiAnim)
+  (let (v (make (Vector WiAnim)) t3 (/ TICRATE 3))
+    (case epsd
+      0 (do (conj &v (anim ANIM-ALWAYS t3 3 224 104 0)) (conj &v (anim ANIM-ALWAYS t3 3 184 160 0))
+            (conj &v (anim ANIM-ALWAYS t3 3 112 136 0)) (conj &v (anim ANIM-ALWAYS t3 3 72 112 0))
+            (conj &v (anim ANIM-ALWAYS t3 3 88 96 0)) (conj &v (anim ANIM-ALWAYS t3 3 64 48 0))
+            (conj &v (anim ANIM-ALWAYS t3 3 192 40 0)) (conj &v (anim ANIM-ALWAYS t3 3 136 16 0))
+            (conj &v (anim ANIM-ALWAYS t3 3 80 16 0)) (conj &v (anim ANIM-ALWAYS t3 3 64 24 0)))
+      1 (do (dotimes (i:i32 7) (conj &v (anim ANIM-LEVEL t3 1 128 136 (+ i 1))))
+            (conj &v (anim ANIM-LEVEL t3 3 192 144 8))
+            (conj &v (anim ANIM-LEVEL t3 1 128 136 8)))
+      2 (do (conj &v (anim ANIM-ALWAYS t3 3 104 168 0)) (conj &v (anim ANIM-ALWAYS t3 3 40 136 0))
+            (conj &v (anim ANIM-ALWAYS t3 3 160 96 0)) (conj &v (anim ANIM-ALWAYS t3 3 104 80 0))
+            (conj &v (anim ANIM-ALWAYS t3 3 120 32 0))
+            (conj &v (anim ANIM-ALWAYS (/ TICRATE 4) 3 40 0 0)))
+      0)
+    (return v)))
+
+; The level spots on each episode's map (lnodes).
+(defvar LNODES:(array i32 54) (array i32
+  185 164 148 143 69 122 209 102 116 89 166 55 71 56 135 29 71 24
+  254 25 97 50 188 64 128 78 214 92 133 130 208 136 148 140 235 158
+  156 168 48 154 174 95 265 75 130 48 279 23 198 48 140 25 281 136))
+
+(defn- lnode-x (epsd:i32 n:i32):i32 (return (aref LNODES (as i64 (* 2 (+ (* epsd 9) n))))))
+(defn- lnode-y (epsd:i32 n:i32):i32 (return (aref LNODES (as i64 (+ 1 (* 2 (+ (* epsd 9) n)))))))
+
+; G_DoCompleted's par times (pars), by episode and map.
+(defvar PARS:(array i32 40) (array i32
+  0 0 0 0 0 0 0 0 0 0
+  0 30 75 120 90 165 180 180 30 165
+  0 90 90 90 120 90 360 240 30 170
+  0 90 45 90 150 90 90 165 30 135))
+(defvar CPARS:(array i32 32) (array i32
+  30 90 120 120 90 150 120 120 270 90 210 150 150 150 210 150 420 150 210 150
+  240 150 180 150 150 300 330 420 300 180 120 30))
+
+(defn par-time (commercial:bool episode:i32 m:i32):i32
+  (return (* TICRATE (cond commercial (aref CPARS (as i64 (max 0 (min 31 (- m 1)))))
+                           ; Episode 4 overflows into cpars, as vanilla.
+                           (< episode 4) (aref PARS (as i64 (+ (* episode 10) m)))
+                           true (aref CPARS (as i64 m))))))
+
+(defn- has-anims? (wi:&Intermission commercial:bool):bool
+  (return (and (not commercial) (<= ((ref wi 'wbs) 'epsd) 2))))
+
+; WI_initAnimatedBack.
+(defn- init-animated-back (wi:&Intermission r:&Random commercial:bool):void
+  (when (has-anims? wi commercial)
+    (let (avs (view (ref wi 'anims)))
+      (dotimes (i:usize (count &avs))
+        (let (a (&avs i))
+          (set! (a 'ctr) -1)
+          (set! (a 'nexttic)
+                (case (a 'type)
+                  ANIM-ALWAYS (+ (wi 'bcnt) 1 (% (m-random r) (a 'period)))
+                  ANIM-RANDOM (+ (wi 'bcnt) 1 (a 'data2) (% (m-random r) (a 'data1)))
+                  (+ (wi 'bcnt) 1))))))))
+
+; WI_updateAnimatedBack.
+(defn- update-animated-back (wi:&Intermission r:&Random commercial:bool):void
+  (when (has-anims? wi commercial)
+    (let (avs (view (ref wi 'anims)))
+      (dotimes (i:usize (count &avs))
+        (let (a (&avs i))
+          (when (= (wi 'bcnt) (a 'nexttic))
+            (case (a 'type)
+              ANIM-ALWAYS (do (set! (a 'ctr) (+ (a 'ctr) 1))
+                              (when (>= (a 'ctr) (a 'nanims)) (set! (a 'ctr) 0))
+                              (set! (a 'nexttic) (+ (wi 'bcnt) (a 'period))))
+              ANIM-RANDOM (do (set! (a 'ctr) (+ (a 'ctr) 1))
+                              (if (= (a 'ctr) (a 'nanims))
+                                (do (set! (a 'ctr) -1)
+                                    (set! (a 'nexttic) (+ (wi 'bcnt) (a 'data2) (% (m-random r) (a 'data1)))))
+                                (set! (a 'nexttic) (+ (wi 'bcnt) (a 'period)))))
+              ; Episode 2's: the 8th waits while the stats count.
+              (when (and (not (and (= (wi 'state) WI-STATCOUNT) (= i 7)))
+                         (= ((ref wi 'wbs) 'next) (a 'data1)))
+                (set! (a 'ctr) (+ (a 'ctr) 1))
+                (when (= (a 'ctr) (a 'nanims)) (set! (a 'ctr) (- (a 'ctr) 1)))
+                (set! (a 'nexttic) (+ (wi 'bcnt) (a 'period)))))))))))
+
+(defn- init-no-state (wi:&Intermission):void
+  (set! (wi 'state) WI-NOSTATE)
+  (set! (wi 'accelerate) false)
+  (set! (wi 'cnt) 10))
+
+(defn- init-show-next-loc (wi:&Intermission r:&Random commercial:bool):void
+  (set! (wi 'state) WI-SHOWNEXTLOC)
+  (set! (wi 'accelerate) false)
+  (set! (wi 'cnt) (* SHOWNEXTLOCDELAY TICRATE))
+  (init-animated-back wi r commercial))
+
+(defn- init-stats (wi:&Intermission r:&Random commercial:bool):void
+  (set! (wi 'state) WI-STATCOUNT)
+  (set! (wi 'accelerate) false)
+  (set! (wi 'sp-state) 1)
+  (set! (wi 'cnt-kills) -1)
+  (set! (wi 'cnt-items) -1)
+  (set! (wi 'cnt-secret) -1)
+  (set! (wi 'cnt-time) -1)
+  (set! (wi 'cnt-par) -1)
+  (set! (wi 'cnt-pause) TICRATE)
+  (init-animated-back wi r commercial))
+
+; WI_Start (WI_initVariables, then single-player stats).
+(defn wi-start (wbs:WbStart r:&Random commercial:bool ultimate:bool):Intermission
+  (let (b wbs)
+    (when (= (b 'max-kills) 0) (set! (b 'max-kills) 1))
+    (when (= (b 'max-items) 0) (set! (b 'max-items) 1))
+    (when (= (b 'max-secret) 0) (set! (b 'max-secret) 1))
+    (when (and (not ultimate) (> (b 'epsd) 2)) (set! (b 'epsd) (- (b 'epsd) 3)))
+    (let (wi (Intermission b WI-STATCOUNT false 0 0 0 0 0 0 0 0 0 false (episode-anims (b 'epsd))))
+      (init-stats &wi r commercial)
+      (return wi))))
+
+; Before any intermission.
+(defn intermission-empty ():Intermission
+  (return (Intermission (WbStart 0 false 0 0 1 1 1 0 0 (make (Vector WbPlayer)))
+                        WI-NOSTATE false 0 0 0 0 0 0 0 0 0 false (make (Vector WiAnim)))))
+
+(defn- me (wi:&Intermission):WbPlayer
+  (let (ps (view (ref (ref wi 'wbs) 'plyr)))
+    (return @(&ps (unsafe/cast usize ((ref wi 'wbs) 'pnum))))))
+
+; WI_updateStats. The sounds go to the world's queue, as the playsim's do.
+(defn- update-stats (wi:&Intermission w:&World commercial:bool):void
+  (let (r (ref w 'random) b (ref wi 'wbs) p (me wi)
+        kills (/ (* (p 'skills) 100) (b 'max-kills))
+        items (/ (* (p 'sitems) 100) (b 'max-items))
+        secret (/ (* (p 'ssecret) 100) (b 'max-secret))
+        time (/ (p 'stime) TICRATE)
+        par (/ (b 'par-time) TICRATE)
+        tick-sound (= (bit-and (wi 'bcnt) 3) 0))
+    (update-animated-back wi r commercial)
+    (when (and (wi 'accelerate) (!= (wi 'sp-state) 10))
+      (set! (wi 'accelerate) false)
+      (set! (wi 'cnt-kills) kills)
+      (set! (wi 'cnt-items) items)
+      (set! (wi 'cnt-secret) secret)
+      (set! (wi 'cnt-time) time)
+      (set! (wi 'cnt-par) par)
+      (start-sound w none SFX-BAREXP)
+      (set! (wi 'sp-state) 10))
+    (case (wi 'sp-state)
+      2 (do (set! (wi 'cnt-kills) (+ (wi 'cnt-kills) 2))
+            (when tick-sound (start-sound w none SFX-PISTOL))
+            (when (>= (wi 'cnt-kills) kills)
+              (set! (wi 'cnt-kills) kills)
+              (start-sound w none SFX-BAREXP)
+              (set! (wi 'sp-state) (+ (wi 'sp-state) 1))))
+      4 (do (set! (wi 'cnt-items) (+ (wi 'cnt-items) 2))
+            (when tick-sound (start-sound w none SFX-PISTOL))
+            (when (>= (wi 'cnt-items) items)
+              (set! (wi 'cnt-items) items)
+              (start-sound w none SFX-BAREXP)
+              (set! (wi 'sp-state) (+ (wi 'sp-state) 1))))
+      6 (do (set! (wi 'cnt-secret) (+ (wi 'cnt-secret) 2))
+            (when tick-sound (start-sound w none SFX-PISTOL))
+            (when (>= (wi 'cnt-secret) secret)
+              (set! (wi 'cnt-secret) secret)
+              (start-sound w none SFX-BAREXP)
+              (set! (wi 'sp-state) (+ (wi 'sp-state) 1))))
+      8 (do (when tick-sound (start-sound w none SFX-PISTOL))
+            (set! (wi 'cnt-time) (+ (wi 'cnt-time) 3))
+            (when (>= (wi 'cnt-time) time) (set! (wi 'cnt-time) time))
+            (set! (wi 'cnt-par) (+ (wi 'cnt-par) 3))
+            (when (>= (wi 'cnt-par) par)
+              (set! (wi 'cnt-par) par)
+              (when (>= (wi 'cnt-time) time)
+                (start-sound w none SFX-BAREXP)
+                (set! (wi 'sp-state) (+ (wi 'sp-state) 1)))))
+      10 (when (wi 'accelerate)
+           (start-sound w none SFX-SGCOCK)
+           (if commercial (init-no-state wi) (init-show-next-loc wi r commercial)))
+      (when (!= (bit-and (wi 'sp-state) 1) 0)
+        (set! (wi 'cnt-pause) (- (wi 'cnt-pause) 1))
+        (when (= (wi 'cnt-pause) 0)
+          (set! (wi 'sp-state) (+ (wi 'sp-state) 1))
+          (set! (wi 'cnt-pause) TICRATE))))))
+
+; WI_checkForAccelerate: fire or use, newly pressed, skips ahead.
+(defn- check-for-accelerate (wi:&Intermission w:&World):void
+  (let (ps (view (ref w 'players)))
+    (dotimes (i:usize MAXPLAYERS)
+      (when ((ref w 'player-in-game) i)
+        (let (p (&ps i) buttons ((p 'cmd) 'buttons))
+          (if (!= (bit-and buttons BT-ATTACK) 0)
+            (do (when (not (p 'attack-down)) (set! (wi 'accelerate) true))
+                (set! (p 'attack-down) true))
+            (set! (p 'attack-down) false))
+          (if (!= (bit-and buttons BT-USE) 0)
+            (do (when (not (p 'use-down)) (set! (wi 'accelerate) true))
+                (set! (p 'use-down) true))
+            (set! (p 'use-down) false)))))))
+
+; WI_Ticker: true once the intermission is over (its G_WorldDone).
+(defn wi-ticker (wi:&Intermission w:&World commercial:bool):bool
+  (set! (wi 'bcnt) (+ (wi 'bcnt) 1))
+  (check-for-accelerate wi w)
+  (let (r (ref w 'random) done false)
+    (case (wi 'state)
+      WI-STATCOUNT (update-stats wi w commercial)
+      WI-SHOWNEXTLOC (do (update-animated-back wi r commercial)
+                         (set! (wi 'cnt) (- (wi 'cnt) 1))
+                         (if (or (= (wi 'cnt) 0) (wi 'accelerate))
+                           (init-no-state wi)
+                           (set! (wi 'pointer-on) (< (bit-and (wi 'cnt) 31) 20))))
+      (do (update-animated-back wi r commercial)
+          (set! (wi 'cnt) (- (wi 'cnt) 1))
+          (when (= (wi 'cnt) 0) (set! done true))))
+    (return done)))
+
+; --- drawing ----------------------------------------------------------------
+
+(defstruct WiGraphics
+  epsd:i32 background:Patch lnames:(Vector Patch) yah:(Vector Patch) splat:Patch
+  ; Each animation's frames, in the order of the episode's table.
+  anims:(Vector (Vector Patch))
+  num:(Vector Patch) minus:?Patch percent:Patch finished:Patch entering:Patch
+  kills:Patch sp-secret:Patch items:Patch colon:Patch time:Patch sucks:Patch par:Patch)
+
+(defn- lump-patch (w:&Wad n:StrView):(Fallible Patch)
+  (return (patch-parse (ref (try (lump-named w (name n))) 'data))))
+
+(defn- named (w:&Wad s:String):(Fallible Patch)
+  (return (lump-patch w (string-as-view &s))))
+
+; "WIA" then the episode, then the animation and frame as two digits each.
+(defn- wia-name (epsd:i32 j:i32 i:i32):String
+  (let (s (str "WIA" epsd))
+    (when (< j 10) (str-into &s "0"))
+    (str-into &s j)
+    (when (< i 10) (str-into &s "0"))
+    (str-into &s i)
+    (return s)))
+
+; WI_loadData for Doom 1's episodes (Doom 2's CWILV names aren't loaded yet).
+(defn wi-graphics-load (w:&Wad epsd:i32 ultimate:bool):(Fallible WiGraphics)
+  (let (lnames (make (Vector Patch)) yah (make (Vector Patch)) anims (make (Vector (Vector Patch)))
+        nums (make (Vector Patch)) table (episode-anims epsd) tv (view &table))
+    (dotimes (i:i32 9) (conj &lnames (try (named w (str "WILV" epsd i)))))
+    (conj &yah (try (named w (str "WIURH0"))))
+    (conj &yah (try (named w (str "WIURH1"))))
+    (dotimes (j:usize (count &tv))
+      (let (frames (make (Vector Patch)))
+        (dotimes (i:i32 ((&tv j) 'nanims))
+          ; Episode 2's last animation borrows the fifth's frames.
+          (let (jj (if (and (= epsd 1) (= j 8)) 4 (unsafe/cast i32 j)))
+            (conj &frames (try (named w (wia-name epsd jj i))))))
+        (conj &anims frames)))
+    (dotimes (i:i32 10) (conj &nums (try (named w (str "WINUM" i)))))
+    (let (minus:?Patch (if (some? (lump-index w "WIMINUS")) (some (try (named w (str "WIMINUS")))) none)
+          bg (if (and ultimate (= epsd 3)) (str "INTERPIC") (str "WIMAP" epsd)))
+      (return (ok (WiGraphics epsd (try (named w bg)) lnames yah (try (named w (str "WISPLAT")))
+                              anims nums minus
+                              (try (named w (str "WIPCNT"))) (try (named w (str "WIF")))
+                              (try (named w (str "WIENTER"))) (try (named w (str "WIOSTK")))
+                              (try (named w (str "WISCRT2"))) (try (named w (str "WIOSTI")))
+                              (try (named w (str "WICOLON"))) (try (named w (str "WITIME")))
+                              (try (named w (str "WISUCKS"))) (try (named w (str "WIPAR")))))))))
+
+(defn- pat (v:&(Vector Patch) i:i32):&Patch
+  (let (s (view v)) (return (&s (unsafe/cast usize i)))))
+
+(defn- draw (buf:&Buffer x:i32 y:i32 p:&Patch):(Fallible void)
+  (return (draw-patch buf (unsafe/cast usize x) (unsafe/cast usize y) p)))
+
+(defn- pw (p:&Patch):i32 (return (unsafe/cast i32 (p 'width))))
+(defn- ph (p:&Patch):i32 (return (unsafe/cast i32 (p 'height))))
+
+; WI_drawNum: right-aligned at x; `digits` -1 for as many as it takes.
+(defn- draw-num (g:&WiGraphics buf:&Buffer x:i32 y:i32 n:i32 digits:i32):(Fallible i32)
+  (let (fw (pw (pat (ref g 'num) 0)) d digits v n cx x neg (< n 0))
+    (when (< d 0)
+      (if (= v 0)
+        (set! d 1)
+        (do (set! d 0)
+            (let (t v) (while (!= t 0) (set! t (/ t 10)) (set! d (+ d 1)))))))
+    (when neg (set! v (- 0 v)))
+    (when (= v 1994) (return (ok 0)))
+    (while (> d 0)
+      (set! cx (- cx fw))
+      (try (draw buf cx y (pat (ref g 'num) (% v 10))))
+      (set! v (/ v 10))
+      (set! d (- d 1)))
+    (when neg
+      (when-some (m (g 'minus))
+        (set! cx (- cx 8))
+        (let (mm m) (try (draw buf cx y &mm)))))
+    (return (ok cx))))
+
+(defn- draw-percent (g:&WiGraphics buf:&Buffer x:i32 y:i32 p:i32):(Fallible void)
+  (when (< p 0) (return (ok)))
+  (try (draw buf x y (ref g 'percent)))
+  (try (draw-num g buf x y p -1))
+  (return (ok)))
+
+; WI_drawTime: m:ss, or "sucks" past 61:59.
+(defn- draw-time (g:&WiGraphics buf:&Buffer x:i32 y:i32 t:i32):(Fallible void)
+  (when (< t 0) (return (ok)))
+  (if (<= t (* 61 59))
+    (let (div 1 cx x go true)
+      (while go
+        (let (n (% (/ t div) 60))
+          (set! cx (- (try (draw-num g buf cx y n 2)) (pw (ref g 'colon))))
+          (set! div (* div 60))
+          (when (or (= div 60) (!= (/ t div) 0)) (try (draw buf cx y (ref g 'colon))))
+          (set! go (!= (/ t div) 0)))))
+    (try (draw buf (- x (pw (ref g 'sucks))) y (ref g 'sucks))))
+  (return (ok)))
+
+(defn- draw-animated-back (wi:&Intermission g:&WiGraphics buf:&Buffer commercial:bool):(Fallible void)
+  (when (has-anims? wi commercial)
+    (let (avs (view (ref wi 'anims)) frames (view (ref g 'anims)))
+      (dotimes (i:usize (count &avs))
+        (let (a (&avs i))
+          (when (>= (a 'ctr) 0)
+            (let (fs (&frames i))
+              (try (draw buf (a 'x) (a 'y) (pat fs (a 'ctr))))))))))
+  (return (ok)))
+
+; WI_drawLF: the level just finished.
+(defn- draw-lf (wi:&Intermission g:&WiGraphics buf:&Buffer):(Fallible void)
+  (let (l (pat (ref g 'lnames) ((ref wi 'wbs) 'last)) f (ref g 'finished))
+    (try (draw buf (/ (- SCREENWIDTH (pw l)) 2) 2 l))
+    (try (draw buf (/ (- SCREENWIDTH (pw f)) 2) (+ 2 (/ (* 5 (ph l)) 4)) f)))
+  (return (ok)))
+
+; WI_drawEL: the level next.
+(defn- draw-el (wi:&Intermission g:&WiGraphics buf:&Buffer):(Fallible void)
+  (let (l (pat (ref g 'lnames) ((ref wi 'wbs) 'next)) e (ref g 'entering))
+    (try (draw buf (/ (- SCREENWIDTH (pw e)) 2) 2 e))
+    (try (draw buf (/ (- SCREENWIDTH (pw l)) 2) (+ 2 (/ (* 5 (ph l)) 4)) l)))
+  (return (ok)))
+
+; WI_drawOnLnode: the first of the patches that fits on screen there.
+(defn- draw-on-lnode (wi:&Intermission buf:&Buffer n:i32 cs:&(Vector Patch)):(Fallible void)
+  (let (epsd ((ref wi 'wbs) 'epsd) x (lnode-x epsd n) y (lnode-y epsd n) i 0 k (unsafe/cast i32 (count cs)))
+    (while (< i (min k 2))
+      (let (c (pat cs i)
+            left (- x (as i32 (c 'left-offset))) top (- y (as i32 (c 'top-offset))))
+        (when (and (>= left 0) (< (+ left (pw c)) SCREENWIDTH) (>= top 0) (< (+ top (ph c)) SCREENHEIGHT))
+          (try (draw buf x y c))
+          (return (ok))))
+      (set! i (+ i 1))))
+  (return (ok)))
+
+(defn- draw-show-next-loc (wi:&Intermission g:&WiGraphics buf:&Buffer commercial:bool):(Fallible void)
+  (let (b (ref wi 'wbs))
+    (try (draw buf 0 0 (ref g 'background)))
+    (try (draw-animated-back wi g buf commercial))
+    (when (not commercial)
+      (when (> (b 'epsd) 2)
+        (try (draw-el wi g buf))
+        (return (ok)))
+      (let (splat (make (Vector Patch)) last (if (= (b 'last) 8) (- (b 'next) 1) (b 'last)))
+        (conj &splat (g 'splat))
+        (dotimes (i:i32 (+ last 1)) (try (draw-on-lnode wi buf i &splat)))
+        (when (b 'did-secret) (try (draw-on-lnode wi buf 8 &splat))))
+      (when (wi 'pointer-on) (try (draw-on-lnode wi buf (b 'next) (ref g 'yah)))))
+    (try (draw-el wi g buf)))
+  (return (ok)))
+
+(defn- draw-stats (wi:&Intermission g:&WiGraphics buf:&Buffer commercial:bool):(Fallible void)
+  (let (lh (/ (* 3 (ph (pat (ref g 'num) 0))) 2))
+    (try (draw buf 0 0 (ref g 'background)))
+    (try (draw-animated-back wi g buf commercial))
+    (try (draw-lf wi g buf))
+    (try (draw buf 50 50 (ref g 'kills)))
+    (try (draw-percent g buf (- SCREENWIDTH 50) 50 (wi 'cnt-kills)))
+    (try (draw buf 50 (+ 50 lh) (ref g 'items)))
+    (try (draw-percent g buf (- SCREENWIDTH 50) (+ 50 lh) (wi 'cnt-items)))
+    (try (draw buf 50 (+ 50 (* 2 lh)) (ref g 'sp-secret)))
+    (try (draw-percent g buf (- SCREENWIDTH 50) (+ 50 (* 2 lh)) (wi 'cnt-secret)))
+    (try (draw buf 16 (- SCREENHEIGHT 32) (ref g 'time)))
+    (try (draw-time g buf (- (/ SCREENWIDTH 2) 16) (- SCREENHEIGHT 32) (wi 'cnt-time)))
+    (when (< ((ref wi 'wbs) 'epsd) 3)
+      (try (draw buf (+ (/ SCREENWIDTH 2) 16) (- SCREENHEIGHT 32) (ref g 'par)))
+      (try (draw-time g buf (- SCREENWIDTH 16) (- SCREENHEIGHT 32) (wi 'cnt-par)))))
+  (return (ok)))
+
+; WI_Drawer.
+(defn wi-drawer (wi:&Intermission g:&WiGraphics buf:&Buffer commercial:bool):(Fallible void)
+  (case (wi 'state)
+    WI-STATCOUNT (try (draw-stats wi g buf commercial))
+    WI-SHOWNEXTLOC (try (draw-show-next-loc wi g buf commercial))
+    (do (set! (wi 'pointer-on) true)
+        (try (draw-show-next-loc wi g buf commercial))))
+  (return (ok)))
