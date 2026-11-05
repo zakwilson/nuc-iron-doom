@@ -17,6 +17,7 @@
 (import-use nucleus.fmt)
 (import-use nucleus.io)
 (import-use nucleus.parse)
+(import-use nucleus.math)
 (import-use nucleus.create)
 (import-use doom.error)
 (import-use doom.util)
@@ -57,6 +58,7 @@
 (import-use doom.cheats)
 (import-use doom.automap)
 (import-use doom.mixer)
+(import-use doom.config)
 (import-use doom.sounds)
 (import-use doom.wad)
 ; Its Level and level-load would clash with phase A's doom.level.
@@ -124,6 +126,9 @@
   ; M_Random for a wipe with no game to draw it from.
   page-random:Random
   mixer:Mixer
+  ; The settings file (M_LoadDefaults' and M_SaveDefaults'), and its keys as
+  ; scancodes.
+  config:Config config-path:String bindings:Bindings
   ; The session's music requests played so far.
   music-serial:i32
   ; The session's level loads when the sound layer last looked (S_Start).
@@ -131,12 +136,43 @@
   tic:i32
   quit:bool)
 
+(defn- bindings-of (k:&Keys):Bindings
+  (return (Bindings (scancodes (ref k 'forward)) (scancodes (ref k 'backward))
+                    (scancodes (ref k 'turn-left)) (scancodes (ref k 'turn-right))
+                    (scancodes (ref k 'strafe-left)) (scancodes (ref k 'strafe-right))
+                    (scancodes (ref k 'strafe)) (scancodes (ref k 'speed))
+                    (scancodes (ref k 'fire)) (scancodes (ref k 'use)))))
+
 (defn game-new (cl:CommandLine assets:Assets video:Video):Game
   (let (mode (game-mode &assets)
-        menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL)))
+        menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL))
+        path (config-path (cl 'config))
+        cfg (config-load (string-as-view &path))
+        renderer (renderer-new (max 3 (min 11 (cfg 'screenblocks)))))
+    (set! (menu 'sfx-volume) (max 0 (min 15 (cfg 'sfx-volume))))
+    (set! (menu 'music-volume) (max 0 (min 15 (cfg 'music-volume))))
+    (set! (menu 'show-messages) (cfg 'show-messages))
+    (set! (menu 'screenblocks) (max 3 (min 11 (cfg 'screenblocks))))
+    (set! (menu 'screen-size) (- (menu 'screenblocks) 3))
+    (set! (menu 'detail) (cfg 'detail))
+    (set! (menu 'mouse-sensitivity) (cfg 'mouse-sensitivity))
     (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
-                  (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) false 0 -1 none 0 false (random-new) (mixer-new) 0 0 0 false))))
+                  (Mode-setup) none none none none (view-new) none renderer 0 0 0 none 0
+                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) false 0 -1 none 0 false (random-new) (mixer-new)
+                  cfg path (bindings-of (ref cfg 'keys)) 0 0 0 false))))
+
+; M_SaveDefaults: the menu's settings back into the file, its keys as read.
+(defn- save-config (g:&Game):void
+  (let (cfg (ref g 'config) m (ref g 'menu))
+    (set! (cfg 'sfx-volume) (m 'sfx-volume))
+    (set! (cfg 'music-volume) (m 'music-volume))
+    (set! (cfg 'show-messages) (m 'show-messages))
+    (set! (cfg 'screenblocks) (m 'screenblocks))
+    (set! (cfg 'detail) (m 'detail))
+    (set! (cfg 'mouse-sensitivity) (m 'mouse-sensitivity))
+    (match (config-save cfg (string-as-view (ref g 'config-path)))
+      ((ok) 0)
+      ((err e) (println "Couldn't save the settings: " (failure-text &e))))))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -352,12 +388,15 @@
       (set! (g 'camera) (some (camera-new (player &ll))))))
   (when-some (s (g 'session))
     (set! (s 'menu-active) ((ref g 'menu) 'active))
+    ; showMessages, which HU_Ticker reads.
+    (set! ((ref s 'hud) 'show-messages) ((ref g 'menu) 'show-messages))
     ; snd_SfxVolume, which decides what S_StartSound draws.
     (let (v (* 8 ((ref g 'menu) 'sfx-volume)))
       (set! ((ref s 'rules) 'sfx-volume) v)
       (when-some (w (s 'world)) (set! ((ref w 'rules) 'sfx-volume) v)))
     (let (cmd (if ((ref g 'menu) 'active) (ticcmd-zero)
-                (build-ticcmd (ref g 'cmd-turn-held) (not (automap-panning? (ref g 'automap))))))
+                (build-ticcmd (ref g 'cmd-turn-held) (not (automap-panning? (ref g 'automap)))
+                              (ref g 'bindings))))
       (when (g 'send-pause)
         (set! (g 'send-pause) false)
         (set! (cmd 'buttons) (bit-or BT-SPECIAL BTS-PAUSE)))
@@ -643,4 +682,5 @@
           (str-into &path name)
           (str-into &path (strview-from-cstr ".lmp"))
           (try (session-end-recording s (string-as-view &path)))))))
+  (when (not ((ref g 'cl) 'iron-render)) (save-config g))
   (return (ok)))

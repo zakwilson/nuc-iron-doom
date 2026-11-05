@@ -1,0 +1,147 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom m_config.c); this port is GPLv3, see COPYING.
+;
+; The settings file: m_config.c's default.cfg as EDN, read into a struct by
+; nucleus.edn's derived codec. Keys are bound by SDL's key names, two to an
+; action. A key missing from the file keeps its default, so an older file
+; still reads; a file that doesn't parse is reported and left alone.
+
+(ns doom.config)
+
+(import-use "SDL2/SDL.h")
+(import-use "stdio.h")
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use nucleus.create)
+(import-use nucleus.string)
+(import-use nucleus.strview)
+(import-use nucleus.fmt)
+(import-use nucleus.file)
+(import-use nucleus.read)
+(import-use nucleus.edn)
+(import-use doom.error)
+(import-use doom.util)
+
+(defstruct Keys
+  (forward (Vector String)) (backward (Vector String))
+  (turn-left (Vector String)) (turn-right (Vector String))
+  (strafe-left (Vector String)) (strafe-right (Vector String))
+  (strafe (Vector String)) (speed (Vector String))
+  (fire (Vector String)) (use (Vector String)))
+
+(defstruct Config
+  sfx-volume:i32 music-volume:i32 show-messages:bool
+  screenblocks:i32 detail:i32 mouse-sensitivity:i32
+  (keys Keys))
+
+(defn- names (a:CStr b:CStr):(Vector String)
+  (let (v (make (Vector String)))
+    (conj &v (str a))
+    (when (!= (strview-from-cstr b) (strview-from-cstr "")) (conj &v (str b)))
+    (return v)))
+
+; ISSUE-028: Keys can't be :edn-keep-absent inside a keep-absent Config (the
+; old vectors would be released twice), so its absent keys take defaults.
+(derive-edn (Keys :edn-default (forward (names "Up" "W") backward (names "Down" "S")
+                                turn-left (names "Left" "") turn-right (names "Right" "")
+                                strafe-left (names "," "A") strafe-right (names "." "D")
+                                strafe (names "Left Alt" "Right Alt")
+                                speed (names "Left Shift" "Right Shift")
+                                fire (names "Left Ctrl" "Right Ctrl") use (names "Space" "E")))
+            (Config :edn-keep-absent))
+
+; d_main.c's defaults, and vanilla's keys with WASD beside the arrows.
+(defn config-default ():Config
+  (return (Config 8 8 true 10 0 5
+                  (Keys (names "Up" "W") (names "Down" "S") (names "Left" "") (names "Right" "")
+                        (names "," "A") (names "." "D") (names "Left Alt" "Right Alt")
+                        (names "Left Shift" "Right Shift") (names "Left Ctrl" "Right Ctrl")
+                        (names "Space" "E")))))
+
+; -config FILE, else $XDG_CONFIG_HOME (or ~/.config) /nuc-iron-doom/config.edn.
+(defn config-path (given:?StrView):String
+  (when-some (g given) (return (str g)))
+  (match (env-var (strview-from-cstr "XDG_CONFIG_HOME"))
+    ((some x) (return (str x "/nuc-iron-doom/config.edn")))
+    ((none) (match (env-var (strview-from-cstr "HOME"))
+              ((some h) (return (str h "/.config/nuc-iron-doom/config.edn")))
+              ((none) (return (str "config.edn")))))))
+
+; Settings from EDN text over `cfg`, which keeps whatever the text leaves out.
+(defn config-from-text (cfg:&Config text:StrView):(Fallible void)
+  (match (edn-parse text)
+    ((err e) (fail "line " (e 'line) ": " (e 'msg)))
+    ((ok n)
+     (match (edn-read cfg n)
+       ((err e) (fail "line " (e 'line) ": " (e 'msg)))
+       ((ok v) (return (ok)))))))
+
+; M_LoadDefaults: no file is no error.
+(defn config-load (path:StrView):Config
+  (let (cfg (config-default))
+    (match (file-open-read &path)
+      ((err e) (return cfg))
+      ((ok f)
+       (with (ff f)
+         (match (file-read-to-string &ff)
+           ((err e) 0)
+           ((ok text)
+            (match (config-from-text &cfg (string-as-view &text))
+              ((err e) (let (msg (str path ": " (failure-text &e) "; using the defaults\n"))
+                         (printf "%s" (string-as-cstr &msg))))
+              ((ok) 0)))))))
+    (return cfg)))
+
+(defn- line (out:&String k:CStr v:&(Vector String)):void
+  (str-into out "  :" k " ")
+  (match (edn-write out v) ((ok) 0) ((err e) 0))
+  (str-into out "\n"))
+
+; The file's text: one key a line, the keys' map indented under its own.
+(defn config-text (cfg:&Config):String
+  (let (out (make String) k (ref cfg 'keys))
+    (str-into &out "#doom.config/Config\n{:sfx-volume " (cfg 'sfx-volume)
+              "\n :music-volume " (cfg 'music-volume)
+              "\n :show-messages " (if (cfg 'show-messages) "true" "false")
+              "\n :screenblocks " (cfg 'screenblocks)
+              "\n :detail " (cfg 'detail)
+              "\n :mouse-sensitivity " (cfg 'mouse-sensitivity)
+              "\n :keys\n #doom.config/Keys\n {\n")
+    (line &out "forward" (ref k 'forward))
+    (line &out "backward" (ref k 'backward))
+    (line &out "turn-left" (ref k 'turn-left))
+    (line &out "turn-right" (ref k 'turn-right))
+    (line &out "strafe-left" (ref k 'strafe-left))
+    (line &out "strafe-right" (ref k 'strafe-right))
+    (line &out "strafe" (ref k 'strafe))
+    (line &out "speed" (ref k 'speed))
+    (line &out "fire" (ref k 'fire))
+    (line &out "use" (ref k 'use))
+    (str-into &out " }}\n")
+    (return out)))
+
+; M_SaveDefaults, making the directory if it isn't there.
+(defn config-save (cfg:&Config path:StrView):(Fallible void)
+  (when-some (slash (strview-rfind-byte &path (as ui8 47)))
+    (let (dir (str (try (strview-sub-bytes &path 0 slash))) parent (str ""))
+      ; One level up first, for ~/.config itself.
+      (let (dv (string-as-view &dir))
+        (when-some (s2 (strview-rfind-byte &dv (as ui8 47)))
+          (set! parent (str (try (strview-sub-bytes &dv 0 s2))))))
+      (when (> (count (ref parent 'bytes)) 0) (match (make-dir (string-as-view &parent)) ((ok) 0) ((err e) 0)))
+      (match (make-dir (string-as-view &dir)) ((ok) 0) ((err e) 0))))
+  (let (text (config-text cfg))
+    (with (f (try (file-create &path)))
+      (try (write-str &f (string-as-view &text)))))
+  (return (ok)))
+
+; An action's keys as SDL scancodes, for build-ticcmd; an unknown name is
+; dropped.
+(defn scancodes (names:&(Vector String)):(Vector i32)
+  (let (out (make (Vector i32)) v (view names))
+    (dotimes (i:usize (count &v))
+      (let (sc (unsafe/cast i32 (SDL_GetScancodeFromName (string-as-cstr (&v i)))))
+        (when (!= sc 0) (conj &out sc))))
+    (return out)))

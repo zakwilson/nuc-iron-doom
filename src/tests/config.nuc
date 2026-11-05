@@ -1,0 +1,42 @@
+(ns tests.config)
+
+; The settings file round trip: written text reads back as the same
+; settings, a file with keys missing keeps the defaults for them, and a bad
+; one changes nothing.
+
+(import-use nucleus.test)
+(import-use nucleus.strview)
+(import-use nucleus.string)
+(import-use nucleus.fmt)
+(import-use nucleus.vector)
+(import-use nucleus.slice)
+(import-use nucleus.coll)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.config)
+
+(defn- first-key (v:&(Vector String)):StrView
+  (let (s (view v)) (return (string-as-view (&s 0)))))
+
+(deftest config-round-trip
+  (let (a (config-default) b (config-default))
+    (set! (a 'sfx-volume) 3)
+    (set! (a 'screenblocks) 11)
+    (set! (a 'show-messages) false)
+    (set (ref (ref a 'keys) 'fire) 0 (str "F"))
+    (let (text (config-text &a))
+      (try (config-from-text &b (string-as-view &text)))
+      (try (check (and (= (b 'sfx-volume) 3) (= (b 'screenblocks) 11) (not (b 'show-messages)))
+                  "the settings come back"))
+      (try (check (= (first-key (ref (ref b 'keys) 'fire)) (strview-from-cstr "F")) "and the keys"))
+      (let (again (config-text &b))
+        (try (check (= (string-as-view &again) (string-as-view &text)) "the same text again"))))))
+
+(deftest config-partial-and-bad
+  (let (c (config-default))
+    (try (config-from-text &c (strview-from-cstr "#doom.config/Config {:music-volume 2}")))
+    (try (check (and (= (c 'music-volume) 2) (= (c 'sfx-volume) 8)) "absent keys keep their defaults"))
+    (try (check (= (first-key (ref (ref c 'keys) 'forward)) (strview-from-cstr "Up")) "the default keys stay"))
+    (match (config-from-text &c (strview-from-cstr "#doom.config/Config {:music-volume \"loud\"}"))
+      ((ok) (try (check false "a string volume is refused")))
+      ((err e) (try (check (= (c 'music-volume) 2) "and changes nothing"))))))

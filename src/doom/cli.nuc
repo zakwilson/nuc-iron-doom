@@ -226,7 +226,8 @@
 
 (defstruct CommandLine iwad:?StrView framedump:?Framedump iron-render:bool
   playdemo:?StrView timedemo:?StrView tichash:?StrView
-  warp:?Warp skill:?i32 record:?StrView fast:bool respawn:bool no-monsters:bool)
+  warp:?Warp skill:?i32 record:?StrView fast:bool respawn:bool no-monsters:bool
+  config:?StrView)
 
 (defoptions CommandLine
   (iwad "-iwad" "FILE" "Specify an IWAD file to use")
@@ -240,13 +241,14 @@
   (record "-record" "NAME" "Record a demo to NAME.lmp")
   (fast "-fast" "" "Fast monsters")
   (respawn "-respawn" "" "Monsters respawn")
-  (no-monsters "-nomonsters" "" "No monsters"))
+  (no-monsters "-nomonsters" "" "No monsters")
+  (config "-config" "FILE" "Read and save the settings in FILE (default: ~/.config/nuc-iron-doom/config.edn)"))
 
 (defn command-line-from (args:&Args):(Fallible CommandLine)
   (let (a1 (try (legacy-response-files args))
         a2 (try (load-response-files &a1))
         s (view &a2)
-        cl (CommandLine none none false none none none none none none false false false))
+        cl (CommandLine none none false none none none none none none false false false none))
     (try (parse-options &cl &s))
     (return (ok cl))))
 

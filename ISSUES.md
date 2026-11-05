@@ -638,6 +638,35 @@ the want *after* its bindings to re-arm its tail, found nothing, and the
 changing with what else is loaded is the costly part: the error points at a
 line that is correct.
 
+## ISSUE-028: a keep-absent struct inside a keep-absent struct is released twice
+
+- **Severity:** major
+- **Kind:** bug
+- **Status:** worked-around
+- **Probe:** `probes/issue-028.nuc` — expected reading `#user/Outer {:inner
+  #user/Inner {:names ["b"]}}` over a valid `Outer` to succeed; actual a
+  segmentation fault in `free`
+- **Port sites:** `src/doom/config.nuc` (the `derive-edn` of `Keys` and
+  `Config`)
+- **Workaround:** the inner struct is strict, with `:edn-default` giving
+  each field's default, so its decode builds fresh values and only the outer
+  one releases the old.
+- **Suggestion:** a keep-absent decode could leave the releases to its
+  caller when it's reading a field of another keep-absent decode: pass the
+  commit up, or make the protocol say whether a type decodes in place, so
+  the outer commit skips fields whose decode already released what it
+  replaced. The failure path has the same problem: the outer undo releases
+  the nested field's mixture of new and kept values and then restores a
+  snapshot whose replaced parts are gone.
+
+Context: the settings file has a `:keys` map nested in the top-level one, and
+both should read leniently so an older file still loads. The docs describe
+each option for one struct and say "a nested struct field reads by its own
+type's rules", which reads as if nesting composes. It doesn't: the inner
+commit runs `(edn-release (ref saved 'names))` and then the outer commit runs
+`(edn-release (ref saved 'inner))` on a shallow snapshot holding the same
+vector. A crash in `free` from a config read is a costly way to find that.
+
 ## What worked well
 
 - Computing the 256-byte RNG table from its LCG in a macro body (ordinary
