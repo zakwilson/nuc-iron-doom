@@ -29,6 +29,7 @@
 (import-use doom.wad)
 (import-use doom.info)
 (import-use doom.sounds)
+(import-use doom.mus2mid)
 (import-use doom.play.map)
 (import-use doom.play.world)
 
@@ -47,14 +48,18 @@
   channels:(Vector Channel)
   ; Each sound effect's Mix_Chunk once loaded; null before, or for a lump
   ; that isn't there or isn't a DMX sound.
-  chunks:(Vector ptr) loaded:(Vector bool))
+  chunks:(Vector ptr) loaded:(Vector bool)
+  ; S_ChangeMusic's mus_playing (0 for none), the Mix_Music playing it, the
+  ; MIDI bytes it reads from, mus2mid's carried state, and whether paused.
+  music-playing:i32 music:ptr music-data:(Vector ui8) m2m:Mus2Mid music-paused:bool)
 
 (defn- channel-at (mx:&Mixer i:usize):&Channel
   (let (v (view (ref mx 'channels))) (return (&v i))))
 
 ; I_SDL_InitSound. A device that won't open leaves the game silent.
 (defn mixer-new ():Mixer
-  (let (mx (Mixer false SAMPLE-RATE (make (Vector Channel)) (make (Vector ptr)) (make (Vector bool))))
+  (let (mx (Mixer false SAMPLE-RATE (make (Vector Channel)) (make (Vector ptr)) (make (Vector bool))
+                  0 null (make (Vector ui8)) (mus2mid-new) false))
     (dotimes (i:usize SND-CHANNELS) (conj (ref mx 'channels) (Channel 0 none none)))
     (dotimes (i:usize NUMSFX) (conj (ref mx 'chunks) null) (conj (ref mx 'loaded) false))
     (if (< (SDL_InitSubSystem SDL_INIT_AUDIO) 0)
@@ -221,3 +226,55 @@
                       (match (sound-params wd l (xy 'x) (xy 'y) volume)
                         ((some sp) (set-params mx (unsafe/cast i32 i) (sp 'volume) (sp 'sep)))
                         ((none) (stop-channel mx i))))))))))))))
+
+; --- music ----------------------------------------------------------------------
+
+(defn- stop-music (mx:&Mixer):void
+  (when (!= (mx 'music) null)
+    (Mix_HaltMusic)
+    (Mix_FreeMusic (unsafe/cast (ptr Mix_Music) (mx 'music)))
+    (set! (mx 'music) null))
+  (set! (mx 'music-playing) 0))
+
+; S_ChangeMusic. The same song again carries on; a MUS lump goes through
+; mus2mid. A missing lump (v1.9's idmus asks Doom 1 for Doom II's songs) or a
+; MIDI that SDL_mixer can't play leaves the music off.
+(defn mixer-change-music (mx:&Mixer wad:&Wad n:i32 loop:bool):void
+  (when (or (<= n 0) (>= n NUMMUSIC)) (return))
+  (when (= (mx 'music-playing) n) (return))
+  (stop-music mx)
+  (set! (mx 'music-playing) n)
+  (when (not (mx 'open)) (return))
+  (let (nm (str "D_" (aref MUSIC-NAMES (as i64 n))))
+    (match (lump-named wad (name (string-as-view &nm)))
+      ((err e) 0)
+      ((ok l)
+       (let (data (ref l 'data)
+             mus (and (>= (count data) 4) (= (byte-at data 0) 0x4d) (= (byte-at data 1) 0x55)
+                      (= (byte-at data 2) 0x53) (= (byte-at data 3) 0x1a)))
+         (set! (mx 'music-data) (make (Vector ui8)))
+         (if mus
+           (match (mus2mid (ref mx 'm2m) data)
+             ((some mid) (set! (mx 'music-data) mid))
+             ((none) 0))
+           (dotimes (i:usize (count data)) (conj (ref mx 'music-data) (unsafe/cast ui8 (byte-at data i)))))
+         (let (md (view (ref mx 'music-data)))
+           (when (> (count &md) 0)
+             (let (rw (SDL_RWFromConstMem (unsafe/cast ptr (&md 0)) (unsafe/cast i32 (count &md)))
+                   m (Mix_LoadMUS_RW rw 1))
+               (when (!= (unsafe/cast ptr m) null)
+                 (set! (mx 'music) (unsafe/cast ptr m))
+                 (Mix_PlayMusic m (if loop -1 1))
+                 (when (mx 'music-paused) (Mix_PauseMusic)))))))))))
+
+; S_SetMusicVolume, from the menu's 0-15: I_SDL_SetMusicVolume scales
+; vanilla's 0-127 to SDL's 0-128.
+(defn mixer-music-volume (mx:&Mixer volume:i32):void
+  (when (mx 'open) (Mix_VolumeMusic (/ (* (* volume 8) MIX_MAX_VOLUME) 127))))
+
+; S_PauseSound and S_ResumeSound: only the music pauses.
+(defn mixer-pause-music (mx:&Mixer paused:bool):void
+  (when (!= paused (mx 'music-paused))
+    (set! (mx 'music-paused) paused)
+    (when (mx 'open)
+      (if paused (Mix_PauseMusic) (Mix_ResumeMusic)))))

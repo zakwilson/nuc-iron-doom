@@ -57,6 +57,7 @@
 (import-use doom.cheats)
 (import-use doom.automap)
 (import-use doom.mixer)
+(import-use doom.sounds)
 (import-use doom.wad)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
@@ -123,6 +124,8 @@
   ; M_Random for a wipe with no game to draw it from.
   page-random:Random
   mixer:Mixer
+  ; The session's music requests played so far.
+  music-serial:i32
   ; The session's level loads when the sound layer last looked (S_Start).
   snd-loads:i32
   tic:i32
@@ -133,7 +136,7 @@
         menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL)))
     (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
                   (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) false 0 -1 none 0 false (random-new) (mixer-new) 0 0 false))))
+                  none GS-DEMOSCREEN 0 none 0 none menu (cheats-new) (automap-new) false 0 -1 none 0 false (random-new) (mixer-new) 0 0 0 false))))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -194,9 +197,13 @@
     (when-some (w (s 'world))
       (when (= (s 'gamestate) GS-LEVEL)
         (when (and (= (ev 'type) EV-KEYDOWN) (not ((ref w 'rules) 'demo-playback)))
-          (when-some (to (cheat-responder (ref g 'cheats) w (ev 'ch)))
-            (try (menu-new-game g GAME-SKILL (to 'episode) (to 'map)))
-            (return (ok))))
+          (let (to (cheat-responder (ref g 'cheats) w (ev 'ch)) c (ref g 'cheats))
+            (when (!= (c 'music) 0)
+              (mixer-change-music (ref g 'mixer) (ref (ref g 'assets) 'wad) (c 'music) true)
+              (set! (c 'music) 0))
+            (when-some (t to)
+              (try (menu-new-game g GAME-SKILL (t 'episode) (t 'map)))
+              (return (ok)))))
         (when (try (automap-responder (ref g 'automap) w (ref (ref g 'assets) 'wad) ev))
           (return (ok))))))
   (when (and (= (ev 'type) EV-KEYDOWN) (= (ev 'key) KEY-PAUSE))
@@ -308,18 +315,24 @@
   (set! (g 'page-tic) tics))
 
 ; D_DoAdvanceDemo: the next title page or demo.
+; S_StartMusic: the title's song, once through.
+(defn- title-music (g:&Game commercial:bool):void
+  (mixer-change-music (ref g 'mixer) (ref (ref g 'assets) 'wad) (if commercial MUS-DM2TTL MUS-INTRO) false))
+
 (defn- do-advance-demo (g:&Game):(Fallible void)
   (let (mode (game-mode (ref g 'assets)) commercial (= mode COMMERCIAL) ultimate (= mode RETAIL))
     (set! (g 'advance-demo) false)
     (set! ((ref g 'menu) 'user-game) false)
     (set! (g 'demo-sequence) (% (+ (g 'demo-sequence) 1) (if ultimate 7 6)))
     (case (g 'demo-sequence)
-      0 (show-page g "TITLEPIC" (if commercial (* 35 11) 170))
+      0 (do (show-page g "TITLEPIC" (if commercial (* 35 11) 170))
+            (title-music g commercial))
       1 (try (start-demo g (strview-from-cstr "demo1")))
       2 (show-page g "CREDIT" 200)
       3 (try (start-demo g (strview-from-cstr "demo2")))
       4 (if commercial
-          (show-page g "TITLEPIC" (* 35 11))
+          (do (show-page g "TITLEPIC" (* 35 11))
+              (title-music g true))
           (show-page g (if ultimate "CREDIT" "HELP2") 200))
       5 (try (start-demo g (strview-from-cstr "demo3")))
       (try (start-demo g (strview-from-cstr "demo4")))))
@@ -354,6 +367,10 @@
         (set! (g 'snd-loads) (s 'loads))
         (mixer-stop-all (ref g 'mixer)))
       (when-some (w (s 'world)) (mixer-events (ref g 'mixer) (ref (ref g 'assets) 'wad) w))
+      (when (!= (s 'music-serial) (g 'music-serial))
+        (set! (g 'music-serial) (s 'music-serial))
+        (mixer-change-music (ref g 'mixer) (ref (ref g 'assets) 'wad) (s 'music) (s 'music-loop)))
+      (mixer-pause-music (ref g 'mixer) (s 'paused))
       (automap-tic g s))
     ; G_CheckDemoStatus: -playdemo and -timedemo quit, the attract loop goes on.
     (when (s 'demo-ended)
@@ -505,6 +522,7 @@
         (set! (g 'wipe-state) -1))))
   ; S_UpdateSounds, between the tics and the drawing.
   (mixer-update (ref g 'mixer) (match (g 'session) ((some s) (s 'world)) ((none) none)))
+  (mixer-music-volume (ref g 'mixer) ((ref g 'menu) 'music-volume))
   (let (gs (match (g 'page) ((some p) GS-DEMOSCREEN)
              ((none) (match (g 'session) ((some s) (s 'gamestate)) ((none) GS-DEMOSCREEN))))
         start:?Buffer (if (!= gs (g 'wipe-state)) (some (copy-of (ref g 'screen))) none))

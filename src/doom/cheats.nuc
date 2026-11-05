@@ -18,6 +18,7 @@
 (import-use doom.play.defs)
 (import-use doom.play.world)
 (import-use doom.play.inter)
+(import-use doom.sounds)
 
 ; cheatseq_t: `read` of the sequence matched, then `pread` parameter keys.
 (defstruct CheatSeq seq:StrView params:usize read:usize pread:usize buf:(array i32 2))
@@ -32,7 +33,9 @@
   behold-a:CheatSeq behold-l:CheatSeq behold:CheatSeq
   choppers:CheatSeq clev:CheatSeq mypos:CheatSeq
   ; idmypos's message, which the player's message points into.
-  pos-text:String)
+  pos-text:String
+  ; idmus's song for the game to play, 0 for none.
+  music:i32)
 
 (defn cheats-new ():Cheats
   (return (Cheats (cheat-seq "idmus" 2) (cheat-seq "iddqd" 0) (cheat-seq "idkfa" 0) (cheat-seq "idfa" 0)
@@ -41,7 +44,7 @@
                   (cheat-seq "idbeholdr" 0) (cheat-seq "idbeholda" 0) (cheat-seq "idbeholdl" 0)
                   (cheat-seq "idbehold" 0)
                   (cheat-seq "idchoppers" 0) (cheat-seq "idclev" 2) (cheat-seq "idmypos" 0)
-                  (make String))))
+                  (make String) 0)))
 
 ; cht_CheckCheat. A wrong key restarts the sequence; parameter keys are taken
 ; as they come.
@@ -80,13 +83,19 @@
   (set! (p 'message) (some "Power-up Toggled")))
 
 ; The Doom II tune numbers v1.9 tried for every game, or Ultimate Doom's
-; episode and map. The music itself is milestone 7's.
+; episode and map.
 (defn- music-cheat (c:&Cheats p:&Player r:&Rules):void
   (let (a (param (ref c 'mus) 0) b (param (ref c 'mus) 1))
     (set! (p 'message) (some "Music Change"))
     (if (or (= (r 'mode) COMMERCIAL) (not (r 'ultimate)))
-      (when (> (+ (* (- a 48) 10) (- b 48)) 35) (set! (p 'message) (some "IMPOSSIBLE SELECTION")))
-      (when (> (+ (* (- a 49) 9) (- b 49)) 31) (set! (p 'message) (some "IMPOSSIBLE SELECTION"))))))
+      (let (k (+ (* (- a 48) 10) (- b 48)))
+        (if (> k 35)
+          (set! (p 'message) (some "IMPOSSIBLE SELECTION"))
+          (set! (c 'music) (+ MUS-RUNNIN (- k 1)))))
+      (let (k (+ (* (- a 49) 9) (- b 49)))
+        (if (> k 31)
+          (set! (p 'message) (some "IMPOSSIBLE SELECTION"))
+          (set! (c 'music) (+ MUS-E1M1 k)))))))
 
 (defn- mypos (c:&Cheats p:&Player):void
   (let (s (ref c 'pos-text) mo (unwrap (p 'mo)))

@@ -34,6 +34,7 @@
 (import-use doom.statusbar)
 (import-use doom.intermission)
 (import-use doom.finale)
+(import-use doom.sounds)
 (import-use doom.hud)
 (import doom.play.map pm)
 
@@ -79,7 +80,10 @@
   ; The game layer's: pause, and the menu being up (which pauses too).
   paused:bool menu-active:bool
   ; G_InitNews, which close the automap.
-  new-games:i32)
+  new-games:i32
+  ; The music S_ChangeMusic was last asked for, and whether it loops; the
+  ; serial counts the requests, for the game layer to play.
+  music:i32 music-loop:bool music-serial:i32)
 
 (defn session-new (a:&Assets mode:i32):(Fallible &Session)
   (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
@@ -87,7 +91,7 @@
                        (single-player-in-game) (new-game-players) (random-new)
                        none 0 none false false none none (status-bar-new)
                        GS-LEVEL GA-NOTHING false (intermission-empty) 0
-                       (finale-empty) 0 (hud-new) false false 0))))
+                       (finale-empty) 0 (hud-new) false false 0 0 false 0))))
 
 ; D_IdentifyVersion: told apart by which maps the IWAD has.
 (defn game-mode (a:&Assets):i32
@@ -101,6 +105,21 @@
 
 ; G_DoLoadLevel and P_SetupLevel: the current episode and map, its things
 ; and specials.
+(defn- change-music (s:&Session n:i32 loop:bool):void
+  (set! (s 'music) n)
+  (set! (s 'music-loop) loop)
+  (set! (s 'music-serial) (+ (s 'music-serial) 1)))
+
+; Episode 4 borrows earlier maps' songs.
+(defvar SPMUS:(array i32 9) (array i32 MUS-E3M4 MUS-E3M2 MUS-E3M3 MUS-E1M5 MUS-E2M7
+                                    MUS-E2M4 MUS-E2M6 MUS-E2M5 MUS-E1M9))
+
+; S_Start's song for the level.
+(defn- level-music (r:&Rules):i32
+  (cond (= (r 'mode) COMMERCIAL) (return (+ MUS-RUNNIN (- (r 'map) 1)))
+        (< (r 'episode) 4) (return (+ MUS-E1M1 (* (- (r 'episode) 1) 9) (- (r 'map) 1)))
+        true (return (aref SPMUS (as i64 (- (r 'map) 1))))))
+
 (defn- load-level (s:&Session a:&Assets):(Fallible void)
   ; Carry the players and the RNG over from the level before, then free it.
   (when-some (w (s 'world))
@@ -125,7 +144,8 @@
          (set! (w 'game-tic) (s 'gametic))
          (set! (s 'world) (some w))
          (set! (s 'gamestate) GS-LEVEL)
-         (set! (s 'loads) (+ (s 'loads) 1))))))
+         (set! (s 'loads) (+ (s 'loads) 1))
+         (change-music s (level-music r) true)))))
   (return (ok)))
 
 ; Vanilla's gameskill outlives a game, and -fast halves the tics again at
@@ -350,6 +370,7 @@
     (set! (s 'gameaction) GA-NOTHING)
     (set! (s 'gamestate) GS-FINALE)
     (when (not commercial) (set! (s 'finished) true))
+    (change-music s (if commercial MUS-READ-M MUS-VICTOR) true)
     (set! (s 'finale) (finale-start commercial (r 'episode) (r 'map)))))
 
 ; The -tichash line: as reference/tichash.patch writes it.
@@ -447,7 +468,10 @@
             (set! (w 'exit) 0)
             (set! (s 'gameaction) GA-COMPLETED)))
       GS-INTERMISSION
-      (when (wi-ticker (ref s 'wi) w commercial) (world-done s))
+      (do (when (wi-ticker (ref s 'wi) w commercial) (world-done s))
+          ; WI_Ticker's first tic starts the intermission music.
+          (when (= ((ref s 'wi) 'bcnt) 1)
+            (change-music s (if commercial MUS-DM2INT MUS-INTER) true)))
       GS-FINALE
       (let (any false)
         (dotimes (i:usize MAXPLAYERS)
@@ -457,7 +481,9 @@
           1 (if (= ((ref s 'rules) 'map) 30)
               (set! (s 'finished) true)
               (set! (s 'gameaction) GA-WORLDDONE))
-          2 (set! (s 'forced-wipes) (+ (s 'forced-wipes) 1))
+          ; The art screen: the bunny scroll has its own song.
+          2 (do (set! (s 'forced-wipes) (+ (s 'forced-wipes) 1))
+                (when (= ((ref s 'rules) 'episode) 3) (change-music s MUS-BUNNY false)))
           0))
       0)
     (when-some (out (s 'tichash))
