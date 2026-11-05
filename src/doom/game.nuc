@@ -108,6 +108,11 @@
   seen-forced-wipes:i32
   hu-font:?HuFont
   menu:MenuState
+  ; The attract loop (d_main.c): the sequence's step, the page showing
+  ; (GS_DEMOSCREEN) and its tics left, and a pending D_AdvanceDemo.
+  demo-sequence:i32 page:?CStr page-tic:i32 advance-demo:bool
+  ; M_Random for a wipe with no game to draw it from.
+  page-random:Random
   tic:i32
   quit:bool)
 
@@ -116,7 +121,7 @@
         menu (menu-new (= mode COMMERCIAL) (= mode SHAREWARE) (= mode RETAIL)))
     (return (Game cl assets video (array2d (as usize SCREEN-WIDTH) (as usize SCREEN-HEIGHT) (as ui8 0)) (rand-new)
                   (Mode-setup) none none none none (view-new) none (renderer-new 10) 0 0 0 none 0
-                  none GS-DEMOSCREEN 0 none 0 none menu 0 false))))
+                  none GS-DEMOSCREEN 0 none 0 none menu -1 none 0 false (random-new) 0 false))))
 
 (defn- palette0 (g:&Game):&Palette
   (let (ps (view (ref (ref g 'assets) 'palettes)))
@@ -138,7 +143,12 @@
   (let (evs (poll-events) v (view &evs)
         gt (match (g 'session) ((some s) (s 'gametic)) ((none) (g 'tic))))
     (dotimes (i:usize (count &v))
-      (menu-responder (ref g 'menu) (&v i) gt)))
+      (let (ev (&v i))
+        (when (and (not (menu-responder (ref g 'menu) ev gt))
+                   ; G_Responder: in the attract loop any key brings up the menu.
+                   (= (ev 'type) EV-KEYDOWN) (not ((ref g 'menu) 'user-game))
+                   (none? (demo-lump (ref g 'cl))))
+          (open-panel (ref g 'menu))))))
   (menu-ticker (ref g 'menu))
   (try (do-menu-requests g))
   (return (ok)))
@@ -159,20 +169,16 @@
     (set! (s 'demo-ended) false)
     (try (session-init-new s a skill episode 1))
     (set! (g 'session) (some s))
+    (set! (g 'page) none)
+    (set! (g 'advance-demo) false)
     (set! ((ref g 'menu) 'user-game) true)
     (set! (g 'pending) (some (Mode-level))))
   (return (ok)))
 
-; D_StartTitle, until the attract loop is ported: back to the title.
+; D_StartTitle: the attract loop from its start.
 (defn- end-game (g:&Game):void
-  (when-some (s (g 'session))
-    (when-some (w (s 'world))
-      (set! (s 'world) none)
-      (world-free w)))
-  (set! (g 'session) none)
-  (set! ((ref g 'menu) 'user-game) false)
-  (set! (g 'wipe-state) GS-DEMOSCREEN)
-  (set! (g 'pending) (some (Mode-intro 0))))
+  (set! (g 'demo-sequence) -1)
+  (set! (g 'advance-demo) true))
 
 (defn- do-menu-requests (g:&Game):(Fallible void)
   (let (m (ref g 'menu) rs (view (ref m 'requests)))
@@ -241,9 +247,32 @@
   (return (if-some (d (cl 'timedemo)) (some d) (cl 'playdemo))))
 
 (defn- start-demo (g:&Game lump:StrView):(Fallible void)
-  (let (a (ref g 'assets) s (try (new-session g)))
+  (let (a (ref g 'assets) s (match (g 'session) ((some old) old) ((none) (try (new-session g)))))
     (try (session-play-demo s a lump))
+    (set! (g 'page) none)
     (set! (g 'session) (some s)))
+  (return (ok)))
+
+(defn- show-page (g:&Game name:CStr tics:i32):void
+  (set! (g 'page) (some name))
+  (set! (g 'page-tic) tics))
+
+; D_DoAdvanceDemo: the next title page or demo.
+(defn- do-advance-demo (g:&Game):(Fallible void)
+  (let (mode (game-mode (ref g 'assets)) commercial (= mode COMMERCIAL) ultimate (= mode RETAIL))
+    (set! (g 'advance-demo) false)
+    (set! ((ref g 'menu) 'user-game) false)
+    (set! (g 'demo-sequence) (% (+ (g 'demo-sequence) 1) (if ultimate 7 6)))
+    (case (g 'demo-sequence)
+      0 (show-page g "TITLEPIC" (if commercial (* 35 11) 170))
+      1 (try (start-demo g (strview-from-cstr "demo1")))
+      2 (show-page g "CREDIT" 200)
+      3 (try (start-demo g (strview-from-cstr "demo2")))
+      4 (if commercial
+          (show-page g "TITLEPIC" (* 35 11))
+          (show-page g (if ultimate "CREDIT" "HELP2") 200))
+      5 (try (start-demo g (strview-from-cstr "demo3")))
+      (try (start-demo g (strview-from-cstr "demo4")))))
   (return (ok)))
 
 ; G_DoLoadLevel's sky for the first three episodes.
@@ -263,8 +292,13 @@
     (let (cmd (if ((ref g 'menu) 'active) (ticcmd-zero) (build-ticcmd (ref g 'cmd-turn-held))))
       (when (some? (s 'record)) (lowres-turn &cmd (ref g 'turn-carry)))
       (try (session-tic s (ref g 'assets) cmd)))
-    ; G_CheckDemoStatus quits after a -playdemo or -timedemo.
-    (when (s 'demo-ended) (set! (g 'quit) true)))
+    ; G_CheckDemoStatus: -playdemo and -timedemo quit, the attract loop goes on.
+    (when (s 'demo-ended)
+      (if (some? (demo-lump (ref g 'cl)))
+        (set! (g 'quit) true)
+        (do (set! (s 'demo-ended) false)
+            (set! (s 'demo) none)
+            (set! (g 'advance-demo) true)))))
   (return (ok)))
 
 (defn- name-from-episode (e:i32):Name
@@ -375,29 +409,45 @@
       0))
   (return (ok)))
 
-; One phase-B frame: the wipe if one is playing (no tics run meanwhile), else a
-; tic and D_Display, which starts a wipe when the gamestate changed.
-(defn- session-frame (g:&Game s:&Session):(Fallible void)
+; One phase-B frame (D_RunFrame): the wipe if one is playing (no tics run
+; meanwhile); else a pending D_AdvanceDemo, a tic of the game or the page,
+; and D_Display, which starts a wipe when the gamestate changed.
+(defn- phase-b-frame (g:&Game):(Fallible void)
   (when-some (wp (g 'wipe))
     ; The copy shares the column array, so the melt's progress stays.
     (let (ww wp)
       (when (wipe-tic &ww (ref g 'screen) 1) (set! (g 'wipe) none)))
     (return (ok)))
-  (try (level-tic g))
-  (when (g 'quit) (return (ok)))
-  ; G_DoLoadLevel forces a wipe even from a level.
-  (when (!= (s 'loads) (g 'seen-loads))
-    (set! (g 'seen-loads) (s 'loads))
-    (when (= (g 'wipe-state) GS-LEVEL) (set! (g 'wipe-state) -1)))
-  (when (!= (s 'forced-wipes) (g 'seen-forced-wipes))
-    (set! (g 'seen-forced-wipes) (s 'forced-wipes))
-    (set! (g 'wipe-state) -1))
-  (let (gs (s 'gamestate) start:?Buffer (if (!= gs (g 'wipe-state)) (some (copy-of (ref g 'screen))) none))
-    (try (draw-session g s))
+  (when (g 'advance-demo) (try (do-advance-demo g)))
+  (if (some? (g 'page))
+    ; D_PageTicker.
+    (do (set! (g 'page-tic) (- (g 'page-tic) 1))
+        (when (< (g 'page-tic) 0) (set! (g 'advance-demo) true)))
+    (when-some (s (g 'session))
+      (try (level-tic g))
+      (when (g 'quit) (return (ok)))
+      ; G_DoLoadLevel forces a wipe even from a level, F_Ticker any time.
+      (when (!= (s 'loads) (g 'seen-loads))
+        (set! (g 'seen-loads) (s 'loads))
+        (when (= (g 'wipe-state) GS-LEVEL) (set! (g 'wipe-state) -1)))
+      (when (!= (s 'forced-wipes) (g 'seen-forced-wipes))
+        (set! (g 'seen-forced-wipes) (s 'forced-wipes))
+        (set! (g 'wipe-state) -1))))
+  (let (gs (match (g 'page) ((some p) GS-DEMOSCREEN)
+             ((none) (match (g 'session) ((some s) (s 'gamestate)) ((none) GS-DEMOSCREEN))))
+        start:?Buffer (if (!= gs (g 'wipe-state)) (some (copy-of (ref g 'screen))) none))
+    ; D_PageDrawer, or the game.
+    (match (g 'page)
+      ((some p) (try (set-palette g 0))
+                (let (pt (try (named-patch g p))) (try (draw-patch (ref g 'screen) 0 0 &pt))))
+      ((none) (when-some (s (g 'session)) (try (draw-session g s)))))
     (when-some (st start)
-      (let (end (copy-of (ref g 'screen)))
+      (let (end (copy-of (ref g 'screen))
+            r (match (g 'session)
+                ((some s) (match (s 'world) ((some w) (ref w 'random)) ((none) (ref g 'page-random))))
+                ((none) (ref g 'page-random))))
         (copy-from (ref g 'screen) &st)
-        (set! (g 'wipe) (some (wipe-new st end (ref (session-world s) 'random))))))
+        (set! (g 'wipe) (some (wipe-new st end r)))))
     (set! (g 'wipe-state) gs))
   (return (ok)))
 
@@ -415,15 +465,12 @@
       (match (g 'mode)
         ((setup) 0)
         ((intro elapsed)
-         ; Phase B redraws it under the menu every tic.
-         (when (or (= elapsed 0) (not ((ref g 'cl) 'iron-render)))
+          (when (= elapsed 0)
            (try (draw-patch (ref g 'screen) 0 0 (ref (ref g 'assets) 'title))))
          (let (now (+ elapsed TIC-NS))
            (set! (g 'mode) (Mode-intro now))
            (when (and (< elapsed TITLE-NS) (>= now TITLE-NS)) (set! title-done true))))
-        ((level) (match (g 'session)
-                   ((some ss) (try (session-frame g ss)))
-                   ((none) (try (level-tic g)))))
+        ((level) (if ((ref g 'cl) 'iron-render) (try (level-tic g)) (try (phase-b-frame g))))
         ((melt)
          (when-some (m (g 'melt))
            ; A copy, but its columns and screens are the same heap buffers.
@@ -437,10 +484,12 @@
          (if-some (d (demo-lump (ref g 'cl)))
            (do (try (start-demo g d))
                (set! (g 'pending) (some (Mode-level))))
-           (if (and (autostart? (ref g 'cl)) (not ((ref g 'cl) 'iron-render)))
-             (do (try (start-game g))
-                 (set! (g 'pending) (some (Mode-level))))
-             (set! (g 'pending) (some (Mode-intro 0))))))
+           (cond ((ref g 'cl) 'iron-render) (set! (g 'pending) (some (Mode-intro 0)))
+                 (autostart? (ref g 'cl)) (do (try (start-game g))
+                                              (set! (g 'pending) (some (Mode-level))))
+                 ; D_StartTitle.
+                 true (do (end-game g)
+                          (set! (g 'pending) (some (Mode-level)))))))
         ((intro e) 0) ((level) 0) ((melt) 0))
       (when title-done
         ; Phase A starts E1M1; phase B's title waits for the menu.

@@ -206,6 +206,7 @@
         (set (ref s 'in-game) i (!= (try (demo-byte &d)) 0)))
       (when ((ref s 'in-game) 1) (set! (r 'netgame) true))
       (try (session-init-new s a skill episode mp))
+      (set! (s 'demo-ended) false)
       (set! (r 'demo-playback) true)
       (set! (s 'demo) (some d))))
   (return (ok)))

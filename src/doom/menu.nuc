@@ -270,7 +270,8 @@
       MSG-QUIT (when yes (request m (MenuRequest-quit)))
       0)))
 
-(defn- open-panel (m:&MenuState):void
+; M_StartControlPanel.
+(defn open-panel (m:&MenuState):void
   (when (not (m 'active))
     (set! (m 'active) true)
     (set! (m 'current) MAIN-MENU)
