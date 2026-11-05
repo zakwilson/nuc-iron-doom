@@ -24,7 +24,7 @@
 (import-use doom.play.world)
 (import-use doom.play.maputl)
 (import-use doom.play.move)
-(import-use doom.play.actions)
+(import-use doom.play.enemy)
 (import-use doom.play.pspr)
 (import-use doom.play.player)
 
@@ -51,7 +51,7 @@
         (set! (m 'sprite) (st 'sprite))
         (set! (m 'frame) (st 'frame))
         (when (!= (st 'action) A-NONE)
-          (try (run-mobj-action w m (st 'action))))
+          (try (mobj-action w m (st 'action))))
         (set! state (st 'next))
         (inc! n)
         (when (> n MOBJ-CYCLE-LIMIT)

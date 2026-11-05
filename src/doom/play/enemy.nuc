@@ -1,0 +1,814 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_enemy.c); this port is GPLv3, see COPYING.
+;
+; Monster behaviour: hearing, looking, chasing and attacking, and the rest
+; of the actions thing states run.
+
+(ns doom.play.enemy)
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.math)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.rand)
+(import-use doom.info)
+(import-use doom.mapdata)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.maputl)
+(import-use doom.play.mobj)
+(import-use doom.play.move)
+(import-use doom.play.sight)
+(import-use doom.play.inter)
+(import-use doom.play.switch)
+(import-use doom.play.doors)
+(import-use doom.play.floors)
+(import-use doom.play.spec)
+(import-use doom.play.pspr)
+
+(defenum DirType DI-EAST DI-NORTHEAST DI-NORTH DI-NORTHWEST DI-WEST DI-SOUTHWEST DI-SOUTH
+  DI-SOUTHEAST DI-NODIR NUMDIRS)
+
+(defvar OPPOSITE:(array i32 9)
+  (array i32 DI-WEST DI-SOUTHWEST DI-SOUTH DI-SOUTHEAST DI-EAST DI-NORTHEAST DI-NORTH
+         DI-NORTHWEST DI-NODIR))
+(defvar DIAGS:(array i32 4) (array i32 DI-NORTHWEST DI-NORTHEAST DI-SOUTHWEST DI-SOUTHEAST))
+(defvar XSPEED:(array i32 8) (array i32 65536 47000 0 -47000 -65536 -47000 0 47000))
+(defvar YSPEED:(array i32 8) (array i32 0 47000 65536 47000 0 -47000 -65536 -47000))
+
+(defconst TRACEANGLE 0xc000000)
+(defconst FATSPREAD (/ ANG90 8))
+(defconst SKULLSPEED (* 20 FRACUNIT))
+
+(defn- info (m:&Mobj):MobjInfo (return (mobj-info (m 'type))))
+(defn- target (m:&Mobj):&Mobj (return (unwrap (m 'target))))
+(defn- sub-random (w:&World):i32 (return (p-sub-random (ref w 'random))))
+(defn- rules (w:&World):&Rules (return (ref w 'rules)))
+(defn- set-state (w:&World m:&Mobj s:i32):(Fallible void)
+  (try (set-mobj-state w m s))
+  (return (ok)))
+
+; The live things, in thinker order.
+(defn- live-mobjs (w:&World):(Vector &Mobj)
+  (let (out (make (Vector &Mobj)) cap (w 'thinker-cap) th (unwrap (cap 'next)))
+    (while (not (same? th cap))
+      (when (not (th 'removed))
+        (match (th 'think)
+          ((mobj m) (conj &out m))
+          ((cap) 0) ((door d) 0) ((floor f) 0) ((ceiling c) 0) ((plat p) 0)
+          ((flash x) 0) ((strobe s) 0) ((glow g) 0) ((flicker f) 0)))
+      (set! th (unwrap (th 'next))))
+    (return out)))
+
+; Whether another thing of m's type is alive.
+(defn- others-alive? (w:&World m:&Mobj):bool
+  (let (all (live-mobjs w) found false)
+    (dotimes (i:usize (count &all))
+      (let (m2 (&all i))
+        (when (and (not (same? m2 m)) (= (m2 'type) (m 'type)) (> (m2 'health) 0))
+          (set! found true))))
+    (drop &all)
+    (return found)))
+
+; P_SubstNullMobj: a missing target stands in as a thing at the origin.
+(defn- subst-null-mobj (w:&World m:?&Mobj):&Mobj
+  (match m
+    ((some x) (return x))
+    ((none)
+     (let (d (new Mobj (ref w 'arena)))
+       (set! @d (Mobj none 0 0 0 none none 0 0 0 none none 0 0 0 0 0 0 0 0
+                      0 0 0 0 0 0 0 0 none 0 0 none 0 (MapThing 0 0 0 0 0) none))
+       (return d)))))
+
+; --- hearing ------------------------------------------------------------------
+
+; P_RecursiveSound: flood the sound through open lines; a second sound-
+; blocking line stops it.
+(defn- recursive-sound (w:&World sec:usize soundblocks:i32 st:?&Mobj):void
+  (let (sp (sector-play-at w sec) l (ref w 'level) s (sector-at l sec))
+    (when (and (= (sp 'valid-count) (w 'valid-count))
+               (<= (sp 'sound-traversed) (+ soundblocks 1)))
+      (return))
+    (set! (sp 'valid-count) (w 'valid-count))
+    (set! (sp 'sound-traversed) (+ soundblocks 1))
+    (set! (sp 'sound-target) st)
+    (dotimes (i:usize (s 'line-count))
+      (let (check (line-at l (sector-line w s i)))
+        (when (!= (bit-and (check 'flags) ML-TWOSIDED) 0)
+          (line-opening w check)
+          ; A closed door.
+          (when (> ((opening w) 'range) 0)
+            (let (s0 ((side-at l (unsafe/cast usize (aref (check 'side-num) 0))) 'sector)
+                  s1 ((side-at l (unsafe/cast usize (aref (check 'side-num) 1))) 'sector)
+                  other (if (= s0 sec) s1 s0))
+              (if (!= (bit-and (check 'flags) ML-SOUNDBLOCK) 0)
+                (when (= soundblocks 0) (recursive-sound w other 1 st))
+                (recursive-sound w other soundblocks st)))))))))
+
+; P_NoiseAlert: wake up monsters that hear the emitter.
+(defn noise-alert (w:&World target:&Mobj emitter:&Mobj):void
+  (set! (w 'valid-count) (+ (w 'valid-count) 1))
+  (recursive-sound w (sector-index-of w emitter) 0 (some target)))
+
+(defn- sector-index-of (w:&World m:&Mobj):usize
+  (return ((sub-sector-at (ref w 'level) (m 'sub-sector)) 'sector)))
+
+; --- looking and moving -----------------------------------------------------
+
+; P_CheckMeleeRange.
+(defn- check-melee-range (w:&World actor:&Mobj):(Fallible bool)
+  (match (actor 'target)
+    ((none) (return (ok false)))
+    ((some pl)
+     (let (dist (aprox-distance (wrap-sub (pl 'x) (actor 'x)) (wrap-sub (pl 'y) (actor 'y)))
+           range (+ (- MELEERANGE (* 20 FRACUNIT)) ((info pl) 'radius)))
+       (when (>= dist range) (return (ok false)))
+       (return (check-sight w actor pl))))))
+
+; P_CheckMissileRange: whether to fire, by chance, nearer being likelier.
+(defn- check-missile-range (w:&World actor:&Mobj):(Fallible bool)
+  (let (t (target actor))
+    (when (not (try (check-sight w actor t))) (return (ok false)))
+    (when (!= (bit-and (actor 'flags) MF-JUSTHIT) 0)
+      ; Just hit: fight back.
+      (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-JUSTHIT)))
+      (return (ok true)))
+    (when (!= (actor 'reaction-time) 0) (return (ok false)))
+    (let (dist (- (aprox-distance (wrap-sub (actor 'x) (t 'x)) (wrap-sub (actor 'y) (t 'y)))
+                  (* 64 FRACUNIT))
+          ty (actor 'type))
+      ; No melee attack, so fire more.
+      (when (= ((info actor) 'melee-state) 0) (set! dist (- dist (* 128 FRACUNIT))))
+      (set! dist (bit-shr dist FRACBITS))
+      (when (and (= ty MT-VILE) (> dist (* 14 64))) (return (ok false)))
+      (when (= ty MT-UNDEAD)
+        (when (< dist 196) (return (ok false)))
+        (set! dist (bit-shr dist 1)))
+      (when (or (= ty MT-CYBORG) (= ty MT-SPIDER) (= ty MT-SKULL))
+        (set! dist (bit-shr dist 1)))
+      (when (> dist 200) (set! dist 200))
+      (when (and (= ty MT-CYBORG) (> dist 160)) (set! dist 160))
+      (return (ok (>= (p-random w) dist))))))
+
+; P_Move: a step in the move direction; blocked, a floater rises or sinks,
+; and a walker tries the special lines it touched.
+(defn- step (w:&World actor:&Mobj):(Fallible bool)
+  (let (dir (actor 'move-dir) sc (ref w 'scratch))
+    (when (= dir DI-NODIR) (return (ok false)))
+    (when (or (< dir 0) (>= dir 8)) (fail "Weird actor->movedir!"))
+    (let (speed ((info actor) 'speed)
+          tryx (wrap-add (actor 'x) (* speed (aref XSPEED (as i64 dir))))
+          tryy (wrap-add (actor 'y) (* speed (aref YSPEED (as i64 dir)))))
+      (if (not (try (try-move w actor tryx tryy)))
+        (do
+          ; Open any specials.
+          (when (and (!= (bit-and (actor 'flags) MF-FLOAT) 0) (sc 'float-ok))
+            (if (< (actor 'z) (sc 'tm-floor-z))
+              (set! (actor 'z) (+ (actor 'z) FLOATSPEED))
+              (set! (actor 'z) (- (actor 'z) FLOATSPEED)))
+            (set! (actor 'flags) (bit-or (actor 'flags) MF-INFLOAT))
+            (return (ok true)))
+          (when (= (sc 'num-spechit) 0) (return (ok false)))
+          (set! (actor 'move-dir) DI-NODIR)
+          ; Vanilla's `while (numspechit--)` leaves it at -1.
+          (let (good false)
+            (while (> (sc 'num-spechit) 0)
+              (set! (sc 'num-spechit) (- (sc 'num-spechit) 1))
+              (let (ld ((ref sc 'spechit) (unsafe/cast usize (sc 'num-spechit))))
+                (when (try (use-special-line w actor ld 0)) (set! good true))))
+            (set! (sc 'num-spechit) -1)
+            (return (ok good))))
+        (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-INFLOAT))))
+      (when (= (bit-and (actor 'flags) MF-FLOAT) 0) (set! (actor 'z) (actor 'floor-z)))
+      (return (ok true)))))
+
+; P_TryWalk: a move that, if it works, keeps going for a random while.
+(defn- try-walk (w:&World actor:&Mobj):(Fallible bool)
+  (when (not (try (step w actor))) (return (ok false)))
+  (set! (actor 'move-count) (bit-and (p-random w) 15))
+  (return (ok true)))
+
+(defn- walk-dir (w:&World actor:&Mobj d:i32):(Fallible bool)
+  (set! (actor 'move-dir) d)
+  (return (try-walk w actor)))
+
+; P_NewChaseDir: toward the target, diagonal first, never straight back
+; unless nothing else works.
+(defn- new-chase-dir (w:&World actor:&Mobj):(Fallible void)
+  (when (none? (actor 'target)) (fail "P_NewChaseDir: called with no target"))
+  (let (t (target actor) olddir (actor 'move-dir)
+        turnaround (aref OPPOSITE (as i64 olddir))
+        deltax (wrap-sub (t 'x) (actor 'x)) deltay (wrap-sub (t 'y) (actor 'y))
+        d1 (cond (> deltax (* 10 FRACUNIT)) DI-EAST (< deltax (* -10 FRACUNIT)) DI-WEST true DI-NODIR)
+        d2 (cond (< deltay (* -10 FRACUNIT)) DI-SOUTH (> deltay (* 10 FRACUNIT)) DI-NORTH true DI-NODIR))
+    ; Try directly.
+    (when (and (!= d1 DI-NODIR) (!= d2 DI-NODIR))
+      (set! (actor 'move-dir)
+            (aref DIAGS (as i64 (+ (bit-shl (if (< deltay 0) 1 0) 1) (if (> deltax 0) 1 0)))))
+      (when (and (!= (actor 'move-dir) turnaround) (try (try-walk w actor))) (return (ok))))
+    ; Try the other directions.
+    (when (or (> (p-random w) 200) (> (abs deltay) (abs deltax)))
+      (let (tdir d1) (set! d1 d2) (set! d2 tdir)))
+    (when (= d1 turnaround) (set! d1 DI-NODIR))
+    (when (= d2 turnaround) (set! d2 DI-NODIR))
+    (when (and (!= d1 DI-NODIR) (try (walk-dir w actor d1))) (return (ok)))
+    (when (and (!= d2 DI-NODIR) (try (walk-dir w actor d2))) (return (ok)))
+    ; No direct path: the old direction, then any.
+    (when (and (!= olddir DI-NODIR) (try (walk-dir w actor olddir))) (return (ok)))
+    (if (!= (bit-and (p-random w) 1) 0)
+      (let (tdir DI-EAST)
+        (while (<= tdir DI-SOUTHEAST)
+          (when (and (!= tdir turnaround) (try (walk-dir w actor tdir))) (return (ok)))
+          (inc! tdir)))
+      (let (tdir DI-SOUTHEAST)
+        (while (!= tdir (- DI-EAST 1))
+          (when (and (!= tdir turnaround) (try (walk-dir w actor tdir))) (return (ok)))
+          (set! tdir (- tdir 1)))))
+    (when (and (!= turnaround DI-NODIR) (try (walk-dir w actor turnaround))) (return (ok)))
+    ; Can't move.
+    (set! (actor 'move-dir) DI-NODIR))
+  (return (ok)))
+
+; Whether player `pi` is one P_LookForPlayers would target.
+(defn- sees-player? (w:&World actor:&Mobj pi:usize allaround:bool):(Fallible bool)
+  (let (p (player-at w pi) mo (unwrap (p 'mo)))
+    (when (<= (p 'health) 0) (return (ok false)))
+    (when (not (try (check-sight w actor mo))) (return (ok false)))
+    (when (not allaround)
+      (let (an (- (point-to-angle2 (actor 'x) (actor 'y) (mo 'x) (mo 'y)) (actor 'angle)))
+        ; Behind its back, and not close.
+        (when (and (> an ANG90) (< an ANG270))
+          (let (dist (aprox-distance (wrap-sub (mo 'x) (actor 'x)) (wrap-sub (mo 'y) (actor 'y))))
+            (when (> dist MELEERANGE) (return (ok false)))))))
+    (return (ok true))))
+
+; P_LookForPlayers: check up to two players in game, from the last looked at.
+(defn look-for-players (w:&World actor:&Mobj allaround:bool):(Fallible bool)
+  (let (c 0 stop (bit-and (- (actor 'last-look) 1) 3))
+    (while true
+      (let (pi (unsafe/cast usize (actor 'last-look)))
+        (when ((ref w 'player-in-game) pi)
+          (when (or (= c 2) (= (actor 'last-look) stop)) (return (ok false)))
+          (set! c (+ c 1))
+          (when (try (sees-player? w actor pi allaround))
+            (set! (actor 'target) ((player-at w pi) 'mo))
+            (return (ok true)))))
+      (set! (actor 'last-look) (bit-and (+ (actor 'last-look) 1) 3))))
+  (return (ok false)))
+
+; --- the chase -----------------------------------------------------------------
+
+; A_Look: wait for a sound or a sight of a player.
+(defn- look (w:&World actor:&Mobj):(Fallible void)
+  (set! (actor 'threshold) 0)
+  (let (targ ((sector-play-at w (sector-index-of w actor)) 'sound-target) seen false)
+    (when-some (t targ)
+      (when (!= (bit-and (t 'flags) MF-SHOOTABLE) 0)
+        (set! (actor 'target) targ)
+        (if (!= (bit-and (actor 'flags) MF-AMBUSH) 0)
+          (when (try (check-sight w actor t)) (set! seen true))
+          (set! seen true))))
+    (when (not seen)
+      (when (not (try (look-for-players w actor false))) (return (ok))))
+    (let (ss ((info actor) 'see-sound))
+      (when (!= ss 0)
+        (let (sound (case ss
+                      (:or SFX-POSIT1 SFX-POSIT2 SFX-POSIT3) (+ SFX-POSIT1 (% (p-random w) 3))
+                      (:or SFX-BGSIT1 SFX-BGSIT2) (+ SFX-BGSIT1 (% (p-random w) 2))
+                      ss))
+          ; Full volume for the bosses.
+          (if (or (= (actor 'type) MT-SPIDER) (= (actor 'type) MT-CYBORG))
+            (start-sound w none sound)
+            (start-sound w (some actor) sound)))))
+    (return (set-state w actor ((info actor) 'see-state)))))
+
+; A_Chase: turn toward the move direction, attack if possible, else walk.
+(defn chase (w:&World actor:&Mobj):(Fallible void)
+  (let (inf (info actor) r (rules w))
+    (when (!= (actor 'reaction-time) 0)
+      (set! (actor 'reaction-time) (- (actor 'reaction-time) 1)))
+    ; Modify target threshold.
+    (when (!= (actor 'threshold) 0)
+      (if (or (none? (actor 'target)) (<= ((target actor) 'health) 0))
+        (set! (actor 'threshold) 0)
+        (set! (actor 'threshold) (- (actor 'threshold) 1))))
+    ; Turn toward the movement direction.
+    (when (< (actor 'move-dir) 8)
+      (set! (actor 'angle) (bit-and (actor 'angle) (bit-shl (as ui32 7) 29)))
+      (let (delta (unsafe/cast i32 (- (actor 'angle) (bit-shl (unsafe/cast ui32 (actor 'move-dir)) 29))))
+        (cond (> delta 0) (set! (actor 'angle) (- (actor 'angle) (/ ANG90 2)))
+              (< delta 0) (set! (actor 'angle) (+ (actor 'angle) (/ ANG90 2)))
+              true 0)))
+    (when (or (none? (actor 'target))
+              (= (bit-and ((target actor) 'flags) MF-SHOOTABLE) 0))
+      ; Look for a new target.
+      (when (try (look-for-players w actor true)) (return (ok)))
+      (return (set-state w actor (inf 'spawn-state))))
+    ; Don't attack twice in a row.
+    (when (!= (bit-and (actor 'flags) MF-JUSTATTACKED) 0)
+      (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-JUSTATTACKED)))
+      (when (and (!= (r 'skill) SK-NIGHTMARE) (not (r 'fast)))
+        (try (new-chase-dir w actor)))
+      (return (ok)))
+    (when (and (!= (inf 'melee-state) 0) (try (check-melee-range w actor)))
+      (when (!= (inf 'attack-sound) 0) (start-sound w (some actor) (inf 'attack-sound)))
+      (return (set-state w actor (inf 'melee-state))))
+    (when (and (!= (inf 'missile-state) 0)
+               (not (and (< (r 'skill) SK-NIGHTMARE) (not (r 'fast)) (!= (actor 'move-count) 0)))
+               (try (check-missile-range w actor)))
+      (try (set-state w actor (inf 'missile-state)))
+      (set! (actor 'flags) (bit-or (actor 'flags) MF-JUSTATTACKED))
+      (return (ok)))
+    ; Possibly choose another target.
+    (when (and (r 'netgame) (= (actor 'threshold) 0)
+               (not (try (check-sight w actor (target actor)))))
+      (when (try (look-for-players w actor true)) (return (ok))))
+    ; Chase toward the player.
+    (set! (actor 'move-count) (- (actor 'move-count) 1))
+    (when (or (< (actor 'move-count) 0) (not (try (step w actor))))
+      (try (new-chase-dir w actor)))
+    ; Make an active sound now and then.
+    (when (and (!= (inf 'active-sound) 0) (< (p-random w) 3))
+      (start-sound w (some actor) (inf 'active-sound))))
+  (return (ok)))
+
+; A_FaceTarget: an invisible target is harder to face.
+(defn face-target (w:&World actor:&Mobj):void
+  (when-some (t (actor 'target))
+    (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-AMBUSH)))
+    (set! (actor 'angle) (point-to-angle2 (actor 'x) (actor 'y) (t 'x) (t 'y)))
+    (when (!= (bit-and (t 'flags) MF-SHADOW) 0)
+      (set! (actor 'angle) (+ (actor 'angle) (unsafe/cast ui32 (bit-shl (sub-random w) 21)))))))
+
+; --- attacks ------------------------------------------------------------------
+
+(defn- hitscan (w:&World actor:&Mobj bangle:Angle slope:Fixed):(Fallible void)
+  (let (angle (+ bangle (unsafe/cast ui32 (bit-shl (sub-random w) 20)))
+        damage (* (+ (% (p-random w) 5) 1) 3))
+    (return (line-attack w actor angle MISSILERANGE slope damage))))
+
+; A_PosAttack: the zombieman's pistol.
+(defn- pos-attack (w:&World actor:&Mobj):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (face-target w actor)
+  (let (angle (actor 'angle) slope (try (aim-line-attack w (some actor) angle MISSILERANGE)))
+    (start-sound w (some actor) SFX-PISTOL)
+    (return (hitscan w actor angle slope))))
+
+; A_SPosAttack: the shotgun guy's three pellets.
+(defn- spos-attack (w:&World actor:&Mobj):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (start-sound w (some actor) SFX-SHOTGN)
+  (face-target w actor)
+  (let (bangle (actor 'angle) slope (try (aim-line-attack w (some actor) bangle MISSILERANGE)))
+    (dotimes (i:usize 3) (try (hitscan w actor bangle slope))))
+  (return (ok)))
+
+; A_CPosAttack: the chaingunner's bullet.
+(defn- cpos-attack (w:&World actor:&Mobj):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (start-sound w (some actor) SFX-SHOTGN)
+  (face-target w actor)
+  (let (bangle (actor 'angle) slope (try (aim-line-attack w (some actor) bangle MISSILERANGE)))
+    (return (hitscan w actor bangle slope))))
+
+; A_CPosRefire and A_SpidRefire: keep firing while the target's in sight.
+(defn- refire (w:&World actor:&Mobj chance:i32):(Fallible void)
+  (face-target w actor)
+  (when (< (p-random w) chance) (return (ok)))
+  (when (or (none? (actor 'target)) (<= ((target actor) 'health) 0)
+            (not (try (check-sight w actor (target actor)))))
+    (try (set-state w actor ((info actor) 'see-state))))
+  (return (ok)))
+
+(defn- missile-at-target (w:&World actor:&Mobj type:i32):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (face-target w actor)
+  (try (spawn-missile w actor (target actor) type))
+  (return (ok)))
+
+; A melee hit if in range, else a missile (type -1: none).
+(defn- melee-or-missile (w:&World actor:&Mobj face:bool sound:i32 dice:i32 mult:i32
+                         missile:i32):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (when face (face-target w actor))
+  (when (try (check-melee-range w actor))
+    (when (!= sound 0) (start-sound w (some actor) sound))
+    (let (damage (* (+ (% (p-random w) dice) 1) mult))
+      (return (damage-mobj w (target actor) (some actor) (some actor) damage))))
+  (when (>= missile 0) (try (spawn-missile w actor (target actor) missile)))
+  (return (ok)))
+
+; A_SkelMissile: the revenant's homing rocket.
+(defn- skel-missile (w:&World actor:&Mobj):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (face-target w actor)
+  ; So the missile spawns higher.
+  (set! (actor 'z) (+ (actor 'z) (* 16 FRACUNIT)))
+  (let (mo (try (spawn-missile w actor (target actor) MT-TRACER)))
+    (set! (actor 'z) (- (actor 'z) (* 16 FRACUNIT)))
+    (set! (mo 'x) (wrap-add (mo 'x) (mo 'mom-x)))
+    (set! (mo 'y) (wrap-add (mo 'y) (mo 'mom-y)))
+    (set! (mo 'tracer) (actor 'target)))
+  (return (ok)))
+
+; A_Tracer: smoke, and steer toward the tracer target.
+(defn- tracer (w:&World actor:&Mobj):(Fallible void)
+  (when (!= (bit-and (w 'game-tic) 3) 0) (return (ok)))
+  (try (spawn-puff w (actor 'x) (actor 'y) (actor 'z)))
+  (let (th (spawn-mobj w (wrap-sub (actor 'x) (actor 'mom-x)) (wrap-sub (actor 'y) (actor 'mom-y))
+                       (actor 'z) MT-SMOKE))
+    (set! (th 'mom-z) FRACUNIT)
+    (set! (th 'tics) (- (th 'tics) (bit-and (p-random w) 3)))
+    (when (< (th 'tics) 1) (set! (th 'tics) 1)))
+  (match (actor 'tracer)
+    ((none) (return (ok)))
+    ((some dest)
+     (when (<= (dest 'health) 0) (return (ok)))
+     (let (exact (point-to-angle2 (actor 'x) (actor 'y) (dest 'x) (dest 'y)))
+       (when (!= exact (actor 'angle))
+         (if (> (- exact (actor 'angle)) 0x80000000)
+           (do (set! (actor 'angle) (- (actor 'angle) TRACEANGLE))
+               (when (< (- exact (actor 'angle)) 0x80000000) (set! (actor 'angle) exact)))
+           (do (set! (actor 'angle) (+ (actor 'angle) TRACEANGLE))
+               (when (> (- exact (actor 'angle)) 0x80000000) (set! (actor 'angle) exact))))))
+     (let (an (fine-index (actor 'angle)) speed ((info actor) 'speed))
+       (set! (actor 'mom-x) (fixed-mul speed (finecosine an)))
+       (set! (actor 'mom-y) (fixed-mul speed (finesine an)))
+       ; Change slope.
+       (let (dist (/ (aprox-distance (wrap-sub (dest 'x) (actor 'x)) (wrap-sub (dest 'y) (actor 'y)))
+                     speed))
+         (when (< dist 1) (set! dist 1))
+         (let (slope (/ (wrap-sub (wrap-add (dest 'z) (* 40 FRACUNIT)) (actor 'z)) dist))
+           (if (< slope (actor 'mom-z))
+             (set! (actor 'mom-z) (- (actor 'mom-z) (/ FRACUNIT 8)))
+             (set! (actor 'mom-z) (+ (actor 'mom-z) (/ FRACUNIT 8)))))))
+     (return (ok)))))
+
+; PIT_VileCheck: a still corpse that has a raise state and fits.
+(defn- vile-check (w:&World thing:&Mobj):bool
+  (let (sc (ref w 'scratch) inf (info thing))
+    (when (= (bit-and (thing 'flags) MF-CORPSE) 0) (return true))
+    (when (!= (thing 'tics) -1) (return true))
+    (when (= (inf 'raise-state) S-NULL) (return true))
+    (let (maxdist (+ (inf 'radius) ((mobj-info MT-VILE) 'radius)))
+      (when (or (> (abs (wrap-sub (thing 'x) (sc 'vile-try-x))) maxdist)
+                (> (abs (wrap-sub (thing 'y) (sc 'vile-try-y))) maxdist))
+        (return true)))
+    (set! (sc 'corpse-hit) (some thing))
+    (set! (thing 'mom-x) 0)
+    (set! (thing 'mom-y) 0)
+    (set! (thing 'height) (bit-shl (thing 'height) 2))
+    (let (check (match (check-position w thing (thing 'x) (thing 'y))
+                  ((ok b) b)
+                  ((err e) (when (none? (w 'pending-error)) (set! (w 'pending-error) (some e))) false)))
+      (set! (thing 'height) (bit-shr (thing 'height) 2))
+      (return (not check)))))
+
+; A_VileChase: raise a corpse in the way, else chase.
+(defn- vile-chase (w:&World actor:&Mobj):(Fallible void)
+  (when (!= (actor 'move-dir) DI-NODIR)
+    (let (sc (ref w 'scratch) l (ref w 'level) speed ((info actor) 'speed)
+          dir (as i64 (actor 'move-dir)))
+      (set! (sc 'vile-try-x) (wrap-add (actor 'x) (* speed (aref XSPEED dir))))
+      (set! (sc 'vile-try-y) (wrap-add (actor 'y) (* speed (aref YSPEED dir))))
+      (let (xl (bit-shr (wrap-sub (wrap-sub (sc 'vile-try-x) (l 'bmap-org-x)) (* MAXRADIUS 2)) MAPBLOCKSHIFT)
+            xh (bit-shr (wrap-add (wrap-sub (sc 'vile-try-x) (l 'bmap-org-x)) (* MAXRADIUS 2)) MAPBLOCKSHIFT)
+            yl (bit-shr (wrap-sub (wrap-sub (sc 'vile-try-y) (l 'bmap-org-y)) (* MAXRADIUS 2)) MAPBLOCKSHIFT)
+            yh (bit-shr (wrap-add (wrap-sub (sc 'vile-try-y) (l 'bmap-org-y)) (* MAXRADIUS 2)) MAPBLOCKSHIFT)
+            bx xl)
+        (while (<= bx xh)
+          (let (by yl)
+            (while (<= by yh)
+              (when (not (block-things-iterator w bx by vile-check))
+                (try (take-error w))
+                ; Got one!
+                (let (corpse (unwrap (sc 'corpse-hit)) temp (actor 'target))
+                  (set! (actor 'target) (some corpse))
+                  (face-target w actor)
+                  (set! (actor 'target) temp)
+                  (try (set-state w actor S-VILE-HEAL1))
+                  (start-sound w (some corpse) SFX-SLOP)
+                  (let (inf (info corpse))
+                    (try (set-state w corpse (inf 'raise-state)))
+                    (set! (corpse 'height) (bit-shl (corpse 'height) 2))
+                    (set! (corpse 'flags) (inf 'flags))
+                    (set! (corpse 'health) (inf 'spawn-health))
+                    (set! (corpse 'target) none))
+                  (return (ok))))
+              (try (take-error w))
+              (inc! by)))
+          (inc! bx)))))
+  ; Return to normal attack.
+  (return (chase w actor)))
+
+; A_Fire: keep the flame in front of its victim, if the vile can see it.
+(defn- fire (w:&World actor:&Mobj):(Fallible void)
+  (match (actor 'tracer)
+    ((none) (return (ok)))
+    ((some dest)
+     (let (t (subst-null-mobj w (actor 'target)))
+       ; Don't move it if the vile lost sight.
+       (when (not (try (check-sight w t dest))) (return (ok)))
+       (let (an (fine-index (dest 'angle)))
+         (unset-thing-position w actor)
+         (set! (actor 'x) (wrap-add (dest 'x) (fixed-mul (* 24 FRACUNIT) (finecosine an))))
+         (set! (actor 'y) (wrap-add (dest 'y) (fixed-mul (* 24 FRACUNIT) (finesine an))))
+         (set! (actor 'z) (dest 'z))
+         (set-thing-position w actor))
+       (return (ok))))))
+
+; A_VileTarget: spawn the flame. Vanilla passes the target's x as its y.
+(defn- vile-target (w:&World actor:&Mobj):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (face-target w actor)
+  (let (t (target actor) fog (spawn-mobj w (t 'x) (t 'x) (t 'z) MT-FIRE))
+    (set! (actor 'tracer) (some fog))
+    (set! (fog 'target) (some actor))
+    (set! (fog 'tracer) (some t))
+    (return (fire w fog))))
+
+; A_VileAttack.
+(defn- vile-attack (w:&World actor:&Mobj):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (face-target w actor)
+  (let (t (target actor))
+    (when (not (try (check-sight w actor t))) (return (ok)))
+    (start-sound w (some actor) SFX-BAREXP)
+    (try (damage-mobj w t (some actor) (some actor) 20))
+    (set! (t 'mom-z) (/ (* 1000 FRACUNIT) ((info t) 'mass)))
+    (let (an (fine-index (actor 'angle)))
+      (match (actor 'tracer)
+        ((none) (return (ok)))
+        ((some f)
+         ; Move the fire between the vile and the player.
+         (set! (f 'x) (wrap-sub (t 'x) (fixed-mul (* 24 FRACUNIT) (finecosine an))))
+         (set! (f 'y) (wrap-sub (t 'y) (fixed-mul (* 24 FRACUNIT) (finesine an))))
+         (return (radius-attack w f (some actor) 70)))))))
+
+; A missile, turned by `turn` from where it was aimed.
+(defn- turn-missile (mo:&Mobj turn:Angle):void
+  (set! (mo 'angle) (+ (mo 'angle) turn))
+  (let (an (fine-index (mo 'angle)) speed ((info mo) 'speed))
+    (set! (mo 'mom-x) (fixed-mul speed (finecosine an)))
+    (set! (mo 'mom-y) (fixed-mul speed (finesine an)))))
+
+; A_FatAttack1-3: the mancubus's spread.
+(defn- fat-attack (w:&World actor:&Mobj which:i32):(Fallible void)
+  (face-target w actor)
+  (let (t (subst-null-mobj w (actor 'target)))
+    (case which
+      1 (do (set! (actor 'angle) (+ (actor 'angle) FATSPREAD))
+            (try (spawn-missile w actor t MT-FATSHOT))
+            (turn-missile (try (spawn-missile w actor t MT-FATSHOT)) FATSPREAD))
+      2 (do (set! (actor 'angle) (- (actor 'angle) FATSPREAD))
+            (try (spawn-missile w actor t MT-FATSHOT))
+            (turn-missile (try (spawn-missile w actor t MT-FATSHOT)) (- 0 (* FATSPREAD 2))))
+      (do (turn-missile (try (spawn-missile w actor t MT-FATSHOT)) (- 0 (/ FATSPREAD 2)))
+          (turn-missile (try (spawn-missile w actor t MT-FATSHOT)) (/ FATSPREAD 2)))))
+  (return (ok)))
+
+; A_SkullAttack: the lost soul flies at its target.
+(defn skull-attack (w:&World actor:&Mobj):(Fallible void)
+  (when (none? (actor 'target)) (return (ok)))
+  (let (dest (target actor))
+    (set! (actor 'flags) (bit-or (actor 'flags) MF-SKULLFLY))
+    (start-sound w (some actor) ((info actor) 'attack-sound))
+    (face-target w actor)
+    (let (an (fine-index (actor 'angle))
+          dist (/ (aprox-distance (wrap-sub (dest 'x) (actor 'x)) (wrap-sub (dest 'y) (actor 'y)))
+                  SKULLSPEED))
+      (set! (actor 'mom-x) (fixed-mul SKULLSPEED (finecosine an)))
+      (set! (actor 'mom-y) (fixed-mul SKULLSPEED (finesine an)))
+      (when (< dist 1) (set! dist 1))
+      (set! (actor 'mom-z) (/ (wrap-sub (wrap-add (dest 'z) (bit-shr (dest 'height) 1)) (actor 'z))
+                              dist))))
+  (return (ok)))
+
+; A_PainShootSkull: a lost soul, unless there are more than 20.
+(defn- pain-shoot-skull (w:&World actor:&Mobj angle:Angle):(Fallible void)
+  (let (all (live-mobjs w) n 0)
+    (dotimes (i:usize (count &all)) (when (= ((&all i) 'type) MT-SKULL) (set! n (+ n 1))))
+    (drop &all)
+    (when (> n 20) (return (ok))))
+  (let (an (fine-index angle)
+        prestep (+ (* 4 FRACUNIT) (/ (* 3 (+ ((info actor) 'radius) ((mobj-info MT-SKULL) 'radius))) 2))
+        x (wrap-add (actor 'x) (fixed-mul prestep (finecosine an)))
+        y (wrap-add (actor 'y) (fixed-mul prestep (finesine an)))
+        z (wrap-add (actor 'z) (* 8 FRACUNIT))
+        newmobj (spawn-mobj w x y z MT-SKULL))
+    ; Check for movements.
+    (when (not (try (try-move w newmobj (newmobj 'x) (newmobj 'y))))
+      ; Kill it immediately.
+      (return (damage-mobj w newmobj (some actor) (some actor) 10000)))
+    (set! (newmobj 'target) (actor 'target))
+    (return (skull-attack w newmobj))))
+
+; A_Scream: a death sound, varied for the zombies and imps.
+(defn- scream (w:&World actor:&Mobj):(Fallible void)
+  (let (ds ((info actor) 'death-sound))
+    (when (= ds 0) (return (ok)))
+    (let (sound (case ds
+                  (:or SFX-PODTH1 SFX-PODTH2 SFX-PODTH3) (+ SFX-PODTH1 (% (p-random w) 3))
+                  (:or SFX-BGDTH1 SFX-BGDTH2) (+ SFX-BGDTH1 (% (p-random w) 2))
+                  ds))
+      ; Full volume for the bosses.
+      (if (or (= (actor 'type) MT-SPIDER) (= (actor 'type) MT-CYBORG))
+        (start-sound w none sound)
+        (start-sound w (some actor) sound))))
+  (return (ok)))
+
+(defn- fall (actor:&Mobj):void
+  ; Corpses can be walked over.
+  (set! (actor 'flags) (bit-and (actor 'flags) (bit-not MF-SOLID))))
+
+; CheckBossEnd: whether this boss's death ends the map, by executable.
+(defn- boss-end? (w:&World motype:i32):bool
+  (let (r (rules w) ep (r 'episode) mp (r 'map))
+    (when (not (r 'ultimate))
+      (when (!= mp 8) (return false))
+      (when (and (= motype MT-BRUISER) (!= ep 1)) (return false))
+      (return true))
+    (return (case ep
+              1 (and (= mp 8) (= motype MT-BRUISER))
+              2 (and (= mp 8) (= motype MT-CYBORG))
+              3 (and (= mp 8) (= motype MT-SPIDER))
+              4 (or (and (= mp 6) (= motype MT-CYBORG)) (and (= mp 8) (= motype MT-SPIDER)))
+              (= mp 8)))))
+
+; A line that's only a tag, for the tag-666 and 667 actions.
+(defn- junk-line (tag:i32):Line
+  (return (Line 0 0 0 0 0 0 tag (array i32 -1 -1) (bbox-clear) 0 none none)))
+
+; A_BossDeath: the last boss of its kind opens the way out, or ends the map.
+(defn- boss-death (w:&World mo:&Mobj):(Fallible void)
+  (let (r (rules w) commercial (= (r 'mode) COMMERCIAL))
+    (if commercial
+      (when (or (!= (r 'map) 7) (and (!= (mo 'type) MT-FATSO) (!= (mo 'type) MT-BABY)))
+        (return (ok)))
+      (when (not (boss-end? w (mo 'type))) (return (ok))))
+    ; No one left alive, so don't end the game.
+    (let (alive false)
+      (dotimes (i:usize MAXPLAYERS)
+        (when (and ((ref w 'player-in-game) i) (> ((player-at w i) 'health) 0)) (set! alive true)))
+      (when (not alive) (return (ok))))
+    (when (others-alive? w mo) (return (ok)))
+    (if commercial
+      (when (= (r 'map) 7)
+        (when (= (mo 'type) MT-FATSO)
+          (let (junk (junk-line 666)) (try (do-floor-line w &junk LOWER-FLOOR-TO-LOWEST)) (return (ok))))
+        (when (= (mo 'type) MT-BABY)
+          (let (junk (junk-line 667)) (try (do-floor-line w &junk RAISE-TO-TEXTURE)) (return (ok)))))
+      (case (r 'episode)
+        1 (let (junk (junk-line 666)) (try (do-floor-line w &junk LOWER-FLOOR-TO-LOWEST)) (return (ok)))
+        4 (case (r 'map)
+            6 (let (junk (junk-line 666)) (try (do-door-line w &junk VLD-BLAZE-OPEN)) (return (ok)))
+            8 (let (junk (junk-line 666)) (try (do-floor-line w &junk LOWER-FLOOR-TO-LOWEST)) (return (ok)))
+            0)
+        0))
+    (exit-level w))
+  (return (ok)))
+
+; A_KeenDie: the last Keen opens the tag-666 door.
+(defn- keen-die (w:&World mo:&Mobj):(Fallible void)
+  (fall mo)
+  (when (others-alive? w mo) (return (ok)))
+  (let (junk (junk-line 666)) (try (do-door-line w &junk VLD-OPEN)))
+  (return (ok)))
+
+; --- the boss brain ----------------------------------------------------------------
+
+(defn- brain-awake (w:&World):void
+  (let (all (live-mobjs w) bt (ref w 'brain-targets))
+    (truncate! bt 0)
+    (set! (w 'brain-target-on) 0)
+    (dotimes (i:usize (count &all))
+      (when (= ((&all i) 'type) MT-BOSSTARGET) (conj bt (&all i))))
+    (drop &all))
+  (start-sound w none SFX-BOSSIT))
+
+(defn- brain-rocket (w:&World x:Fixed y:Fixed):(Fallible void)
+  (let (z (+ 128 (* (p-random w) 2 FRACUNIT)) th (spawn-mobj w x y z MT-ROCKET))
+    (set! (th 'mom-z) (* (p-random w) 512))
+    (try (set-state w th S-BRAINEXPLODE1))
+    (set! (th 'tics) (- (th 'tics) (bit-and (p-random w) 7)))
+    (when (< (th 'tics) 1) (set! (th 'tics) 1)))
+  (return (ok)))
+
+(defn- brain-scream (w:&World mo:&Mobj):(Fallible void)
+  (let (x (- (mo 'x) (* 196 FRACUNIT)))
+    (while (< x (+ (mo 'x) (* 320 FRACUNIT)))
+      (try (brain-rocket w x (- (mo 'y) (* 320 FRACUNIT))))
+      (set! x (+ x (* FRACUNIT 8)))))
+  (start-sound w none SFX-BOSDTH)
+  (return (ok)))
+
+(defn- brain-spit (w:&World mo:&Mobj):(Fallible void)
+  (set! (w 'brain-easy) (bit-xor (w 'brain-easy) 1))
+  (when (and (<= ((rules w) 'skill) SK-EASY) (= (w 'brain-easy) 0)) (return (ok)))
+  (let (bt (ref w 'brain-targets) n (unsafe/cast i32 (count bt)))
+    (when (= n 0) (fail "A_BrainSpit: numbraintargets was 0 (vanilla crashes here)"))
+    (let (targ (bt (unsafe/cast usize (w 'brain-target-on))))
+      (set! (w 'brain-target-on) (% (+ (w 'brain-target-on) 1) n))
+      ; Spawn the brain missile.
+      (let (newmobj (try (spawn-missile w mo targ MT-SPAWNSHOT)))
+        (set! (newmobj 'target) (some targ))
+        (set! (newmobj 'reaction-time)
+              (/ (/ (wrap-sub (targ 'y) (mo 'y)) (newmobj 'mom-y)) ((state-at (newmobj 'state)) 'tics))))
+      (start-sound w none SFX-BOSPIT)))
+  (return (ok)))
+
+; A_SpawnFly: the cube arrives and becomes a random monster.
+(defn- spawn-fly (w:&World mo:&Mobj):(Fallible void)
+  (set! (mo 'reaction-time) (- (mo 'reaction-time) 1))
+  ; Still flying.
+  (when (!= (mo 'reaction-time) 0) (return (ok)))
+  (let (targ (subst-null-mobj w (mo 'target))
+        fog (spawn-mobj w (targ 'x) (targ 'y) (targ 'z) MT-SPAWNFIRE))
+    (start-sound w (some fog) SFX-TELEPT)
+    ; Randomly select a monster to spawn.
+    (let (r (p-random w)
+          type (cond (< r 50) MT-TROOP (< r 90) MT-SERGEANT (< r 120) MT-SHADOWS
+                     (< r 130) MT-PAIN (< r 160) MT-HEAD (< r 162) MT-VILE
+                     (< r 172) MT-UNDEAD (< r 192) MT-BABY (< r 222) MT-FATSO
+                     (< r 246) MT-KNIGHT true MT-BRUISER)
+          newmobj (spawn-mobj w (targ 'x) (targ 'y) (targ 'z) type))
+      (when (try (look-for-players w newmobj true))
+        (try (set-state w newmobj ((info newmobj) 'see-state))))
+      ; Telefrag anything in this spot.
+      (try (teleport-move w newmobj (newmobj 'x) (newmobj 'y)))
+      (remove-mobj w mo)))
+  (return (ok)))
+
+; --- the dispatcher ------------------------------------------------------------
+
+; Run a thing state's action.
+(defn mobj-action (w:&World m:&Mobj a:i32):(Fallible void)
+  (case a
+    A-LOOK (try (look w m))
+    A-CHASE (try (chase w m))
+    A-FACETARGET (face-target w m)
+    A-POSATTACK (try (pos-attack w m))
+    A-SPOSATTACK (try (spos-attack w m))
+    A-CPOSATTACK (try (cpos-attack w m))
+    A-CPOSREFIRE (try (refire w m 40))
+    A-SPIDREFIRE (try (refire w m 10))
+    A-BSPIATTACK (try (missile-at-target w m MT-ARACHPLAZ))
+    A-TROOPATTACK (try (melee-or-missile w m true SFX-CLAW 8 3 MT-TROOPSHOT))
+    ; Post-1.5: only in melee range.
+    A-SARGATTACK (try (melee-or-missile w m true 0 10 4 -1))
+    A-HEADATTACK (try (melee-or-missile w m true 0 6 10 MT-HEADSHOT))
+    A-CYBERATTACK (try (missile-at-target w m MT-ROCKET))
+    A-BRUISATTACK (try (melee-or-missile w m false SFX-CLAW 8 10 MT-BRUISERSHOT))
+    A-SKELMISSILE (try (skel-missile w m))
+    A-TRACER (try (tracer w m))
+    A-SKELWHOOSH (when (some? (m 'target)) (face-target w m) (start-sound w (some m) SFX-SKESWG))
+    A-SKELFIST (try (melee-or-missile w m true SFX-SKEPCH 10 6 -1))
+    A-VILECHASE (try (vile-chase w m))
+    A-VILESTART (start-sound w (some m) SFX-VILATK)
+    A-STARTFIRE (do (start-sound w (some m) SFX-FLAMST) (try (fire w m)))
+    A-FIRECRACKLE (do (start-sound w (some m) SFX-FLAME) (try (fire w m)))
+    A-FIRE (try (fire w m))
+    A-VILETARGET (try (vile-target w m))
+    A-VILEATTACK (try (vile-attack w m))
+    A-FATRAISE (do (face-target w m) (start-sound w (some m) SFX-MANATK))
+    A-FATATTACK1 (try (fat-attack w m 1))
+    A-FATATTACK2 (try (fat-attack w m 2))
+    A-FATATTACK3 (try (fat-attack w m 3))
+    A-SKULLATTACK (try (skull-attack w m))
+    A-PAINATTACK (when (some? (m 'target)) (face-target w m) (try (pain-shoot-skull w m (m 'angle))))
+    A-PAINDIE (do (fall m)
+                  (try (pain-shoot-skull w m (+ (m 'angle) ANG90)))
+                  (try (pain-shoot-skull w m (+ (m 'angle) ANG180)))
+                  (try (pain-shoot-skull w m (+ (m 'angle) ANG270))))
+    A-SCREAM (try (scream w m))
+    A-XSCREAM (start-sound w (some m) SFX-SLOP)
+    A-PAIN (let (ps ((info m) 'pain-sound)) (when (!= ps 0) (start-sound w (some m) ps)))
+    A-FALL (fall m)
+    A-EXPLODE (try (radius-attack w m (m 'target) 128))
+    A-BOSSDEATH (try (boss-death w m))
+    A-HOOF (do (start-sound w (some m) SFX-HOOF) (try (chase w m)))
+    A-METAL (do (start-sound w (some m) SFX-METAL) (try (chase w m)))
+    A-BABYMETAL (do (start-sound w (some m) SFX-BSPWLK) (try (chase w m)))
+    A-KEENDIE (try (keen-die w m))
+    A-BRAINAWAKE (brain-awake w)
+    A-BRAINPAIN (start-sound w none SFX-BOSPN)
+    A-BRAINSCREAM (try (brain-scream w m))
+    A-BRAINEXPLODE (try (brain-rocket w (wrap-add (m 'x) (* (sub-random w) 2048)) (m 'y)))
+    A-BRAINDIE (exit-level w)
+    A-BRAINSPIT (try (brain-spit w m))
+    A-SPAWNSOUND (do (start-sound w (some m) SFX-BOSCUB) (try (spawn-fly w m)))
+    A-SPAWNFLY (try (spawn-fly w m))
+    A-PLAYERSCREAM
+    (start-sound w (some m)
+                 (if (and (= ((rules w) 'mode) COMMERCIAL) (< (m 'health) -50)) SFX-PDIEHI SFX-PLDETH))
+    A-BFGSPRAY (try (bfg-spray w m))
+    ; A weapon action on a thing's state: vanilla would call it with the
+    ; wrong arguments. No shipped state does.
+    0)
+  (return (ok)))

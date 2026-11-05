@@ -167,7 +167,9 @@
   trace:Divline
   early-out:bool
   ; P_CheckSight.
-  sight-z-start:Fixed t2x:Fixed t2y:Fixed strace:Divline)
+  sight-z-start:Fixed t2x:Fixed t2y:Fixed strace:Divline
+  ; A_VileChase.
+  corpse-hit:?&Mobj vile-try-x:Fixed vile-try-y:Fixed)
 
 (defn- map-scratch-new ():MapScratch
   (return (MapScratch (bbox-clear) none 0 0 0 false 0 0 0 none (make (Vector usize)) 0
@@ -175,7 +177,8 @@
                       none none 0 0 0 0 0 0 none
                       none none 0 false false
                       (Opening 0 0 0 0) (make (Vector Intercept)) (Divline 0 0 0 0) false
-                      0 0 0 (Divline 0 0 0 0))))
+                      0 0 0 (Divline 0 0 0 0)
+                      none 0 0)))
 
 ; A sound the playsim started: the game layer plays and then clears them.
 ; `located` is false for a sound at no place, which the whole level hears;
@@ -237,7 +240,14 @@
   texture-translation:(Vector i32) flat-translation:(Vector i32)
   ; Scrolling walls (linespeciallist), and deathmatch's level timer.
   line-specials:(Vector usize)
-  level-timer:bool level-time-count:i32)
+  level-timer:bool level-time-count:i32
+  ; p_user.c's onground, which P_CalcHeight reads after the last player that
+  ; moved set it.
+  on-ground:bool
+  ; gametic, which the game layer keeps: A_Tracer reads it, not leveltime.
+  game-tic:i32
+  ; A_BrainAwake's targets and A_BrainSpit's turn and easy-skill toggle.
+  brain-targets:(Vector &Mobj) brain-target-on:i32 brain-easy:i32)
 
 (defn mobj-info-of (m:&Mobj):MobjInfo (return (mobj-info (m 'type))))
 
@@ -377,7 +387,8 @@
                (make (Vector MapThing)) (ints 128) 0 0
                (filled 32 none) 0 none
                pics (identity (pics 'num-textures)) (identity (pics 'num-flats))
-               (make (Vector usize)) false 0))
+               (make (Vector usize)) false 0 false
+               0 (make (Vector &Mobj)) 0 0))
     ; P_InitThinkers: the cap alone is a circular list.
     (set! (cap 'prev) (some cap))
     (set! (cap 'next) (some cap))

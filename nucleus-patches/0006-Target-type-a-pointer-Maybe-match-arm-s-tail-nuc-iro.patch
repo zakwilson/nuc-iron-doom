@@ -1,0 +1,66 @@
+From e15f66843f4fa648541a5e586432d2ac25003181 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 03:40:17 +0000
+Subject: [PATCH] Target-type a pointer-Maybe match arm's tail (nuc-iron-doom
+ ISSUE-024)
+
+emit-niche-match-arm, which emits the arms of a match over a pointer
+Maybe or an ERR_PTR value, emitted each arm body without re-arming the
+want or rewriting the tail, as emit-match-clauses does. So with a typed
+let, a bare none arm stayed an untyped null and the match joined to
+void.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CsC8hzrZakM3KWb32SpqKh
+---
+ src/union-emit.nuc   |  8 +++++++-
+ tests/suite-doom.nuc | 17 +++++++++++++++++
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/union-emit.nuc b/src/union-emit.nuc
+index 48de28c..03fac3c 100644
+--- a/src/union-emit.nuc
++++ b/src/union-emit.nuc
+@@ -1583,7 +1583,13 @@
+   (let (bv:&Val (alloc-val ty-void "")
+         bcur:ptr body)
+     (while (> (node-len bcur) 0)
+-      (set! bv (emit-node (node-first (unsafe/cast &Node bcur)) inner))
++      (let (form:ptr (node-first (unsafe/cast &Node bcur)))
++        ; TC-5 part 2, as emit-match-clauses does: target-type the tail form
++        ; against the armed want (nuc-iron-doom ISSUE-024).
++        (when (= (node-rest (unsafe/cast &Node bcur)) null)
++          (set! g-want-type want)
++          (set! form (union-target-rewrite form want)))
++        (set! bv (emit-node form inner)))
+       (set! bcur (node-rest (unsafe/cast &Node bcur))))
+     (emit-scope-cleanups inner)
+     (when (= g-block-term 0)
+diff --git a/tests/suite-doom.nuc b/tests/suite-doom.nuc
+index abde72d..75bc22c 100644
+--- a/tests/suite-doom.nuc
++++ b/tests/suite-doom.nuc
+@@ -773,3 +773,20 @@ missing key :sens for #user/Opt"))
+       (try (check-eq (strview-trim-end &ov) "2 3"))
+       (drop &out))
+     (drop &h)))
++
++; nuc-iron-doom ISSUE-024: a typed let's want reaches the arms of a match over
++; a pointer Maybe, so a bare `none` arm is typed.
++(deftest doom-niche-match-arm-target-typed
++  (let (out:String (try (build-run-source "(import-use \"stdio.h\")
++(defstruct M player:?usize)
++(defn f (src:?&M):i32
++  (let (sp:?usize (match src ((some s) (s 'player)) ((none) none)))
++    (match sp ((some i) (return (unsafe/cast i32 i))) ((none) (return -1)))))
++(defn main ():i32
++  (let (m (M (some (as usize 3))))
++    (printf \"%d %d\\n\" (f (some &m)) (f none)))
++  0)
++"))
++        ov:StrView (string-as-view &out))
++    (try (check-eq (strview-trim-end &ov) "3 -1"))
++    (drop &out)))
+-- 
+2.43.0
+

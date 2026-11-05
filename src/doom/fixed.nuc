@@ -112,3 +112,7 @@
         (if (> (wrap-sub 0 x) (wrap-sub 0 y))
           (return (+ ANG180 (tantoangle (slope-div ny nx))))
           (return (- (- ANG270 1) (tantoangle (slope-div nx ny)))))))))
+
+; R_PointToAngle2: the angle from (x1, y1) to (x2, y2).
+(defn point-to-angle2 (x1:Fixed y1:Fixed x2:Fixed y2:Fixed):Angle
+  (return (angle-of (wrap-sub x2 x1) (wrap-sub y2 y1))))

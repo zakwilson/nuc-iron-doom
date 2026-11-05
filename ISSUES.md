@@ -19,6 +19,7 @@ provisional until milestone 8.)
 | ISSUE-015 | A float constant doesn't adapt to an overload's `f32` parameter | minor | design |
 | ISSUE-019 | A struct literal passed to a generic binds `T` to `&S` | minor | bug |
 | ISSUE-022 | `none` passed to a generic method isn't typed from its other arguments | minor | bug |
+| ISSUE-024 | A `match` over a pointer `Maybe` doesn't target-type a bare `none` arm | minor | bug |
 | ISSUE-010 | A macro template can't call `count` where two collection namespaces are imported | minor | design |
 | ISSUE-001 | A two-key `invoke` reads but can't be `set!` | minor | missing-feature |
 | ISSUE-005 | A finished `Vector` can't be viewed as a `Slice` | minor | missing-feature |
@@ -529,6 +530,32 @@ every kind of object reaches 128 without writing many `defunion`s itself.
 (nucleus `design/progress.md`). The enum cap failed worse: past it, the
 `defenum` still compiled, but its members silently dropped out of the table
 `match` checks, so the error named the pattern, not the cap.
+
+## ISSUE-024: a `match` over a pointer `Maybe` doesn't target-type its arms
+
+- **Severity:** minor
+- **Kind:** bug
+- **Status:** fixed-in-compiler (nucleus `e15f668`, carried as
+  `nucleus-patches/0006-*.patch`)
+- **Probe:** `probes/issue-024.nuc` — expected `(let (sp:?usize (match src
+  ((some s) (s 'player)) ((none) none))) …)`, with `src` a `?&M`, to bind
+  `sp`; actual `let: init type mismatch for 'sp': value is void, slot is
+  ?usize`
+- **Port sites:** none left; it struck `src/doom/play/inter.nuc`
+  (`kill-mobj`, the source's player).
+- **Workaround:** an `if` with `some?` in place of the match, which
+  target-types its arms.
+- **Suggestion:** (done) the pointer-`Maybe` and ERR_PTR arm emitter now
+  re-arms the want for each arm's tail, as the tagged-union one does.
+
+Context: `docs/structs-unions.md` says a typed binding's want "carries into
+the value tails of `if`/`cond`/`do`/`let`/`with`/`match`". It did for a
+match over a tagged union, which `emit-match-clauses` emits. A match over a
+`?&T` or a niche `Result` goes through `emit-niche-match-arm` instead, which
+emitted the arm bodies without the tail rewrite, so `none` stayed an untyped
+null and the arms joined to `void`. An untyped `let` of the same match (or
+of an `if` with a bare `none` arm) is also `void`, but that one is the
+documented rule: the join doesn't infer `none`'s type from its sibling.
 
 ## What worked well
 

@@ -52,6 +52,10 @@
 ; p_local.h.
 (defconst FLOATSPEED (* 4 65536))
 (defconst MAXHEALTH 100)
+
+; Ammo without a backpack, and what a clip holds (p_inter.c), by Ammo.
+(defvar MAXAMMO:(array i32 4) (array i32 200 50 300 50))
+(defvar CLIPAMMO:(array i32 4) (array i32 10 4 20 1))
 (defconst VIEWHEIGHT (* 41 65536))
 (defconst MAPBLOCKUNITS 128)
 (defconst MAPBLOCKSIZE (* 128 65536))

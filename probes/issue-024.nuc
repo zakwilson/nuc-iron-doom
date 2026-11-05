@@ -1,0 +1,17 @@
+; ISSUE-024: a typed `let` doesn't carry its type into a `match` arm that is
+; a bare `none`, so the match is void. The same with `if` works.
+; fixed-when: runs
+; Actual: "let: init type mismatch for 'sp': value is void, slot is ?usize".
+
+(import-use "stdio.h")
+
+(defstruct M player:?usize)
+
+(defn f (src:?&M):i32
+  (let (sp:?usize (match src ((some s) (s 'player)) ((none) none)))
+    (match sp ((some i) (return (unsafe/cast i32 i))) ((none) (return -1)))))
+
+(defn main ():i32
+  (let (m (M (some (as usize 3))))
+    (printf "%d %d\n" (f (some &m)) (f none)))
+  (return 0))

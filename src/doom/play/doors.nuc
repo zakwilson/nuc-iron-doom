@@ -108,7 +108,12 @@
 
 ; EV_DoDoor.
 (defn do-door (w:&World li:usize type:i32):(Fallible bool)
-  (let (l (ref w 'level) line (line-at l li) rtn false
+  (return (do-door-line w (line-at (ref w 'level) li) type)))
+
+; The same for a line that may not be in the map: A_BossDeath's, which has
+; only a tag.
+(defn do-door-line (w:&World line:&Line type:i32):(Fallible bool)
+  (let (l (ref w 'level) rtn false
         secnum (find-sector-from-line-tag w line -1))
     (while (>= secnum 0)
       (let (si (unsafe/cast usize secnum) sec (sector-at l si))
