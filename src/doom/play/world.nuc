@@ -55,7 +55,8 @@
 
 (defstruct VlDoor th:?&Thinker type:i32 sector:usize top-height:Fixed speed:Fixed
   direction:i32 top-wait:i32 top-countdown:i32)
-(defstruct FloorMove th:?&Thinker type:i32 crush:bool sector:usize direction:i32
+; `crush` is an int: stairs leave it 10.
+(defstruct FloorMove th:?&Thinker type:i32 crush:i32 sector:usize direction:i32
   new-special:i32 texture:i32 floor-dest-height:Fixed speed:Fixed)
 (defstruct Ceiling th:?&Thinker type:i32 sector:usize bottom-height:Fixed top-height:Fixed
   speed:Fixed crush:bool direction:i32 tag:i32 old-direction:i32)
@@ -87,7 +88,17 @@
 (defstruct Thinker prev:?&Thinker next:?&Thinker removed:bool idle:bool think:Think)
 
 ; A switch waiting to flip back (button_t). `where` is a ButtonWhere.
-(defstruct Button line:usize where:i32 texture:i32 timer:i32 sound-x:Fixed sound-y:Fixed)
+; `sound-org` is false where vanilla's soundorg pointer is null.
+(defstruct Button line:usize where:i32 texture:i32 timer:i32
+  sound-org:bool sound-x:Fixed sound-y:Fixed)
+
+; An animated flat or texture range (anim_t).
+(defstruct Anim is-texture:bool pic-num:i32 base-pic:i32 num-pics:i32 speed:i32)
+
+; What the specials need from the WAD's textures and flats: P_InitPicAnims'
+; animations, P_InitSwitchList's on/off texture pairs, and textureheight.
+(defstruct PicData anims:(Vector Anim) switches:(Vector i32) texture-heights:(Vector Fixed)
+  num-textures:usize num-flats:usize)
 
 ; --- players (d_player.h, d_ticcmd.h) -------------------------------------------
 
@@ -177,7 +188,9 @@
 (defstruct Rules skill:i32 deathmatch:i32 netgame:bool no-monsters:bool respawn-monsters:bool
   fast:bool mode:i32 episode:i32 map:i32 console-player:i32 demo-playback:bool
   ; Ultimate Doom's executable or later (gameversion >= exe_ultimate).
-  ultimate:bool)
+  ultimate:bool
+  ; Deathmatch's -timer, in minutes; 0 for none.
+  time-limit:i32)
 
 ; The playsim's per-sector state beside the map's (sector_t's other fields).
 (defstruct SectorPlay sound-traversed:i32 sound-target:?&Mobj valid-count:i32
@@ -218,7 +231,13 @@
   body-que:(Vector ?&Mobj) body-que-slot:i32
   ; An error raised inside an iterator callback, raised again once the
   ; iteration ends (callbacks return a plain bool, as vanilla's do).
-  pending-error:?Failure)
+  pending-error:?Failure
+  pics:PicData
+  ; What P_UpdateSpecials shows for each texture and flat this tic.
+  texture-translation:(Vector i32) flat-translation:(Vector i32)
+  ; Scrolling walls (linespeciallist), and deathmatch's level timer.
+  line-specials:(Vector usize)
+  level-timer:bool level-time-count:i32)
 
 (defn mobj-info-of (m:&Mobj):MobjInfo (return (mobj-info (m 'type))))
 
@@ -317,6 +336,11 @@
     (dotimes (i:usize n) (conj &out 0))
     (return out)))
 
+(defn- identity (n:usize):(Vector i32)
+  (let (out (make (Vector i32)))
+    (dotimes (i:usize n) (conj &out (unsafe/cast i32 i)))
+    (return out)))
+
 (defn ticcmd-zero ():TicCmd (return (TicCmd 0 0 0 0 0 0)))
 
 ; memset(p, 0, sizeof *p).
@@ -334,7 +358,7 @@
 ; `players` and `random` carry over from the previous level, as vanilla's
 ; globals do.
 (defn world-new (l:Level rules:Rules players:(Vector Player) in-game:&(Vector bool)
-                 random:Random):&World
+                 random:Random pics:PicData):&World
   (let (arena (make Arena)
         cap (new Thinker &arena none none false false (Think-cap))
         nsec (count (ref l 'sectors))
@@ -351,7 +375,9 @@
                (make (Vector ?&Ceiling)) (make (Vector ?&Plat)) (make (Vector Button))
                (map-scratch-new) (make (Vector SoundEvent))
                (make (Vector MapThing)) (ints 128) 0 0
-               (filled 32 none) 0 none))
+               (filled 32 none) 0 none
+               pics (identity (pics 'num-textures)) (identity (pics 'num-flats))
+               (make (Vector usize)) false 0))
     ; P_InitThinkers: the cap alone is a circular list.
     (set! (cap 'prev) (some cap))
     (set! (cap 'next) (some cap))
@@ -394,7 +420,7 @@
 
 ; A single-player game's rules.
 (defn single-player-rules (skill:i32 mode:i32 episode:i32 m:i32):Rules
-  (return (Rules skill 0 false false false false mode episode m 0 false false)))
+  (return (Rules skill 0 false false false false mode episode m 0 false false 0)))
 
 ; Only player 1 in the game.
 (defn single-player-in-game ():(Vector bool)

@@ -36,6 +36,8 @@
 (import-use doom.play.world)
 (import-use doom.play.defs)
 (import-use doom.play.mobj)
+(import-use doom.play.setup)
+(import-use doom.play.spec)
 (import-use doom.render.state)
 (import-use doom.render.view)
 ; Its Level and level-load would clash with phase A's doom.level.
@@ -102,11 +104,11 @@
           l (try (level-load &mp (ref a 'flats) (ref a 'textures)))
           fl (try (pm/level-load &mp (ref a 'flats) (ref a 'textures)))
           in-game (single-player-in-game)
-          w (world-new fl (single-player-rules SK-MEDIUM SHAREWARE episode m) (new-game-players)
-                       &in-game (random-new)))
+          pics (try (pic-data-new (ref a 'textures) (ref a 'flats) SHAREWARE))
+          w (try (level-setup fl &mp (single-player-rules SK-MEDIUM SHAREWARE episode m)
+                              (new-game-players) &in-game (random-new) pics)))
       (set! (g 'camera) (some (camera-new (player &l))))
       (set! (g 'level) (some l))
-      (try (load-things w &mp))
       (set! (g 'world) (some w))
       ; G_DoLoadLevel's sky for the first three episodes.
       (let (sky (if (<= episode 3) (name-from-episode episode) (name "SKY4")))

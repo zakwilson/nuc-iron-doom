@@ -1,0 +1,223 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom p_doors.c); this port is GPLv3, see COPYING.
+;
+; Vertical doors: raised by a tag or opened by hand, locked or not.
+
+(ns doom.play.doors)
+
+(import-use nucleus.create)
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.io)
+(import-use doom.error)
+(import-use doom.util)
+(import-use doom.fixed)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.map)
+(import-use doom.play.world)
+(import-use doom.play.mobj)
+(import-use doom.play.spec)
+(import-use doom.play.floors)
+
+(defn- door-sound (w:&World d:&VlDoor sfx:i32):void (start-sector-sound w (d 'sector) sfx))
+
+(defn- remove-door (w:&World d:&VlDoor):void
+  (set-special-data w (d 'sector) none)
+  (remove-thinker (unwrap (d 'th))))
+
+; T_VerticalDoor.
+(defn t-vertical-door (w:&World d:&VlDoor):(Fallible void)
+  (case (d 'direction)
+    ; Waiting at the top, or closed for 30 seconds.
+    0 (do (set! (d 'top-countdown) (- (d 'top-countdown) 1))
+          (when (= (d 'top-countdown) 0)
+            (case (d 'type)
+              VLD-BLAZE-RAISE (do (set! (d 'direction) -1) (door-sound w d SFX-BDCLS))
+              VLD-NORMAL (do (set! (d 'direction) -1) (door-sound w d SFX-DORCLS))
+              VLD-CLOSE30-THEN-OPEN (do (set! (d 'direction) 1) (door-sound w d SFX-DOROPN))
+              0)))
+    ; Waiting to raise in five minutes.
+    2 (do (set! (d 'top-countdown) (- (d 'top-countdown) 1))
+          (when (and (= (d 'top-countdown) 0) (= (d 'type) VLD-RAISE-IN-5-MINS))
+            (set! (d 'direction) 1)
+            (set! (d 'type) VLD-NORMAL)
+            (door-sound w d SFX-DOROPN)))
+    -1 (let (res (try (move-plane w (d 'sector) (d 'speed)
+                                  ((sector-at (ref w 'level) (d 'sector)) 'floor-height)
+                                  0 1 -1)))
+         (if (= res RES-PASTDEST)
+           (case (d 'type)
+             (:or VLD-BLAZE-RAISE VLD-BLAZE-CLOSE) (do (remove-door w d) (door-sound w d SFX-BDCLS))
+             (:or VLD-NORMAL VLD-CLOSE) (remove-door w d)
+             VLD-CLOSE30-THEN-OPEN (do (set! (d 'direction) 0)
+                                       (set! (d 'top-countdown) (* TICRATE 30)))
+             0)
+           ; Something's in the way: back up, unless it's a closing door.
+           (when (and (= res RES-CRUSHED)
+                      (not (case (d 'type) (:or VLD-BLAZE-CLOSE VLD-CLOSE) true false)))
+             (set! (d 'direction) 1)
+             (door-sound w d SFX-DOROPN))))
+    1 (let (res (try (move-plane w (d 'sector) (d 'speed) (d 'top-height) 0 1 1)))
+        (when (= res RES-PASTDEST)
+          (case (d 'type)
+            (:or VLD-BLAZE-RAISE VLD-NORMAL) (do (set! (d 'direction) 0)
+                                                 (set! (d 'top-countdown) (d 'top-wait)))
+            (:or VLD-CLOSE30-THEN-OPEN VLD-BLAZE-OPEN VLD-OPEN) (remove-door w d)
+            0)))
+    0)
+  (return (ok)))
+
+(defn- has-key? (p:&Player card:i32 skull:i32):bool
+  (return (or (aref (p 'cards) (as i64 card)) (aref (p 'cards) (as i64 skull)))))
+
+; Whether the player holds the key a locked special wants, telling them if not.
+(defn- check-key (w:&World p:&Player card:i32 skull:i32 msg:CStr):bool
+  (when (has-key? p card skull) (return true))
+  (set! (p 'message) (some msg))
+  (start-sound w none SFX-OOF)
+  (return false))
+
+; EV_DoLockedDoor: the switch-opened locked doors.
+(defn do-locked-door (w:&World li:usize type:i32 thing:&Mobj):(Fallible bool)
+  (match (mobj-player w thing)
+    ((none) (return (ok false)))
+    ((some p)
+     (let (sp ((line-at (ref w 'level) li) 'special))
+       (when (not (case sp
+                    (:or 99 133) (check-key w p IT-BLUECARD IT-BLUESKULL "You need a blue key to activate this object")
+                    (:or 134 135) (check-key w p IT-REDCARD IT-REDSKULL "You need a red key to activate this object")
+                    (:or 136 137) (check-key w p IT-YELLOWCARD IT-YELLOWSKULL "You need a yellow key to activate this object")
+                    true))
+         (return (ok false))))
+     (return (do-door w li type)))))
+
+(defn- spawn-door (w:&World sec:usize type:i32 direction:i32 speed:Fixed top:Fixed
+                   countdown:i32):&VlDoor
+  (let (d (new VlDoor (ref w 'arena)))
+    (set! @d (VlDoor none type sec top speed direction VDOORWAIT countdown))
+    (let (th (add-thinker w (Think-door d)))
+      (set! (d 'th) (some th))
+      (set-special-data w sec (some th)))
+    (return d)))
+
+; The lowest neighbouring ceiling, less 4: how high a door opens.
+(defn- door-top (w:&World sec:usize):Fixed
+  (return (- (find-lowest-ceiling-surrounding w sec) (* 4 FRACUNIT))))
+
+; EV_DoDoor.
+(defn do-door (w:&World li:usize type:i32):(Fallible bool)
+  (let (l (ref w 'level) line (line-at l li) rtn false
+        secnum (find-sector-from-line-tag w line -1))
+    (while (>= secnum 0)
+      (let (si (unsafe/cast usize secnum) sec (sector-at l si))
+        (when (none? (special-data w si))
+          (set! rtn true)
+          ; Vanilla leaves topheight and topcountdown as the allocator found them.
+          (let (d (spawn-door w si type 0 VDOORSPEED 0 0))
+            (case type
+              VLD-BLAZE-CLOSE (do (set! (d 'top-height) (door-top w si))
+                                  (set! (d 'direction) -1)
+                                  (set! (d 'speed) (* VDOORSPEED 4))
+                                  (door-sound w d SFX-BDCLS))
+              VLD-CLOSE (do (set! (d 'top-height) (door-top w si))
+                            (set! (d 'direction) -1)
+                            (door-sound w d SFX-DORCLS))
+              VLD-CLOSE30-THEN-OPEN (do (set! (d 'top-height) (sec 'ceiling-height))
+                                        (set! (d 'direction) -1)
+                                        (door-sound w d SFX-DORCLS))
+              (:or VLD-BLAZE-RAISE VLD-BLAZE-OPEN)
+              (do (set! (d 'direction) 1)
+                  (set! (d 'top-height) (door-top w si))
+                  (set! (d 'speed) (* VDOORSPEED 4))
+                  (when (!= (d 'top-height) (sec 'ceiling-height)) (door-sound w d SFX-BDOPN)))
+              (:or VLD-NORMAL VLD-OPEN)
+              (do (set! (d 'direction) 1)
+                  (set! (d 'top-height) (door-top w si))
+                  (when (!= (d 'top-height) (sec 'ceiling-height)) (door-sound w d SFX-DOROPN)))
+              0))))
+      (set! secnum (find-sector-from-line-tag w line secnum)))
+    (return (ok rtn))))
+
+; EV_VerticalDoor reads and writes a sector's special data as a vldoor_t
+; whatever it is. In the 32-bit executables' layouts, a door's direction is
+; a plat's wait, a floor's newspecial and a ceiling's speed.
+(defn- aliased-direction (th:&Thinker):i32
+  (match (th 'think)
+    ((door d) (return (d 'direction)))
+    ((plat p) (return (p 'wait)))
+    ((floor f) (return (f 'new-special)))
+    ((ceiling c) (return (c 'speed)))
+    ((cap) (return 0)) ((mobj m) (return 0)) ((flash l) (return 0)) ((strobe s) (return 0))
+    ((glow g) (return 0)) ((flicker f) (return 0))))
+
+(defn- set-aliased-direction (th:&Thinker v:i32):void
+  (match (th 'think)
+    ((door d) (set! (d 'direction) v))
+    ((plat p) (set! (p 'wait) v))
+    ((floor f) (set! (f 'new-special) v))
+    ((ceiling c) (set! (c 'speed) v))
+    ((cap) 0) ((mobj m) 0) ((flash l) 0) ((strobe s) 0) ((glow g) 0) ((flicker f) 0)))
+
+; EV_VerticalDoor: a door opened by hand, from the line's back sector.
+(defn vertical-door (w:&World li:usize thing:&Mobj):(Fallible void)
+  (let (l (ref w 'level) line (line-at l li) sp (line 'special) player (mobj-player w thing))
+    (when (case sp (:or 26 32 27 34 28 33) true false)
+      (match player
+        ((none) (return (ok)))
+        ((some p)
+         (when (not (case sp
+                      (:or 26 32) (check-key w p IT-BLUECARD IT-BLUESKULL "You need a blue key to open this door")
+                      (:or 27 34) (check-key w p IT-YELLOWCARD IT-YELLOWSKULL "You need a yellow key to open this door")
+                      (check-key w p IT-REDCARD IT-REDSKULL "You need a red key to open this door")))
+           (return (ok))))))
+    (when (= (aref (line 'side-num) 1) -1)
+      (fail "EV_VerticalDoor: DR special type on 1-sided linedef"))
+    (let (si ((side-at l (unsafe/cast usize (aref (line 'side-num) 1))) 'sector))
+      (when-some (th (special-data w si))
+        (when (case sp (:or 1 26 27 28 117) true false)
+          (if (= (aliased-direction th) -1)
+            ; Going down: back up.
+            (set-aliased-direction th 1)
+            (do
+              ; Monsters never close doors.
+              (when (none? (thing 'player)) (return (ok)))
+              (match (th 'think)
+                ((plat p) (if (th 'idle)
+                            (do (eprintln "EV_VerticalDoor: Tried to close something that wasn't a door.")
+                                (set-aliased-direction th -1))
+                            (set! (p 'wait) -1)))
+                ((door d) (if (th 'idle)
+                            (do (eprintln "EV_VerticalDoor: Tried to close something that wasn't a door.")
+                                (set-aliased-direction th -1))
+                            (set! (d 'direction) -1)))
+                ((cap) 0) ((mobj m) 0)
+                ((floor f) (eprintln "EV_VerticalDoor: Tried to close something that wasn't a door.")
+                 (set-aliased-direction th -1))
+                ((ceiling c) (eprintln "EV_VerticalDoor: Tried to close something that wasn't a door.")
+                 (set-aliased-direction th -1))
+                ((flash x) 0) ((strobe s) 0) ((glow g) 0) ((flicker f) 0))))
+          (return (ok))))
+      (start-sector-sound w si (if (case sp (:or 117 118) true false) SFX-BDOPN SFX-DOROPN))
+      (let (d (spawn-door w si VLD-NORMAL 1 VDOORSPEED 0 0))
+        (case sp
+          (:or 1 26 27 28) (set! (d 'type) VLD-NORMAL)
+          (:or 31 32 33 34) (do (set! (d 'type) VLD-OPEN) (set! (line 'special) 0))
+          117 (do (set! (d 'type) VLD-BLAZE-RAISE) (set! (d 'speed) (* VDOORSPEED 4)))
+          118 (do (set! (d 'type) VLD-BLAZE-OPEN) (set! (line 'special) 0)
+                  (set! (d 'speed) (* VDOORSPEED 4)))
+          0)
+        (set! (d 'top-height) (door-top w si)))))
+  (return (ok)))
+
+; P_SpawnDoorCloseIn30.
+(defn spawn-door-close-in-30 (w:&World sec:usize):void
+  (spawn-door w sec VLD-NORMAL 0 VDOORSPEED 0 (* 30 TICRATE))
+  (set! ((sector-at (ref w 'level) sec) 'special) 0))
+
+; P_SpawnDoorRaiseIn5Mins.
+(defn spawn-door-raise-in-5-mins (w:&World sec:usize):void
+  (let (d (spawn-door w sec VLD-RAISE-IN-5-MINS 2 VDOORSPEED 0 (* 5 60 TICRATE)))
+    (set! ((sector-at (ref w 'level) sec) 'special) 0)
+    (set! (d 'top-height) (door-top w sec))))

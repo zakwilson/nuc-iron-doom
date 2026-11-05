@@ -20,6 +20,8 @@
 (import-use doom.play.world)
 (import-use doom.play.defs)
 (import-use doom.play.mobj)
+(import-use doom.play.setup)
+(import-use doom.play.spec)
 (import-use doom.render.state)
 (import-use doom.render.view)
 
@@ -47,17 +49,18 @@
        ((some m)
         (let (l (try (level-load &m (ref a 'flats) (ref a 'textures)))
               in-game (single-player-in-game)
-              w (world-new l (single-player-rules SK-MEDIUM SHAREWARE 1 1) (new-game-players)
-                           &in-game (random-new))
+              pics (try (pic-data-new (ref a 'textures) (ref a 'flats) SHAREWARE))
+              w (try (level-setup l &m (single-player-rules SK-MEDIUM SHAREWARE 1 1)
+                                  (new-game-players) &in-game (random-new) pics))
               screen (array2d (as usize 320) (as usize 200) (as ui8 0))
               r (renderer-new 11)
               sc (Scene (ref w 'level) (ref a 'textures) (ref a 'flats) (ref a 'colormaps)
                         (ref a 'sprites) (ref w 'sector-things) &screen))
-          (try (load-things w &m))
-          ; Things spawned on skill 3; the P_Random index after spawning.
+          ; Things spawned on skill 3; the P_Random index after spawning (143)
+          ; and the one light flash (special 1) taking one more.
           (try (check-eq-int (as i64 (w 'total-kills)) 6 "kills"))
           (try (check-eq-int (as i64 (w 'total-items)) 37 "items"))
-          (try (check-eq-int (as i64 ((ref w 'random) 'prnd)) 143 "prndindex"))
+          (try (check-eq-int (as i64 ((ref w 'random) 'prnd)) 144 "prndindex"))
           (set! (r 'sky-texture) (unwrap-or (texture-index (ref a 'textures) (name "SKY1")) 0))
           ; The start, facing north and north-west; the courtyard, with sky.
           (try (check-eq-int (try (view-hash &r &sc 1056 -3616 ANG90)) 1971587042 "start view"))

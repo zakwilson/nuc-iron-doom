@@ -11,3 +11,5 @@
 (import-use doom.play.world)
 
 (defn player-reborn (w:&World pi:usize):void)
+
+(defn player-think (w:&World pi:usize):(Fallible void) (return (ok)))

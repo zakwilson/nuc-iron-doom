@@ -6,8 +6,69 @@
 
 (ns doom.play.switch)
 
+(import-use nucleus.vector)
+(import-use nucleus.coll)
+(import-use nucleus.slice)
 (import-use doom.error)
+(import-use doom.util)
+(import-use doom.info)
+(import-use doom.play.defs)
+(import-use doom.play.map)
 (import-use doom.play.world)
+(import-use doom.play.spec)
 
+; P_StartButton: a switch that flips back after `time` tics.
+(defn- start-button (w:&World li:usize where:i32 texture:i32 time:i32):(Fallible void)
+  (let (buttons (view (ref w 'buttons)) l (ref w 'level))
+    ; Already waiting to flip back.
+    (dotimes (i:usize MAXBUTTONS)
+      (let (b (&buttons i))
+        (when (and (!= (b 'timer) 0) (= (b 'line) li)) (return (ok)))))
+    (dotimes (i:usize MAXBUTTONS)
+      (let (b (&buttons i))
+        (when (= (b 'timer) 0)
+          (let (s (sector-at l (unwrap-or ((line-at l li) 'front-sector) 0)))
+            (set! @b (Button li where texture time true (s 'sound-x) (s 'sound-y))))
+          (return (ok))))))
+  (fail "P_StartButton: no button slots left!"))
+
+; P_ChangeSwitchTexture: flip the front side's switch texture, to flip back
+; later if the switch can be used again.
+(defn change-switch-texture (w:&World li:usize use-again:bool):(Fallible void)
+  (let (l (ref w 'level) line (line-at l li))
+    (when (not use-again) (set! (line 'special) 0))
+    (let (side (side-at l (unsafe/cast usize (aref (line 'side-num) 0)))
+          top (side 'top-texture) mid (side 'mid-texture) bot (side 'bottom-texture)
+          ; Read after clearing, so a used-up exit switch makes the usual sound.
+          sound (if (= (line 'special) 11) SFX-SWTCHX SFX-SWTCHN)
+          switches (ref (ref w 'pics) 'switches)
+          ; Vanilla plays it from the first button slot's origin.
+          buttons (view (ref w 'buttons))
+          b0 (&buttons 0))
+      (dotimes (i:usize (count switches))
+        (let (t (switches i) where (cond (= t top) BW-TOP (= t mid) BW-MIDDLE (= t bot) BW-BOTTOM true -1))
+          (when (>= where 0)
+            (if (b0 'sound-org)
+              (conj (ref w 'sounds) (SoundEvent sound none true (b0 'sound-x) (b0 'sound-y) false))
+              (start-sound w none sound))
+            (let (other (switches (bit-xor i 1)))
+              (case where
+                BW-TOP (set! (side 'top-texture) other)
+                BW-MIDDLE (set! (side 'mid-texture) other)
+                (set! (side 'bottom-texture) other)))
+            (when use-again (try (start-button w li where t BUTTONTIME)))
+            (return (ok)))))))
+  (return (ok)))
+
+; P_UseSpecialLine: whether using the line did anything.
 (defn use-special-line (w:&World thing:&Mobj li:usize side:i32):(Fallible bool)
-  (return (ok false)))
+  (let (line (line-at (ref w 'level) li) sp (line 'special))
+    ; Only the exit switch 124 works from the back.
+    (when (and (!= side 0) (!= sp 124)) (return (ok false)))
+    (when (none? (thing 'player))
+      (when (!= (bit-and (line 'flags) ML-SECRET) 0) (return (ok false)))
+      ; Monsters can only open the plain manual doors.
+      (when (not (case sp (:or 1 32 33 34) true false)) (return (ok false))))
+    (let (e (use-entry sp))
+      (try (run-use-entry w li &e thing))))
+  (return (ok true)))

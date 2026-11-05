@@ -8,6 +8,7 @@
 
 (import-use nucleus.vector)
 (import-use doom.error)
+(import-use doom.rand)
 (import-use doom.mapdata)
 (import-use doom.play.map)
 (import-use doom.play.world)
@@ -15,8 +16,8 @@
 (import-use doom.play.spec)
 
 (defn level-setup (l:Level m:&Map rules:Rules players:(Vector Player) in-game:&(Vector bool)
-                   random:Random):(Fallible &World)
-  (let (w (world-new l rules players in-game random))
+                   random:Random pics:PicData):(Fallible &World)
+  (let (w (world-new l rules players in-game random pics))
     (try (load-things w m))
     (try (spawn-specials w))
     (return (ok w))))
