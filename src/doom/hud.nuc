@@ -1,0 +1,78 @@
+; Copyright (C) 1993-1996 Id Software, Inc.
+; Copyright (C) 2005-2014 Simon Howard
+; GPLv2 or later (Chocolate Doom hu_stuff.c, hu_lib.c); this port is GPLv3,
+; see COPYING.
+;
+; The heads-up message line: a player message shows for four seconds. Chat is
+; out of scope with networking. HU_Ticker takes the message off the player,
+; so it runs in the session's tic.
+
+(ns doom.hud)
+
+(import-use nucleus.strview)
+(import-use doom.error)
+(import-use doom.buffer)
+(import-use doom.graphics)
+(import-use doom.hufont)
+(import-use doom.play.world)
+
+(defconst HU-MSGTIMEOUT 140)
+
+(defstruct Hud message:?CStr on:bool counter:i32
+  ; message_nottobefuckedwith and message_dontfuckwithme: a menu message
+  ; that a player message mustn't replace.
+  keep:bool dont-replace:bool
+  show-messages:bool
+  ; The world's console-spawns at the last HU_Start.
+  spawns:i32)
+
+(defn hud-new ():Hud (return (Hud none false 0 false false true -1)))
+
+; HU_Start.
+(defn- hu-start (h:&Hud):void
+  (set! (h 'message) none)
+  (set! (h 'on) false)
+  (set! (h 'keep) false)
+  (set! (h 'dont-replace) false))
+
+; HU_Ticker.
+(defn hud-ticker (h:&Hud w:&World p:&Player):void
+  (when (!= (h 'spawns) (w 'console-spawns))
+    (set! (h 'spawns) (w 'console-spawns))
+    (hu-start h))
+  (when (> (h 'counter) 0)
+    (set! (h 'counter) (- (h 'counter) 1))
+    (when (= (h 'counter) 0)
+      (set! (h 'on) false)
+      (set! (h 'keep) false)))
+  (when (or (h 'show-messages) (h 'dont-replace))
+    (when-some (m (p 'message))
+      (when (or (not (h 'keep)) (h 'dont-replace))
+        (set! (h 'message) (some m))
+        (set! (p 'message) none)
+        (set! (h 'on) true)
+        (set! (h 'counter) HU-MSGTIMEOUT)
+        (set! (h 'keep) (h 'dont-replace))
+        (set! (h 'dont-replace) false)))))
+
+; HUlib_drawTextLine: upper-cased in the HU font, a space for what it lacks.
+(defn draw-text (font:&HuFont buf:&Buffer x0:i32 y:i32 text:StrView):(Fallible void)
+  (let (x x0 i:usize 0)
+    (while (< i (text 'len))
+      (let (k (font-index (byte-of text i)))
+        (if (and (>= k 0) (!= (byte-of text i) 32))
+          (let (p (font-patch font k) w (unsafe/cast i32 (p 'width)))
+            (when (> (+ x w) 320) (return (ok)))
+            (try (draw-patch buf (unsafe/cast usize x) (unsafe/cast usize y) p))
+            (set! x (+ x w)))
+          (do (set! x (+ x 4))
+              (when (>= x 320) (return (ok))))))
+      (set! i (+ i 1))))
+  (return (ok)))
+
+; HU_Drawer's message line, at the top left.
+(defn hud-drawer (h:&Hud font:&HuFont buf:&Buffer):(Fallible void)
+  (when (h 'on)
+    (when-some (m (h 'message))
+      (try (draw-text font buf 0 0 (strview-from-cstr m)))))
+  (return (ok)))

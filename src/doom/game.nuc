@@ -51,6 +51,7 @@
 (import-use doom.wipe)
 (import-use doom.finale)
 (import-use doom.hufont)
+(import-use doom.hud)
 ; Its Level and level-load would clash with phase A's doom.level.
 (import doom.play.map pm)
 
@@ -239,6 +240,8 @@
       (when-some (sg (g 'st-graphics))
         (let (r (ref w 'rules) sgv sg)
           (try (st-drawer (ref s 'st) &sgv (ref g 'screen) p (!= (r 'deathmatch) 0) (r 'netgame) 0))))
+      (let (font (try (font-of g)))
+        (try (hud-drawer (ref s 'hud) &font (ref g 'screen))))
       (try (set-palette g (st-palette p)))))
   (return (ok)))
 

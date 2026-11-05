@@ -34,6 +34,7 @@
 (import-use doom.statusbar)
 (import-use doom.intermission)
 (import-use doom.finale)
+(import-use doom.hud)
 (import doom.play.map pm)
 
 ; The v1.9 executable's demo version byte, and the end-of-demo marker.
@@ -73,7 +74,8 @@
   loads:i32
   finale:Finale
   ; F_Ticker's forced wipes (wipegamestate = -1), for the game layer.
-  forced-wipes:i32)
+  forced-wipes:i32
+  hud:Hud)
 
 (defn session-new (a:&Assets mode:i32):(Fallible &Session)
   (return (ok (new Session heap (try (pic-data-new (ref a 'textures) (ref a 'flats) mode))
@@ -81,7 +83,7 @@
                        (single-player-in-game) (new-game-players) (random-new)
                        none 0 none false false none none (status-bar-new)
                        GS-LEVEL GA-NOTHING false (intermission-empty) 0
-                       (finale-empty) 0))))
+                       (finale-empty) 0 (hud-new)))))
 
 ; D_IdentifyVersion: told apart by which maps the IWAD has.
 (defn game-mode (a:&Assets):i32
@@ -425,6 +427,7 @@
       GS-LEVEL
       (do (try (ticker w))
           (st-ticker (ref s 'st) w (player-at w cp) (m-random (ref w 'random)))
+          (hud-ticker (ref s 'hud) w (player-at w cp))
           ; G_ExitLevel and G_SecretExitLevel, which the playsim flags.
           (when (!= (w 'exit) 0)
             (set! (s 'secret-exit) (= (w 'exit) 2))
