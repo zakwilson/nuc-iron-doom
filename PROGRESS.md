@@ -52,10 +52,11 @@ it.
 | 1. Foundations | done: CLI and response files, IWAD search, WAD directory, every lump parser, RNG, 12 unit tests |
 | 2. Screens | done except the framedump gate: title (tic 2) and melt run; frames can't be compared until the reference is built |
 | 3. Level and walls | done except the framedump gate (blocked like milestone 2's): E1M1 renders; movement matches an independent f32 model of Iron Doom's bit for bit over 80 tics; playtest requested below |
-| 4. Planes and things | in progress: Chocolate Doom's renderer (`doom.render.*`) draws walls, visplanes, sky, light, sprites and masked middle textures. `doom.info` is generated from info.c, and `doom.play.world` spawns the map's things (P_Random in step). E1M1 views were checked by eye and are hashed in `tests.render`. The switch-over of `game.nuc` and the weapon sprites remain |
-| 5–8 | not started |
+| 4. Planes and things | done except the framedump gate: Chocolate Doom's renderer (`doom.render.*`) draws walls, visplanes, sky, light, sprites and masked middle textures, and the game draws from the playsim's console player. The weapon sprites remain (below) |
+| 5. Playsim | in progress, playable: all of p_*.c is in `doom.play.*` (thinkers, map utilities, movement and collision, mobjs, player, weapons, sight, monster AI and attacks, damage and pickups, every sector special). `doom.session` is G_InitNew, G_DoLoadLevel and G_Ticker, and `doom.ticcmd` is G_BuildTiccmd. `-playdemo` and `-timedemo` play v1.9 demos, and `-tichash` writes the sync hash. All three doom1.wad demos play to their end (5026, 3836 and 2134 tics), and the player dies 50–60 tics before each ends, as in the originals: good evidence of sync, but the gate (`scripts/check-demos.sh`) waits on the reference build |
+| 6–8 | not started |
 
-## Reference frames
+## Reference frames and tic hashes
 
 `reference/iron-doom.patch` adds `--framedump` to Iron Doom (one fixed tic per
 frame through Bevy's `TimeUpdateStrategy::ManualDuration`, so dumps are
@@ -63,6 +64,14 @@ deterministic). **Not recorded yet:** auto mode denied building the cloned Iron
 Doom from a session. To record them, either approve
 `scripts/build-reference.sh` in a session, or add it to the environment's
 setup script after `setup-cloud.sh`.
+
+The same build applies `reference/tichash.patch` to Chocolate Doom, which
+adds `-tichash FILE`: one line per gametic of `gametic rndindex prndindex
+hash nmobjs` and each player's `health/armor/weapon/kills/items/secrets`,
+where the hash is FNV-1a over every live mobj's position, angle, momentum,
+health, type, state and flags in thinker order. The port writes the same
+lines. `scripts/check-demos.sh --record` records the references from it into
+`reference/data/tichash/`, and `scripts/check-demos.sh` compares the port.
 
 ## Compiler fixes
 
@@ -76,20 +85,21 @@ as a patch in `nucleus-patches/`, which `setup-cloud.sh` applies.
 | ISSUE-009 | `ac05293` | `nucleus-patches/0002-*.patch` |
 | ISSUE-013 | `36c13e3` | `nucleus-patches/0003-*.patch` |
 | ISSUE-016 | `7bb5257` | `nucleus-patches/0004-*.patch` |
+| ISSUE-023 | `d13384a` | `nucleus-patches/0005-*.patch` |
+| ISSUE-024 | `e15f668` | `nucleus-patches/0006-*.patch` |
 
-Each passed the nucleus gate here (after 0004: 1677 passed, the 4 avr-gcc
+Each passed the nucleus gate here (after 0006: 1679 passed, the 4 avr-gcc
 failures of the baseline, 6 skipped; `make bootstrap` PASS once converged).
 0003 and 0004 change the compiler's own code generation, so after applying
 them `make bootstrap` reports a diff until it is converged (nucleus
 `context/build.md`, "After a codegen change"). `make` itself is unaffected.
 The converged `boot/*.ll` can't be pushed to `nucleus-boot` from here.
-## Playtest request (milestone 3, updated for milestone 4)
+## Playtest request (milestone 5)
 
-The port reaches E1M1 and can be walked around with Iron Doom's movement.
-Since milestone 4 it draws with Chocolate Doom's renderer: floors, ceilings,
-sky, sector light and the map's things as sprites. `-ironrender` switches
-back to Iron Doom's renderer (walls and sky only), which is what phase A's
-frame comparison uses.
+The port is now a playable Doom on Chocolate Doom's fixed-point playsim:
+collision, doors, lifts, switches, pickups, weapons and monsters that hunt
+and fight. `-ironrender` keeps phase A (Iron Doom's float movement and
+renderer, for the frame comparison).
 
 To build on your machine:
 
@@ -102,29 +112,24 @@ To build on your machine:
 4. Run `build/nuc-iron-doom` (it searches for `doom1.wad` or `doom.wad` as
    Iron Doom does; `-iwad FILE` names one).
 
-Controls, as Iron Doom binds them: arrows or WASD to move and turn, Shift to
-run or turn fast, A/D or `,`/`.` (or Alt+arrows) to strafe, Escape or closing
-the window to quit.
+Controls: arrows or WASD to move and turn, Shift to run, Alt+arrows or A/D
+or `,`/`.` to strafe, Ctrl to fire, Space or E to use, 1–7 for weapons,
+Escape or closing the window to quit.
 
 Please check:
 
-- The title, then the melt into E1M1 after about 1.7 s.
-- Walls, floors and ceilings in the start room and beyond: textures aligned,
-  steps and the computer wall where you'd expect them, nothing flickering
-  as you turn, light falling off with distance.
-- Sprites: the barrels, the dead marines, the lamps, items and the
-  monsters (standing still) sit on the floor, face the right way as you
-  walk around them, and are hidden by walls in front of them.
-- The outdoor areas show the sky.
-- Turning starts slow for about a sixth of a second, then speeds up.
-- Movement glides to a stop, with no collision (you can walk through walls).
-- With `-ironrender`: the milestone-3 view, unchanged.
+- The title, the melt into E1M1, then playing through the episode: doors,
+  lifts, switches, the exit switch (it goes straight to the next map; there's
+  no intermission yet).
+- Monsters wake, chase, attack and die; barrels explode; pickups work
+  (watch the counts by dying and comparing: there's no status bar yet).
+- `build/nuc-iron-doom -playdemo demo1` (and `demo2`, `demo3`): each should
+  play exactly as in Chocolate Doom, ending with the player's death.
 
-Known problems: no collision and no playsim yet (monsters stand still, no
-weapon on screen, no status bar); the view height follows the floor
-instantly, with no smoothing; textures and flats don't animate. The frames
-haven't been compared with the reference engines yet (their build is blocked
-here), so a misplaced texture or sprite is worth reporting.
+Known problems: no weapon on screen, no status bar, HUD, menu, automap,
+intermission or sound yet (milestones 6–8). Textures and flats don't animate
+on screen yet (the playsim animates them, the renderer doesn't apply it).
+Fast monsters (`-fast`, nightmare) don't change state durations yet.
 
 ## In flight
 
@@ -132,17 +137,13 @@ here), so a misplaced texture or sprite is worth reporting.
 
 ## Next steps
 
-- Milestone 4's gate (reference frames from Chocolate Doom) waits on
-  `scripts/build-reference.sh`, like milestones 2 and 3.
-- Milestone 5 (playsim), ported file by file into `doom.play.*`, which may
-  import each other (Nucleus allows import cycles):
-  `tick` (P_Ticker, thinkers), `maputl` (geometry, blockmap iterators, path
-  traversal), `move` (p_map.c), `mobj`, `player` (d_player.h, p_user.c),
-  `pspr` (weapons), `sight`, `enemy`, `inter`, the sector specials (`spec`,
-  `doors`, `floors`, `ceilings`, `plats`, `lights`, `switch`, `telept`),
-  then `doom.game`'s ticcmd and demo playback (g_game.c) and the action
-  dispatch. The tichash harness needs the reference build, so until then
-  demos are checked by playing them and watching the frames.
-- Known gaps: no texture or flat animation (texturetranslation), and freed
-  mobjs are reused last-freed first, which only approximates the zone
-  allocator for stale `target` pointers.
+- The gates for milestones 2–5 wait on `scripts/build-reference.sh` (frames
+  from Iron Doom and Chocolate Doom, tic hashes from Chocolate Doom).
+- Milestone 5's rest: the renderer applies texture and flat translations,
+  draws the weapon (R_DrawPlayerSprites), extralight and the fixed colormap;
+  `-fast` state tics; old levels' arenas are freed.
+- Milestone 6 (status bar, HUD, menu, intermission, finale, sound).
+- Known gaps: freed mobjs are reused last-freed first, which only
+  approximates the zone allocator for stale `target` pointers; the tichash
+  comparison leaves out `rndindex` until the wipe and sound draw from it
+  (see `scripts/check-demos.sh`).

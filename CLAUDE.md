@@ -140,14 +140,19 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy build/nuc-iron-doom -iwad /usr/share
 scripts/run-tests.sh        # unit tests (nucleus test: :tests in build.edn)
 scripts/check-probes.sh     # which ISSUES.md probes still reproduce
 scripts/check-frames.sh     # framedumps against reference/data/frames/
-scripts/check-demos.sh      # phase B: tic hashes against reference/data/
+scripts/check-demos.sh      # phase B: tic hashes against reference/data/tichash/ (--record writes them)
+build/nuc-iron-doom -iwad /usr/share/games/doom/doom1.wad -timedemo demo1 -tichash FILE   # one demo, headless
 make -C ../nucleus -j4 && make -C ../nucleus -k test bootstrap   # after a Nucleus fix (env.sh sourced)
 ```
 
 Written so far: `env.sh`, `setup-cloud.sh`, `run-tests.sh`, `check-probes.sh`,
 `build-reference.sh` (`[iron-doom] [chocolate-doom]`; auto mode denied running
 it again on 2026-11-05, so the user runs it or adds it to the setup script).
-`check-frames.sh` and `check-demos.sh` come with the milestones that need them. Update this list as scripts are added or renamed.
+`check-demos.sh` (exit 2 when a demo has no reference). `check-frames.sh`
+comes once there are reference frames. Update this list as scripts are added
+or renamed.
+- **Demo lengths** on doom1.wad v1.9: demo1 5026 gametics, demo2 3836, demo3
+  2134; `-timedemo` runs all three in about 40 s here, drawing every tic.
 
 ## Layout
 
